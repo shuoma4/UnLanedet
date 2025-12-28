@@ -32,8 +32,9 @@ docker exec -it ldet bash
 # git clone https://github.com/zkyntu/UnLanedet.git
 cd /home/UnLanedet
 pip install -r requirements.txt
-pip install numpy==1.23.1
 pip install hydra-core --upgrade
+apt-get update
+apt-get install -y libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev libgl1
 python setup.py build develop
 ```
 
@@ -50,7 +51,7 @@ conda activate unlanedet
 conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 cd UnLanedet
 pip install -r requirements.txt
-pip install numpy==1.23.1
+# pip install numpy==1.23.1
 pip install hydra-core --upgrade
 python setup.py build develop
 ```

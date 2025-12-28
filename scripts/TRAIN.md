@@ -6,6 +6,8 @@ When you first use Unlanedet, please run the following code: 1) ```sudo apt upda
 ### Training
 ```Shell
 cd UnLanedet
+apt update && apt install dos2unix
+dos2unix scripts/train.sh scripts/eval.sh scripts/resume_train.sh
 bash scripts/train.sh path_to_config num_gpus
 # 8 cards training example 
 # bash scripts/train.sh config/clrnet/resnet34_culane.py 8

@@ -35,7 +35,9 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 192
 num_classes = 4 + 1
-data_root = "/root/autodl-tmp/culane"
+# 请确保CULane数据集已下载并解压到此路径
+# 默认路径为相对路径，指向项目中的data目录
+data_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "CULane")
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight

@@ -1,0 +1,25 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  unlanedet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: unlanedet
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    shm_size: 20G
+    network_mode: host
+    volumes:
+      # 挂载当前目录到容器的/home目录（符合官方教程）
+      - .:/home
+      # 挂载数据集目录（根据您的实际路径）
+      - /mnt/e/mashuo/master/GraduationThesis/data/CULane:/home/data/CULane:ro
+      - /mnt/e/mashuo/master/GraduationThesis/data/VIL100:/home/data/VIL100:ro
+      - /mnt/e/mashuo/master/GraduationThesis/data/TuSimple:/home/data/TuSimple:ro
+    working_dir: /home
+    stdin_open: true
+    tty: true
+    command: /bin/bash
