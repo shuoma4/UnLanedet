@@ -37,7 +37,7 @@ featuremap_out_channel = 192
 num_classes = 4 + 1
 # 请确保CULane数据集已下载并解压到此路径
 # 默认路径为相对路径，指向项目中的data目录
-data_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "CULane")
+data_root = "/home/data/CULane"
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight
