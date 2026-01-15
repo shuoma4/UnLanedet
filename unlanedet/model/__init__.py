@@ -4,3 +4,4 @@ from .SCNN import *
 from .CLRNet import *
 from .RESA import *
 from .CondlaneNet import *
+from .LLANet import *

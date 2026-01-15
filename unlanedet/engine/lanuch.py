@@ -30,6 +30,7 @@ def launch(
     dist_url=None,
     args=(),
     timeout=DEFAULT_TIMEOUT,
+    max_retries=5,  # 添加最大重试次数
 ):
     """
     Launch multi-process or distributed training.
@@ -55,28 +56,79 @@ def launch(
 
         if dist_url == "auto":
             assert num_machines == 1, "dist_url=auto not supported in multi-machine jobs."
-            port = _find_free_port()
-            dist_url = f"tcp://127.0.0.1:{port}"
+            
+            # 添加重试逻辑，处理端口冲突
+            for attempt in range(max_retries):
+                try:
+                    import subprocess
+                    import time
+                    
+                    # 清理可能占用端口的进程
+                    port = _find_free_port()
+                    dist_url = f"tcp://127.0.0.1:{port}"
+                    
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"尝试启动分布式训练，使用端口: {port} (尝试 {attempt+1}/{max_retries})")
+                    
+                    # 尝试启动训练
+                    mp.start_processes(
+                        _distributed_worker,
+                        nprocs=num_gpus_per_machine,
+                        args=(
+                            main_func,
+                            world_size,
+                            num_gpus_per_machine,
+                            machine_rank,
+                            dist_url,
+                            args,
+                            timeout,
+                        ),
+                        daemon=False,
+                    )
+                    break  # 如果成功，退出重试循环
+                except Exception as e:
+                    error_msg = str(e)
+                    logger = logging.getLogger(__name__)
+                    
+                    if "Address already in use" in error_msg and attempt < max_retries - 1:
+                        logger.warning(f"端口冲突，{3}秒后重试... (尝试 {attempt+1}/{max_retries})")
+                        time.sleep(3)
+                        
+                        # 尝试清理可能占用端口的相关进程
+                        try:
+                            # 查找并杀死可能占用该端口的Python进程
+                            subprocess.run(f"lsof -ti:{port} | xargs -r kill -9", shell=True, 
+                                       capture_output=True, text=True)
+                        except:
+                            pass
+                        continue
+                    else:
+                        # 如果是最后一次尝试或其他错误，抛出异常
+                        if attempt == max_retries - 1:
+                            logger.error(f"达到最大重试次数，无法启动分布式训练: {e}")
+                            logger.error("请尝试手动清理进程或使用不同的GPU")
+                        raise
         if num_machines > 1 and dist_url.startswith("file://"):
             logger = logging.getLogger(__name__)
             logger.warning(
                 "file:// is not a reliable init_method in multi-machine jobs. Prefer tcp://"
             )
-
-        mp.start_processes(
-            _distributed_worker,
-            nprocs=num_gpus_per_machine,
-            args=(
-                main_func,
-                world_size,
-                num_gpus_per_machine,
-                machine_rank,
-                dist_url,
-                args,
-                timeout,
-            ),
-            daemon=False,
-        )
+        else:
+            # 如果用户指定了dist_url，直接使用
+            mp.start_processes(
+                _distributed_worker,
+                nprocs=num_gpus_per_machine,
+                args=(
+                    main_func,
+                    world_size,
+                    num_gpus_per_machine,
+                    machine_rank,
+                    dist_url,
+                    args,
+                    timeout,
+                ),
+                daemon=False,
+            )
     else:
         main_func(*args)
 
