@@ -332,6 +332,8 @@ class OpenLaneEvaluator(DatasetEvaluator):
             str(self.iou_threshold),
             "-o",
             output_file,
+            "-j",
+            4,
         ]
 
         metrics = {}

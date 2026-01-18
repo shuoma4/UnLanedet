@@ -55,7 +55,7 @@ cls_loss_weight = 2.0
 xyt_loss_weight = 0.2
 seg_loss_weight = 1.0
 category_loss_weight = 2.0
-attribute_loss_weight = 0.5
+attribute_loss_weight = 1.0
 
 num_points = 72
 max_lanes = 24
@@ -146,16 +146,16 @@ train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
 
 # Optimizer
 optimizer = get_config("config/common/optim.py").AdamW
-optimizer.lr = 1e-4
-optimizer.weight_decay = 1e-3
+optimizer.lr = 5e-5
+optimizer.weight_decay = 1e-4
 
 lr_multiplier = L(CompositeParamScheduler)(
     schedulers=[
-        L(LinearParamScheduler)(start_value=0.01, end_value=1.0),
-        L(CosineParamScheduler)(start_value=1.0, end_value=0.001),
+        L(LinearParamScheduler)(start_value=0.1, end_value=1.0),
+        L(CosineParamScheduler)(start_value=1.0, end_value=0.01),
     ],
-    lengths=[0.2, 0.8],
-    interval_scaling=["rescaled", "rescaled"],  # 添加这行
+    lengths=[0.1, 0.9],
+    interval_scaling=["rescaled", "rescaled"],
 )
 # === Transform Definition (Optimized) ===
 train_transforms = [

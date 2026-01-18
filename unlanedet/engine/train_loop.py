@@ -9,8 +9,9 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 from ..data.iterload import IterLoader
 from ..utils import comm as comm
-from ..utils.events import EventStorage,get_event_storage
+from ..utils.events import EventStorage, get_event_storage
 from ..utils.logger import _log_api_usage
+
 
 class HookBase:
     """
@@ -85,6 +86,7 @@ class HookBase:
         implementing `state_dict` and `load_state_dict`.
         """
         return {}
+
 
 class TrainerBase:
     """
@@ -215,7 +217,10 @@ class TrainerBase:
                     h.load_state_dict(value)
                     break
             else:
-                logger.warning(f"Cannot find the hook '{key}', its state_dict is ignored.")
+                logger.warning(
+                    f"Cannot find the hook '{key}', its state_dict is ignored."
+                )
+
 
 class SimpleTrainer(TrainerBase):
     """
@@ -380,7 +385,7 @@ class SimpleTrainer(TrainerBase):
             data_time (float): time taken by the dataloader iteration
             prefix (str): prefix for logging keys
         """
-#        import pdb;pdb.set_trace()
+        #        import pdb;pdb.set_trace()
         metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
         metrics_dict["data_time"] = data_time
 
@@ -401,7 +406,8 @@ class SimpleTrainer(TrainerBase):
 
             # average the rest metrics
             metrics_dict = {
-                k: np.mean([x[k] for x in all_metrics_dict]) for k in all_metrics_dict[0].keys()
+                k: np.mean([x[k] for x in all_metrics_dict])
+                for k in all_metrics_dict[0].keys()
             }
             total_losses_reduced = sum(metrics_dict.values())
             if not np.isfinite(total_losses_reduced):
@@ -413,9 +419,9 @@ class SimpleTrainer(TrainerBase):
             storage.put_scalar(
                 "{}total_loss".format(prefix), total_losses_reduced, cur_iter=cur_iter
             )
-            
-            for k,v in metrics_dict.items():
-                storage.put_scalar(f"{k}",v,cur_iter = cur_iter)
+
+            for k, v in metrics_dict.items():
+                storage.put_scalar(f"{k}", v, cur_iter=cur_iter)
 
             if len(metrics_dict) > 1:
                 storage.put_scalars(cur_iter=cur_iter, **metrics_dict)
@@ -459,19 +465,26 @@ class AMPTrainer(SimpleTrainer):
             grad_scaler: torch GradScaler to automatically scale gradients.
             precision: torch.dtype as the target precision to cast to in computations
         """
-        unsupported = "AMPTrainer does not support single-process multi-device training!"
+        unsupported = (
+            "AMPTrainer does not support single-process multi-device training!"
+        )
         if isinstance(model, DistributedDataParallel):
             assert not (model.device_ids and len(model.device_ids) > 1), unsupported
         assert not isinstance(model, DataParallel), unsupported
 
         super().__init__(
-            model, data_loader, optimizer, gather_metric_period, zero_grad_before_forward
+            model,
+            data_loader,
+            optimizer,
+            gather_metric_period,
+            zero_grad_before_forward,
         )
 
         if grad_scaler is None:
             from torch.cuda.amp import GradScaler
 
-            grad_scaler = GradScaler()
+            # 【修复】设置 init_scale 为 1.0，防止训练初期 Loss 过大导致 backward 时 FP16 溢出
+            grad_scaler = GradScaler(init_scale=1.0)
         self.grad_scaler = grad_scaler
         self.precision = precision
         self.log_grad_scaler = log_grad_scaler
@@ -481,7 +494,9 @@ class AMPTrainer(SimpleTrainer):
         Implement the AMP training logic.
         """
         assert self.model.training, "[AMPTrainer] model was changed to eval mode!"
-        assert torch.cuda.is_available(), "[AMPTrainer] CUDA is required for AMP training!"
+        assert (
+            torch.cuda.is_available()
+        ), "[AMPTrainer] CUDA is required for AMP training!"
         from torch.cuda.amp import autocast
 
         start = time.perf_counter()
@@ -516,6 +531,13 @@ class AMPTrainer(SimpleTrainer):
             )
         else:
             self._write_metrics(loss_dict, data_time)
+
+        # === 【修改】手动梯度裁剪逻辑 ===
+        # 1. 解缩放梯度，使梯度回到 FP32 范围，以便正确计算 Norm
+        self.grad_scaler.unscale_(self.optimizer)
+        # 2. 裁剪梯度，防止梯度爆炸 (Max Norm = 35.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=35.0)
+        # ============================
 
         self.grad_scaler.step(self.optimizer)
         self.grad_scaler.update()

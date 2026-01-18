@@ -449,27 +449,53 @@ class LLANetHead(nn.Module):
                         ) / max(len(stage_attr_preds), 1)
 
         # 3. Final Weighted Sum
+        # 归一化说明：
+        # - cls_loss: 已经除以num_positives（匹配到的车道线数），再除以refine_layers得到平均每层的每根车道线损失
+        # - reg_xytl_loss: 已经用mean reduction（除以num_positives），再除以refine_layers得到平均每层的每根车道线损失
+        # - iou_loss: 已经除以num_positives，再除以refine_layers得到平均每层的每根车道线损失
+        # - loss_category: 只在最后一层计算，需要除以batch_size得到每张图的平均损失
+        # - loss_attribute: 只在最后一层计算，需要除以batch_size得到每张图的平均损失
         losses = {}
         losses["cls_loss"] = (
-            total_cls_loss / self.refine_layers
-        ) * self.cfg.cls_loss_weight
+            total_cls_loss
+            / self.refine_layers
+            * self.cfg.cls_loss_weight
+        )
         losses["reg_xytl_loss"] = (
-            total_reg_xytl_loss / self.refine_layers
-        ) * self.cfg.xyt_loss_weight
+            total_reg_xytl_loss
+            / self.refine_layers
+            * self.cfg.xyt_loss_weight
+        )
         losses["iou_loss"] = (
-            total_iou_loss / self.refine_layers
-        ) * self.cfg.iou_loss_weight
-        losses["loss_category"] = total_category_loss * self.cfg.category_loss_weight
-        losses["loss_attribute"] = total_attribute_loss * self.cfg.attribute_loss_weight
+            total_iou_loss
+            / self.refine_layers
+            * self.cfg.iou_loss_weight
+        )
+        # category和attribute只在最后一层计算，且已经除以了各自匹配到的数量
+        # 这里再除以batch_size得到每张图的平均损失
+        losses["loss_category"] = (
+            total_category_loss
+            / batch_size
+            * self.cfg.category_loss_weight
+        )
+        losses["loss_attribute"] = (
+            total_attribute_loss
+            / batch_size
+            * self.cfg.attribute_loss_weight
+        )
 
         seg_loss = torch.tensor(0.0, device=device)
         if outputs.get("seg", None) is not None and batch.get("seg", None) is not None:
-            seg_pred = F.interpolate(
-                outputs["seg"],
-                size=batch["seg"].shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
+            # PlainDecoder已经将seg上采样到[img_h, img_w]尺寸
+            # 如果batch["seg"]尺寸不同才需要上采样
+            seg_pred = outputs["seg"]
+            if seg_pred.shape[-2:] != batch["seg"].shape[-2:]:
+                seg_pred = F.interpolate(
+                    seg_pred,
+                    size=batch["seg"].shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
             seg_loss = self.criterion(
                 F.log_softmax(seg_pred, dim=1), batch["seg"].long()
             )

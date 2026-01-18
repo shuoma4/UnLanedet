@@ -503,10 +503,10 @@ def inference_on_dataset(
             start_eval_time = time.perf_counter()
             prediction.extend(outputs)
             prediction_indices.extend(batch_indices)  # Store batch indices
-            
+
             if is_view:
                 dataset.view(outputs,inputs['meta'],"viz")
-            # evaluator.process(inputs, outputs)
+            evaluator.process(inputs, outputs)
             total_eval_time += time.perf_counter() - start_eval_time
 
             iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)

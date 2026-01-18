@@ -1,7 +1,9 @@
 import logging
 import copy
+import os
+import torch  # 新增
 
-from unlanedet.checkpoint import Checkpointer,BestCheckPointer
+from unlanedet.checkpoint import Checkpointer, BestCheckPointer
 from unlanedet.config import LazyConfig, instantiate
 from unlanedet.engine import (
     AMPTrainer,
@@ -22,16 +24,14 @@ logger = logging.getLogger("unlanedet")
 
 def do_test(cfg, model):
     if "evaluator" in cfg.dataloader:
-        # Convert to SyncBatchNorm if in distributed mode and not already converted
         if comm.get_world_size() > 1:
-            import torch
-            # Check if model already has SyncBatchNorm modules
-            has_sync_bn = any(isinstance(module, torch.nn.SyncBatchNorm) 
-                            for module in model.modules())
+            has_sync_bn = any(
+                isinstance(module, torch.nn.SyncBatchNorm) for module in model.modules()
+            )
             if not has_sync_bn:
                 logger.info("Converting model to use SyncBatchNorm for evaluation")
                 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        
+
         ret = inference_on_dataset(
             model,
             instantiate(cfg.dataloader.test),
@@ -42,31 +42,12 @@ def do_test(cfg, model):
 
 
 def do_train(args, cfg):
-    """
-    Args:
-        cfg: an object with the following attributes:
-            model: instantiate to a module
-            dataloader.{train,test}: instantiate to dataloaders
-            dataloader.evaluator: instantiate to evaluator for test set
-            optimizer: instantaite to an optimizer
-            lr_multiplier: instantiate to a fvcore scheduler
-            train: other misc config defined in `configs/common/train.py`, including:
-                output_dir (str)
-                init_checkpoint (str)
-                amp.enabled (bool)
-                max_iter (int)
-                eval_period, log_period (int)
-                device (str)
-                checkpointer (dict)
-                ddp (dict)
-    """
     model = instantiate(cfg.model)
     logger = logging.getLogger("unlanedet")
     logger.info("Model:\n{}".format(model))
     model.to(cfg.train.device)
 
     if comm.get_world_size() > 1:
-        import torch
         logger.info("Converting model to use SyncBatchNorm")
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     cfg_copy = copy.deepcopy(cfg)
@@ -76,7 +57,9 @@ def do_train(args, cfg):
     train_loader = instantiate(cfg.dataloader.train)
 
     model = create_ddp_model(model, **cfg.train.ddp)
-    trainer = (AMPTrainer if cfg.train.amp.enabled else SimpleTrainer)(model, train_loader, optim)
+    trainer = (AMPTrainer if cfg.train.amp.enabled else SimpleTrainer)(
+        model, train_loader, optim
+    )
     checkpointer = BestCheckPointer(
         model,
         cfg.train.output_dir,
@@ -93,9 +76,12 @@ def do_train(args, cfg):
                 else None
             ),
             hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
-            # Save the model achieving the best result.
             (
-                hooks.BestCheckpointer(checkpointer=checkpointer,eval_period=cfg.train.eval_period,val_metric=cfg.dataloader.evaluator.metric)
+                hooks.BestCheckpointer(
+                    checkpointer=checkpointer,
+                    eval_period=cfg.train.eval_period,
+                    val_metric=cfg.dataloader.evaluator.metric,
+                )
                 if comm.is_main_process()
                 else None
             ),
@@ -112,8 +98,6 @@ def do_train(args, cfg):
 
     checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=args.resume)
     if args.resume and checkpointer.has_checkpoint():
-        # The checkpoint stores the training iteration that just finished, thus we start
-        # at the next iteration
         start_iter = trainer.iter + 1
     else:
         start_iter = 0
@@ -121,6 +105,12 @@ def do_train(args, cfg):
 
 
 def main(args):
+    # === 核心优化：开启 CuDNN Benchmark ===
+    # 针对固定输入尺寸加速卷积运算
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+    # ====================================
+
     cfg = LazyConfig.load(args.config_file)
     cfg = LazyConfig.apply_overrides(cfg, args.opts)
     default_setup(cfg, args)
@@ -148,4 +138,4 @@ def invoke_main() -> None:
 
 
 if __name__ == "__main__":
-    invoke_main()  # pragma: no cover
+    invoke_main()
