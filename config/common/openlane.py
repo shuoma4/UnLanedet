@@ -2,7 +2,7 @@ from omegaconf import OmegaConf
 from unlanedet.data.openlane import OpenLane
 from unlanedet.config import LazyCall as L
 from unlanedet.data.build import build_batch_data_loader
-from unlanedet.evaluation import LaneAttributeEvaluator
+from unlanedet.evaluation import OpenLaneEvaluator
 
 ori_img_h = 1280 
 ori_img_w = 1920 
@@ -37,7 +37,7 @@ dataloader.test = L(build_batch_data_loader)(
     shuffle=False,
 )
 
-dataloader.evaluator = L(LaneAttributeEvaluator)(
+dataloader.evaluator = L(OpenLaneEvaluator)(
     iou_threshold=0.5,
     width=30,
     metric='detection/f1'

@@ -163,6 +163,7 @@ cython_debug/
 
 output
 assets
+monitor_logs
 
 # extra ide
 .codebuddy 

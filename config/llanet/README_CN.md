@@ -1,5 +1,50 @@
 # LLANet OpenLane数据集训练指南
 
+## 准备工作
+
+1. 导入opencv动态库路径（自行选择），lane2d评估，调用的程序需要加载opencv动态库，需要设置环境变量
+···bash
+ export LD_LIBRARY_PATH=/home/lixiyang/anaconda3/envs/dataset-manger/lib:$LD_LIBRARY_PATH
+···
+
+## 杀死中断的训练进程
+
+```bash
+ps -ef | grep train  # 查看训练进程
+kill -9 <PID>        # 强制终止训练进程
+ps -ef | grep train | grep -v grep | awk '{print $2}' | xargs kill -9 # 直接杀死训练进程
+ps aux | grep python | grep -v grep | awk '{print $2}' | xargs -r kill -9  # 杀死所有python进程
+```
+
+## 监控程序用法
+
+在tmux中运行守护监控程序
+```bash
+python tools/safety_daemon.py
+# 或者使用nohup
+nohup python tools/safety_daemon.py &
+```
+
+停止守护监控程序
+```bash
+kill $(pgrep -f safety_daemon.py)
+```
+
+你可以通过命令行参数调整阈值：
+
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `--pid` | None | 手动指定要监控的进程 ID，指定后忽略 keyword。 |
+| `--keyword` | `tools/train_net.py` | 自动查找时匹配命令行的关键字。 |
+| `--my-mem-limit` | `55.0` | **你的内存配额 (GB)**。只有当你超过此值且系统内存不足时才杀。 |
+| `--my-cpu-limit` | `2500.0` | **你的 CPU 配额 (%)**。`2500` 代表占用 25 个物理核心。 |
+| `--sys-min-free-mem`| `20.0` | **系统危险线**：系统可用内存 (Free/Available) 低于此值 (GB) 时视为危险。 |
+| `--sys-max-cpu` | `96.0` | **系统危险线**：系统总 CPU 占用率超过此值 (%) 时视为危险。 |
+| `--patience` | `5` | **耐心值**。连续多少次检测到危险才执行查杀。 |
+| `--interval` | `3` | **检测间隔 (秒)**。 |
+| `--log-dir` | `./montor_logs/` | **日志目录**。 |
+| `--log-interval-steps` | `1` | **日志记录间隔 (步)**。 |
+
 ## ⚠️ 重要：多GPU训练环境变量设置
 
 **必须在使用多GPU训练前设置CUDA_VISIBLE_DEVICES环境变量！**

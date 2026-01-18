@@ -2,12 +2,13 @@ import os
 import os.path as osp
 import json
 import numpy as np
-from .base_dataset import BaseDataset
+import cv2
+import glob
+import pickle
 from tqdm import tqdm
-import logging
+from .base_dataset import BaseDataset
 
-# OpenLane lane category mapping
-# Including curbside lanes which are important for driving scenes
+# OpenLane lane category mapping (保持不变)
 LANE_CATEGORIES = {
     0: "unknown",
     1: "white-dash",
@@ -22,323 +23,278 @@ LANE_CATEGORIES = {
     10: "double-yellow-solid",
     11: "yellow-ldash-rsolid",
     12: "yellow-lsolid-rdash",
-    13: "left-curbside",  # Remapped from 20 to 13
-    14: "right-curbside",  # Remapped from 21 to 14
+    13: "left-curbside",
+    14: "right-curbside",
 }
 
-# Valid lane categories including curbside (remapped to 13, 14 for contiguous indices)
-# Original categories: 0-12 (lanes), 20-21 (curbsides) → Remapped to: 0-14
 VALID_LANE_CATEGORIES = {
-    0: 0,  # unknown
-    1: 1,  # white-dash
-    2: 2,  # white-solid
-    3: 3,  # double-white-dash
-    4: 4,  # double-white-solid
-    5: 5,  # white-ldash-rsolid
-    6: 6,  # white-lsolid-rdash
-    7: 7,  # yellow-dash
-    8: 8,  # yellow-solid
-    9: 9,  # double-yellow-dash
-    10: 10,  # double-yellow-solid
-    11: 11,  # yellow-ldash-rsolid
-    12: 12,  # yellow-lsolid-rdash
-    20: 13,  # left-curbside → 13
-    21: 14,  # right-curbside → 14
+    0: 0,
+    1: 1,
+    2: 2,
+    3: 3,
+    4: 4,
+    5: 5,
+    6: 6,
+    7: 7,
+    8: 8,
+    9: 9,
+    10: 10,
+    11: 11,
+    12: 12,
+    20: 13,
+    21: 14,
 }
-NUM_LANE_CATEGORIES = 15  # 0-14 (13 regular lanes + 2 curbsides)
 
 LEFT_RIGHT_ATTRIBUTES = {1: "left-left", 2: "left", 3: "right", 4: "right-right"}
-
-
-def _load_json_file(json_path):
-    """Helper function for parallel JSON loading (must be module-level for pickling)."""
-    try:
-        with open(json_path, "r") as f:
-            anno_data = json.load(f)
-            if "file_path" not in anno_data:
-                return None
-            return json_path, anno_data
-    except (json.JSONDecodeError, IOError, OSError):
-        return None
-
-
-LIST_FILE = {
-    "train": "list/train.txt",
-    "val": "list/val.txt",
-    "test": "list/test.txt",
-}
 
 
 class OpenLane(BaseDataset):
     def __init__(self, data_root, split, cut_height, processes=None, cfg=None):
         super().__init__(data_root, split, cut_height, processes=processes, cfg=cfg)
-        self.data_infos = []
 
-        # 🔧 修复：初始化 cfg
         self.cfg = cfg if cfg is not None else {}
+        self.use_preprocessed = self.cfg.get("use_preprocessed", False)
 
-        if cfg is not None:
-            self.use_2d_only = cfg.get("use_2d_only", True)
-            self.enable_attributes = cfg.get("enable_attributes", True)
-            self.enable_tracking = cfg.get("enable_tracking", False)
-        else:
-            self.use_2d_only = True
-            self.enable_attributes = True
-            self.enable_tracking = False
+        self.target_w = self.cfg.get("img_w", 800)
+        self.target_h = self.cfg.get("img_h", 320)
+        self.ori_w = 1920
+        self.ori_h = 1280
+        self.valid_ori_h = self.ori_h - self.cut_height
 
-        self.list_path = self._get_list_path(split)
-        self.load_annotations()
-
-    def _get_list_path(self, split):
-        """OpenLane数据集直接扫描目录,不使用list文件"""
-        return None
-
-    def load_annotations(self):
-        self.logger.info("Loading OpenLane annotations...")
-        # OpenLane直接扫描目录加载标注文件
-        self._scan_annotations()
-        self.logger.info(f"Loaded {len(self.data_infos)} samples")
-
-    def _scan_annotations(self):
-        from multiprocessing import Pool, cpu_count
-
-        anno_dirs = [
-            osp.join(self.data_root, "lane3d_300", "training"),
-            osp.join(self.data_root, "lane3d_300", "validation"),
-            # osp.join(self.data_root, "lane3d_1000", "training"),
-            # osp.join(self.data_root, "lane3d_1000", "validation"),
-        ]
-
-        # Step 1: Fast path collection using scandir (much faster than os.walk)
-        json_paths = []
-        for anno_dir in anno_dirs:
-            if not osp.exists(anno_dir):
-                continue
-            self.logger.info(f"Scanning {anno_dir}...")
-            try:
-                with os.scandir(anno_dir) as entries:
-                    for entry in entries:
-                        if entry.is_dir():
-                            try:
-                                with os.scandir(entry.path) as sub_entries:
-                                    for sub_entry in sub_entries:
-                                        if (
-                                            sub_entry.is_file()
-                                            and sub_entry.name.endswith(".json")
-                                        ):
-                                            json_paths.append(sub_entry.path)
-                            except (PermissionError, OSError):
-                                continue
-            except (PermissionError, OSError):
-                continue
-
-        self.logger.info(f"Found {len(json_paths)} annotation files, loading...")
-
-        # Step 2: Parallel loading
-        num_workers = min(4, cpu_count())  # 限制最大进程数为4
-        chunk_size = max(1, len(json_paths) // (num_workers * 8))
-
-        with Pool(num_workers) as pool:
-            results = list(
-                tqdm(
-                    pool.imap(_load_json_file, json_paths, chunksize=chunk_size),
-                    total=len(json_paths),
-                    desc="Loading annotations",
-                )
+        if self.use_preprocessed:
+            self.logger.info(
+                f"[OpenLane] Preprocessed Mode ENABLED. Target: {self.target_w}x{self.target_h}"
             )
-
-        # Step 3: Process loaded data
-        for result in results:
-            if result is None:
-                continue
-            json_path, anno_data = result
-            infos = self._process_annotation_data(json_path, anno_data)
-            if infos:
-                self.data_infos.append(infos)
-
-        self.logger.info(f"Loaded {len(self.data_infos)} valid samples")
-
-    def _process_annotation_data(self, json_path, anno_data):
-        """Process annotation data after it's been loaded."""
-        infos = {}
-
-        file_path = anno_data.get("file_path", "")
-        if not file_path:
-            return None
-
-        img_path = osp.join(self.data_root, file_path)
-
-        if not osp.exists(img_path):
-            possible_bases = [
-                self.data_root,
-                osp.join(self.data_root, "dataset", "raw"),
-            ]
-            for base in possible_bases:
-                possible_path = osp.join(base, file_path)
-                if osp.exists(possible_path):
-                    img_path = possible_path
-                    break
-
-        if not osp.exists(img_path):
-            return None
-
-        infos["img_name"] = file_path
-        infos["img_path"] = img_path
-
-        # Extract lane information
-        lanes_info = anno_data.get("lane_lines", [])
-        lanes = []
-        lane_categories = []
-        lane_attributes = []
-        lane_track_ids = []
-
-        for lane_info in lanes_info:
-            uv = lane_info.get("uv", [])
-            if len(uv) < 2 or len(uv[0]) < 2:
-                continue
-            u_coords = uv[0]
-            v_coords = uv[1]
-            lane_points = [
-                (u_coords[i], v_coords[i])
-                for i in range(len(u_coords))
-                if u_coords[i] > 0 and v_coords[i] > 0
-            ]
-            if len(lane_points) < 2:
-                continue
-
-            # Keep order and deduplicate
-            seen = set()
-            lane_points_unique = []
-            for point in lane_points:
-                if point not in seen:
-                    seen.add(point)
-                    lane_points_unique.append(point)
-            lane_points = lane_points_unique
-
-            lane_points = sorted(lane_points, key=lambda p: p[1])
-            lane_points = [p for p in lane_points if p[1] >= self.cut_height]
-            if len(lane_points) < 2:
-                continue
-            lanes.append(lane_points)
-
-            if self.enable_attributes:
-                category = lane_info.get("category", 0)
-                # Remap categories including curbside (20→13, 21→14)
-                if category in VALID_LANE_CATEGORIES:
-                    category = VALID_LANE_CATEGORIES[category]
-                else:
-                    category = 0  # unknown for any other category
-                lane_categories.append(category)
-                attribute = lane_info.get("attribute", 0)
-                lane_attributes.append(attribute)
-
-            if self.enable_tracking:
-                track_id = lane_info.get("track_id", -1)
-                lane_track_ids.append(track_id)
-
-        lane_exist = np.ones(len(lanes), dtype=np.float32)
-        infos["lanes"] = lanes
-
-        if self.enable_attributes:
-            max_lanes = self.cfg.get("max_lanes", 4)
-            # Always ensure exactly max_lanes entries
-            if len(lane_categories) > max_lanes:
-                # Truncate if too many lanes
-                lane_categories = lane_categories[:max_lanes]
-                lane_attributes = lane_attributes[:max_lanes]
-            elif len(lane_categories) < max_lanes:
-                # Pad if too few lanes
-                pad_len = max_lanes - len(lane_categories)
-                lane_categories = np.pad(
-                    lane_categories, (0, pad_len), constant_values=0
-                )
-                lane_attributes = np.pad(
-                    lane_attributes, (0, pad_len), constant_values=0
-                )
-
-            infos["lane_categories"] = np.array(lane_categories, dtype=np.int64)
-            infos["lane_attributes"] = np.array(lane_attributes, dtype=np.int64)
-
-        if self.enable_tracking:
-            infos["lane_track_ids"] = np.array(lane_track_ids, dtype=np.int64)
-            max_lanes = self.cfg.get("max_lanes", 4)
-            if len(lane_track_ids) < max_lanes:
-                pad_len = max_lanes - len(lane_track_ids)
-                infos["lane_track_ids"] = np.pad(
-                    infos["lane_track_ids"], (0, pad_len), constant_values=-1
-                )
-
-        infos["lane_exist"] = lane_exist
-        return infos
-
-    def load_annotation(self, line_or_path):
-        """Load annotation from a list file entry."""
-        infos = {}
-
-        if osp.exists(line_or_path) and line_or_path.endswith(".json"):
-            # Load JSON and process
-            with open(line_or_path, "r") as f:
-                anno_data = json.load(f)
-            return self._process_annotation_data(line_or_path, anno_data)
+            self.h_scale = self.target_h / self.valid_ori_h
+            self.w_scale = self.target_w / self.ori_w
         else:
-            # Parse line from list file
-            parts = line_or_path.split()
-            if len(parts) < 1:
-                return None
-            img_line = parts[0]
-            img_line = img_line[1 if img_line[0] == "/" else 0 :]
-            img_path = osp.join(self.data_root, img_line)
-            if not osp.exists(img_path):
-                self.logger.warning(f"Cannot find image: {img_path}")
-                return None
+            self.h_scale = 1.0
+            self.w_scale = 1.0
 
-            # Find corresponding JSON
-            json_path = img_path.rsplit(".", 1)[0] + ".json"
-            if not osp.exists(json_path):
-                json_path = img_path + ".json"
+        self.enable_attributes = self.cfg.get("enable_attributes", True)
+        self.enable_tracking = self.cfg.get("enable_tracking", False)
 
-            if osp.exists(json_path):
+        # 缓存文件名 (区分训练/验证集)
+        self.cache_path = os.path.join(data_root, f"openlane_{split}_cache_compact.pkl")
+
+        # 加载数据
+        self.data_infos = self.load_annotations(split)
+
+    def load_annotations(self, split):
+        # 1. 尝试加载缓存
+        if os.path.exists(self.cache_path):
+            self.logger.info(f"Loading cached annotations from {self.cache_path}...")
+            try:
+                with open(self.cache_path, "rb") as f:
+                    data_infos = pickle.load(f)
+                self.logger.info(
+                    f"Successfully loaded {len(data_infos)} samples from cache."
+                )
+                return data_infos
+            except Exception as e:
+                self.logger.warning(f"Failed to load cache: {e}. Re-generating...")
+
+        # 2. 如果缓存不存在，生成缓存
+        self.logger.info("Generating annotation cache (This runs only once)...")
+        data_infos = self._generate_cache(split)
+
+        # 3. 保存缓存
+        self.logger.info(f"Saving cache to {self.cache_path}...")
+        try:
+            with open(self.cache_path, "wb") as f:
+                pickle.dump(data_infos, f)
+        except Exception as e:
+            self.logger.warning(f"Failed to save cache: {e}")
+
+        return data_infos
+
+    def _generate_cache(self, split):
+        """
+        扫描 JSON 并提取核心数据，丢弃冗余信息以节省内存。
+        """
+        # 从配置中获取 lane_anno_dir，默认为 lane3d_300
+        lane_anno_dir = self.cfg.get("lane_anno_dir", "lane3d_300/")
+        
+        if split == "train":
+            anno_dirs = [osp.join(self.data_root, lane_anno_dir, "training")]
+        elif split == "val" or split == "test":
+            anno_dirs = [osp.join(self.data_root, lane_anno_dir, "validation")]
+        else:
+            # Fallback for generic split names
+            anno_dirs = [
+                osp.join(self.data_root, lane_anno_dir, "training"),
+                osp.join(self.data_root, lane_anno_dir, "validation"),
+            ]
+
+        json_files = []
+        for anno_dir in anno_dirs:
+            if osp.exists(anno_dir):
+                json_files.extend(
+                    glob.glob(osp.join(anno_dir, "**/*.json"), recursive=True)
+                )
+
+        compact_infos = []
+
+        for json_path in tqdm(json_files, desc="Parsing JSONs"):
+            try:
                 with open(json_path, "r") as f:
                     anno_data = json.load(f)
-                return self._process_annotation_data(json_path, anno_data)
-            else:
-                self.logger.warning(f"Cannot find annotation for {img_path}")
-                return None
+
+                # --- 提取核心数据 ---
+                file_path = anno_data.get("file_path", "")
+                if not file_path:
+                    continue
+
+                # 1. 预计算图片路径
+                if self.use_preprocessed:
+                    parts = file_path.split(os.sep)
+                    if len(parts) > 1:
+                        split_name = parts[0]
+                        rest_path = os.sep.join(parts[1:])
+                        new_folder = (
+                            f"{split_name}_resized_{self.target_w}_{self.target_h}"
+                        )
+                        img_path = osp.join(self.data_root, new_folder, rest_path)
+                    else:
+                        img_path = osp.join(self.data_root, file_path)
+                else:
+                    img_path = osp.join(self.data_root, file_path)
+                    if not osp.exists(img_path):
+                        possible = osp.join(self.data_root, "dataset", "raw", file_path)
+                        if osp.exists(possible):
+                            img_path = possible
+
+                # 2. 提取车道线坐标 (提前做完坐标转换，__getitem__里就不用做了)
+                lanes_info = anno_data.get("lane_lines", [])
+                lanes = []
+                lane_categories = []
+                lane_attributes = []
+
+                for lane_info in lanes_info:
+                    uv = lane_info.get("uv", [])
+                    if len(uv) < 2 or len(uv[0]) < 2:
+                        continue
+
+                    # 转换为 numpy 提高处理速度，最后转回 list 或 array 存入
+                    u_coords = np.array(uv[0], dtype=np.float32)
+                    v_coords = np.array(uv[1], dtype=np.float32)
+
+                    # 坐标转换 (Pre-calculation)
+                    if self.use_preprocessed:
+                        v_coords = v_coords - self.cut_height
+                        u_coords = u_coords * self.w_scale
+                        v_coords = v_coords * self.h_scale
+
+                        # Vectorized boundary check
+                        valid_mask = (
+                            (u_coords >= 0)
+                            & (u_coords < self.target_w)
+                            & (v_coords >= 0)
+                            & (v_coords < self.target_h)
+                        )
+                    else:
+                        valid_mask = (v_coords >= self.cut_height) & (u_coords > 0)
+
+                    u_valid = u_coords[valid_mask]
+                    v_valid = v_coords[valid_mask]
+
+                    if len(u_valid) < 2:
+                        continue
+
+                    # Stack points
+                    points = np.stack([u_valid, v_valid], axis=1)
+
+                    # 去重和排序 (Unique & Sort by Y)
+                    # Lexsort to sort by Y (column 1)
+                    # Note: Unique might reorder, so we sort after
+                    _, idx = np.unique(points, axis=0, return_index=True)
+                    points = points[idx]
+                    points = points[points[:, 1].argsort()]
+
+                    if len(points) < 2:
+                        continue
+
+                    # 存入列表 (转为 list 以便 pickle 序列化更通用，或者保持 numpy)
+                    # 这里保持 numpy float32 极其节省内存
+                    lanes.append(points.astype(np.float32))
+
+                    if self.enable_attributes:
+                        cat = lane_info.get("category", 0)
+                        lane_categories.append(VALID_LANE_CATEGORIES.get(cat, 0))
+                        lane_attributes.append(lane_info.get("attribute", 0))
+
+                if len(lanes) == 0:
+                    continue
+
+                # 3. 构建紧凑字典
+                # 只保留训练必须的字段
+                sample = {
+                    "img_path": img_path,
+                    "img_name": file_path,
+                    "lanes": lanes,  # List of numpy arrays
+                }
+
+                if self.enable_attributes:
+                    # Pad attributes here to save time in getitem
+                    max_lanes = self.cfg.get("max_lanes", 24)
+                    l_cats = np.array(lane_categories, dtype=np.int64)
+                    l_attrs = np.array(lane_attributes, dtype=np.int64)
+
+                    if len(l_cats) > max_lanes:
+                        l_cats = l_cats[:max_lanes]
+                        l_attrs = l_attrs[:max_lanes]
+                    elif len(l_cats) < max_lanes:
+                        pad = max_lanes - len(l_cats)
+                        l_cats = np.pad(l_cats, (0, pad), constant_values=0)
+                        l_attrs = np.pad(l_attrs, (0, pad), constant_values=0)
+
+                    sample["lane_categories"] = l_cats
+                    sample["lane_attributes"] = l_attrs
+
+                compact_infos.append(sample)
+
+            except Exception as e:
+                continue
+
+        return compact_infos
 
     def __len__(self):
         return len(self.data_infos)
 
     def __getitem__(self, idx):
-        """重写__getitem__方法,OpenLane数据集不使用分割mask"""
+        # 直接从内存获取数据，无需 IO 和 解析
         data_info = self.data_infos[idx]
+
+        # 图片读取
         if not osp.isfile(data_info["img_path"]):
-            raise FileNotFoundError(
-                "cannot find file: {}".format(data_info["img_path"])
-            )
+            return self.__getitem__((idx + 1) % len(self))
 
         import cv2
         from .transform import DataContainer as DC
 
         img = cv2.imread(data_info["img_path"])
-        img = img[self.cut_height :, :, :]
+        if img is None:
+            return self.__getitem__((idx + 1) % len(self))
+
+        # 裁剪 (仅非预处理模式)
+        if not self.use_preprocessed:
+            img = img[self.cut_height :, :, :]
+
+        # 构造返回样本 (浅拷贝即可)
         sample = data_info.copy()
-        sample.update({"img": img})
+        sample["img"] = img
 
-        # 传递lane_categories和lane_attributes到sample
-        if "lane_categories" in data_info:
-            sample["lane_categories"] = data_info["lane_categories"]
-        if "lane_attributes" in data_info:
-            sample["lane_attributes"] = data_info["lane_attributes"]
+        # 生成 existence flag
+        sample["lane_exist"] = np.ones(len(data_info["lanes"]), dtype=np.float32)
 
-        # OpenLane数据集不使用分割mask,跳过mask读取
-        # 直接进行数据预处理
+        # Transform
         sample = self.processes(sample)
+
         meta = {
             "full_img_path": data_info["img_path"],
             "img_name": data_info["img_name"],
         }
-        meta = DC(meta, cpu_only=True)
-        sample.update({"meta": meta})
+        sample.update({"meta": DC(meta, cpu_only=True)})
 
         return sample
 
