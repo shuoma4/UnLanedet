@@ -77,6 +77,7 @@ lane_anno_dir = "lane3d_300/"  # 车道线标注目录，相对于data_root的�
 param_config = OmegaConf.create()
 param_config.opencv_path = opencv_path
 param_config.use_preprocessed = True
+param_config.use_pretrained_backbone = True
 param_config.iou_loss_weight = iou_loss_weight
 param_config.cls_loss_weight = cls_loss_weight
 param_config.xyt_loss_weight = xyt_loss_weight

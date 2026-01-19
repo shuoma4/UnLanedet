@@ -89,6 +89,12 @@ class LLANetHead(nn.Module):
         self.reg_layers = nn.Linear(self.fc_hidden_dim, self.n_offsets + 1 + 2 + 1)
         self.cls_layers = nn.Linear(self.fc_hidden_dim, 2)
 
+        # 设置分类层 bias，使得初始正样本概率极低（0.01），避免 Mode Collapse
+        # bias = -log((1-p)/p), p=0.01 => bias ≈ -4.59
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        nn.init.constant_(self.cls_layers.bias, bias_value)
+
         if self.enable_category:
             self.category_modules = nn.ModuleList(
                 [
@@ -131,10 +137,26 @@ class LLANetHead(nn.Module):
         self.init_weights()
 
     def init_weights(self):
+        import math
+
+        # 分类层初始化：设置 bias 使得初始正样本概率极低（0.01），避免 Mode Collapse
         for m in self.cls_layers.parameters():
-            nn.init.normal_(m, mean=0.0, std=1e-3)
+            if isinstance(m, nn.Linear):
+                # Weight 使用小的正态分布
+                nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+                # Bias 设置使得初始预测概率约为 0.01
+                # bias = -log((1-p)/p), p=0.01 => bias ≈ -4.59
+                prior_prob = 0.01
+                bias_value = -math.log((1 - prior_prob) / prior_prob)
+                nn.init.constant_(m.bias, bias_value)
+            else:
+                nn.init.normal_(m, mean=0.0, std=1e-3)
+
+        # 回归层初始化
         for m in self.reg_layers.parameters():
             nn.init.normal_(m, mean=0.0, std=1e-3)
+
+        # Category 和 Attribute 层初始化
         if self.enable_category:
             for m in self.category_modules.parameters():
                 if isinstance(m, nn.Linear):
@@ -429,18 +451,39 @@ class LLANetHead(nn.Module):
                     target_starts = (reg_target[:, 0] * self.n_strips).round().long()
                     reg_target[:, 3] -= (pred_starts - target_starts) / self.n_strips
 
-                # 还原到绝对坐标
-                reg_pred_abs = reg_pred.clone()
-                reg_pred_abs[:, 0] *= self.n_strips
-                reg_pred_abs[:, 1] *= self.img_w - 1
-                reg_pred_abs[:, 2] *= 180
-                reg_pred_abs[:, 3] *= self.n_strips
+                # 将 Theta 从 [0, 1] 转换为角度，再转换为 sin/cos 编码以解决周期性
+                # Theta: [0, 1] -> [0, 180] -> [0, pi] -> sin/cos
+                theta_pred_rad = reg_pred[:, 2] * math.pi  # 转换为弧度 [0, pi]
+                theta_target_rad = reg_target[:, 2] * math.pi
 
-                reg_target_abs = reg_target.clone()
-                reg_target_abs[:, 0] *= self.n_strips
-                reg_target_abs[:, 1] *= self.img_w - 1
-                reg_target_abs[:, 2] *= 180
-                reg_target_abs[:, 3] *= self.n_strips
+                # 计算 sin/cos
+                theta_pred_sin = torch.sin(theta_pred_rad)
+                theta_pred_cos = torch.cos(theta_pred_rad)
+                theta_target_sin = torch.sin(theta_target_rad)
+                theta_target_cos = torch.cos(theta_target_rad)
+
+                # 还原到绝对坐标，但 Theta 使用 sin/cos
+                reg_pred_abs = torch.stack(
+                    [
+                        reg_pred[:, 0] * self.n_strips,  # X
+                        reg_pred[:, 1] * (self.img_w - 1),  # Y
+                        theta_pred_sin,  # Theta sin
+                        theta_pred_cos,  # Theta cos
+                        reg_pred[:, 3] * self.n_strips,  # Length
+                    ],
+                    dim=1,
+                )
+
+                reg_target_abs = torch.stack(
+                    [
+                        reg_target[:, 0] * self.n_strips,
+                        reg_target[:, 1] * (self.img_w - 1),
+                        theta_target_sin,
+                        theta_target_cos,
+                        reg_target[:, 3] * self.n_strips,
+                    ],
+                    dim=1,
+                )
 
                 total_reg_xytl_loss += F.smooth_l1_loss(
                     reg_pred_abs, reg_target_abs, reduction="mean"
