@@ -20,7 +20,7 @@ if "--num-gpus" in sys.argv:
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 40
+TARGET_BATCH_PER_GPU = 60
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
@@ -33,7 +33,6 @@ print(
 from ..modelzoo import get_config
 from omegaconf import OmegaConf
 from unlanedet.config import LazyCall as L
-from unlanedet.model.LLANet.mobilenetv4_small import MobileNetV4Small
 from unlanedet.model.LLANet.llanet_head import LLANetHead
 from unlanedet.model.LLANet.gsa_fpn import GSAFPN
 from unlanedet.model.LLANet.llanet import LLANet
@@ -48,7 +47,7 @@ from fvcore.common.param_scheduler import (
 )
 from ..modelzoo import get_config
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
-from .model_factory import create_llanet_model
+from unlanedet.model import ResNetWrapper, FPN
 
 opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
 
@@ -63,7 +62,7 @@ attribute_loss_weight = 0.5
 num_points = 72
 max_lanes = 24
 sample_y = range(589, 230, -20)
-num_priors = 96
+num_priors = 192
 num_lane_categories = 15
 num_lr_attributes = 4
 
@@ -111,8 +110,28 @@ param_config.num_classes = num_classes
 param_config.num_lane_categories = num_lane_categories
 param_config.num_lr_attributes = num_lr_attributes
 param_config.num_priors = num_priors
+
 # Model
-model = create_llanet_model(param_config)
+model = L(LLANet)(
+    backbone=L(ResNetWrapper)(
+        resnet="resnet18",
+        pretrained=True,
+        replace_stride_with_dilation=[False, False, False],
+        out_conv=False,
+    ),
+    neck=L(FPN)(
+        in_channels=[128, 256, 512], out_channels=64, num_outs=3, attention=False
+    ),
+    head=L(LLANetHead)(
+        num_priors=192,
+        refine_layers=3,
+        fc_hidden_dim=64,
+        sample_points=36,
+        cfg=param_config,
+        enable_category=True,
+        enable_attribute=True,
+    ),
+)
 
 # Training Config
 train = get_config("config/common/train.py").train

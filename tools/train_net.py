@@ -23,6 +23,15 @@ logger = logging.getLogger("unlanedet")
 
 
 def do_test(cfg, model):
+    # Ensure model is on correct device before inference
+    device = cfg.train.device
+    logger.info(f"Moving model to device: {device}")
+    model = model.to(device)
+
+    # Debug: check model parameters device
+    for name, param in list(model.named_parameters())[:3]:
+        logger.info(f"Parameter {name} device: {param.device}")
+
     if "evaluator" in cfg.dataloader:
         if comm.get_world_size() > 1:
             has_sync_bn = any(
@@ -117,9 +126,17 @@ def main(args):
 
     if args.eval_only:
         model = instantiate(cfg.model)
+        logger.info(f"Instantiated model, initial device of first param: {next(model.parameters()).device}")
         model.to(cfg.train.device)
+        logger.info(f"Moved model to {cfg.train.device}, first param device now: {next(model.parameters()).device}")
         model = create_ddp_model(model)
-        Checkpointer(model).load(cfg.train.init_checkpoint)
+        if cfg.train.init_checkpoint:
+            logger.info(f"Loading checkpoint from: {cfg.train.init_checkpoint}")
+            Checkpointer(model).load(cfg.train.init_checkpoint)
+            # Ensure model is on correct device after loading checkpoint
+            model.to(cfg.train.device)
+            logger.info(f"After loading checkpoint, first param device: {next(model.parameters()).device}")
+        model.eval()
         print(do_test(cfg, model))
     else:
         do_train(args, cfg)

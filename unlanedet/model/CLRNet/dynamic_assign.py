@@ -1,116 +1,164 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from .line_iou import line_iou
 
 
-def distance_cost(predictions, targets, img_w):
-    """Broadcasting optimized distance cost"""
-    # preds: (N, 72) -> (N, 1, 72)
-    # targs: (M, 72) -> (1, M, 72)
-    preds_pts = predictions[..., 6:]
-    targs_pts = targets[..., 6:]
+class DynamicAssign(nn.Module):
+    def __init__(self, cfg=None):
+        super(DynamicAssign, self).__init__()
+        self.simota_q = 10
+        self.w_cls = getattr(cfg, "w_cls", 3.0)
+        self.w_iou = getattr(cfg, "w_iou", 3.0)
+        self.w_reg = getattr(cfg, "w_reg", 3.0)
 
-    # Broadcasting abs diff: (N, M, 72)
-    dists = torch.abs(preds_pts.unsqueeze(1) - targs_pts.unsqueeze(0))
+    def forward(self, preds, targets, masks, img_w, img_h):
+        """
+        Args:
+            preds: (B, Num_Priors, Pred_Dim)
+            targets: (B, Max_Targets, Target_Dim)
+            masks: (B, Max_Targets)
+        """
+        device = preds.device
+        batch_size, num_priors, _ = preds.shape
+        _, max_targets, _ = targets.shape
 
-    # Invalid masks: (1, M, 72)
-    invalid_masks = (targs_pts < 0) | (targs_pts >= img_w)
-    invalid_masks = invalid_masks.unsqueeze(0)
+        if max_targets == 0:
+            return torch.zeros(
+                (batch_size, num_priors), dtype=torch.bool, device=device
+            ), torch.full((batch_size, num_priors), -1, dtype=torch.long, device=device)
 
-    # Lengths: (1, M)
-    lengths = (~invalid_masks).sum(dim=-1)
+        # 1. 提取并转换预测值 (Logits -> Probs)
+        pred_logits = preds[..., :2]
+        pred_probs = F.softmax(pred_logits, dim=-1)
+        pred_scores = pred_probs[..., 1]  # (B, Num_Priors)
 
-    # Zero out invalid distances
-    dists = torch.where(invalid_masks, torch.zeros_like(dists), dists)
+        pred_start_y = preds[..., 2]
+        pred_start_x = preds[..., 3]
+        pred_theta = preds[..., 4]
 
-    # Sum over points: (N, M)
-    cost = dists.sum(dim=-1) / (lengths.float() + 1e-9)
-    return cost
+        # 2. 提取目标值
+        gt_start_y = targets[..., 2]
+        gt_start_x = targets[..., 3]
+        gt_theta = targets[..., 4]
 
+        # ========================================
+        # A. 计算 Cost Matrix
+        # ========================================
 
-def focal_cost(cls_pred, gt_labels, alpha=0.25, gamma=2, eps=1e-12):
-    cls_pred = cls_pred.sigmoid()
-    neg_cost = -(1 - cls_pred + eps).log() * (1 - alpha) * cls_pred.pow(gamma)
-    pos_cost = -(cls_pred + eps).log() * alpha * (1 - cls_pred).pow(gamma)
-    cls_cost = pos_cost[:, gt_labels] - neg_cost[:, gt_labels]
-    return cls_cost
+        # A.1 Classification Cost
+        pair_wise_cls_cost = -torch.log(pred_scores.unsqueeze(2).clamp(min=1e-8))
 
+        # A.2 Regression Cost
+        cost_x = torch.abs(pred_start_x.unsqueeze(2) - gt_start_x.unsqueeze(1))
+        cost_y = torch.abs(pred_start_y.unsqueeze(2) - gt_start_y.unsqueeze(1))
+        cost_theta = torch.abs(pred_theta.unsqueeze(2) - gt_theta.unsqueeze(1))
+        pair_wise_reg_cost = cost_x + cost_y + cost_theta
 
-def dynamic_k_assign(cost, pair_wise_ious):
-    ious_matrix = pair_wise_ious.clamp(min=0.0)
-    topk_ious, _ = torch.topk(ious_matrix, k=min(4, ious_matrix.size(0)), dim=0)
-    dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)
+        # A.3 IoU Cost (修复维度广播)
+        pred_lines = preds[..., 6:] * (img_w - 1)
+        gt_lines = targets[..., 6:] * (img_w - 1)
 
-    num_gt = cost.shape[1]
-    matching_matrix = torch.zeros_like(cost)
+        iou_cost_list = []
+        ious_list = []
 
-    for gt_idx in range(num_gt):
-        _, pos_idx = torch.topk(
-            cost[:, gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
+        for i in range(batch_size):
+            valid_gt_mask = masks[i].bool()
+            num_valid = int(valid_gt_mask.sum())
+
+            if num_valid == 0:
+                iou_cost_list.append(
+                    torch.zeros(num_priors, max_targets, device=device)
+                )
+                ious_list.append(torch.zeros(num_priors, max_targets, device=device))
+                continue
+
+            # (Num_Priors, 1, 72) vs (1, Num_Valid, 72) -> 自动广播
+            cur_pred_lines = pred_lines[i].unsqueeze(1)
+            cur_gt_lines = gt_lines[i, :num_valid].unsqueeze(0)
+
+            # (Num_Priors, Num_Valid)
+            l_iou = line_iou(cur_pred_lines, cur_gt_lines, img_w, length=15)
+            l_iou = torch.nan_to_num(l_iou, nan=0.0)  # 安全防护
+
+            # Fill Padding
+            padded_iou = torch.zeros(num_priors, max_targets, device=device)
+            padded_iou[:, :num_valid] = l_iou
+
+            padded_iou_cost = -torch.log(padded_iou[:, :num_valid].clamp(min=1e-8))
+            full_iou_cost = torch.zeros(num_priors, max_targets, device=device)
+            full_iou_cost[:, :num_valid] = padded_iou_cost
+
+            iou_cost_list.append(full_iou_cost)
+            ious_list.append(padded_iou)
+
+        pair_wise_iou_cost = torch.stack(iou_cost_list)
+        pair_wise_ious = torch.stack(ious_list)
+
+        # A.4 Total Cost
+        mask_expanded = masks.unsqueeze(1).expand(-1, num_priors, -1)
+        total_cost = (
+            self.w_cls * pair_wise_cls_cost
+            + self.w_reg * pair_wise_reg_cost
+            + self.w_iou * pair_wise_iou_cost
+            + 100000.0 * (~mask_expanded.bool()).float()
         )
-        matching_matrix[pos_idx, gt_idx] = 1.0
 
-    matched_gt = matching_matrix.sum(1)
-    if (matched_gt > 1).sum() > 0:
-        conflict_mask = matched_gt > 1
-        cost_conflict = cost[conflict_mask]
-        cost_argmin = torch.min(cost_conflict, dim=1)[1]
-        matching_matrix[conflict_mask] = 0.0
-        matching_matrix[conflict_mask, cost_argmin] = 1.0
+        # ========================================
+        # B. SimOTA (简化且安全的版本)
+        # ========================================
+        n_candidate_k = min(self.simota_q, num_priors)
+        topk_ious, _ = torch.topk(pair_wise_ious, n_candidate_k, dim=1)
+        dynamic_ks = torch.clamp(topk_ious.sum(1).int(), min=1, max=num_priors)
 
-    prior_idx, gt_idx = matching_matrix.nonzero(as_tuple=True)
-    return prior_idx, gt_idx
+        # 初始化分配矩阵
+        matched_targets_matrix = torch.full(
+            (batch_size, num_priors), -1, dtype=torch.long, device=device
+        )
+        # 记录当前每个 Prior 被分配时的最小 Cost，用于解决冲突
+        matched_min_costs = torch.full(
+            (batch_size, num_priors), 1e8, dtype=torch.float32, device=device
+        )
+
+        for b in range(batch_size):
+            num_gt = int(masks[b].sum())
+            if num_gt == 0:
+                continue
+
+            cost_b = total_cost[b, :, :num_gt]  # (Num_Priors, Num_GT)
+            k_b = dynamic_ks[b, :num_gt]  # (Num_GT)
+
+            # 遍历每个 GT 进行分配
+            for gt_idx in range(num_gt):
+                k = k_b[gt_idx].item()
+                k = max(1, min(k, num_priors))  # 确保 k 有效
+
+                # 获取该 GT cost 最小的 topk 个 prior
+                current_costs = cost_b[:, gt_idx]
+                topk_costs, pos_idx = torch.topk(current_costs, k, largest=False)
+
+                # 安全更新逻辑：
+                # 只有当 (Prior 未被分配) OR (Prior 已被分配但新 Cost 更小) 时，才更新
+
+                # 1. 获取选中的 Prior 当前记录的最小 Cost
+                current_min_costs = matched_min_costs[b, pos_idx]
+
+                # 2. 判断是否需要更新 (New Cost < Current Min Cost)
+                update_mask = topk_costs < current_min_costs
+
+                # 3. 筛选出需要更新的 Prior 索引
+                valid_indices = pos_idx[update_mask]
+                valid_costs = topk_costs[update_mask]
+
+                # 4. 执行更新
+                if len(valid_indices) > 0:
+                    matched_targets_matrix[b, valid_indices] = gt_idx
+                    matched_min_costs[b, valid_indices] = valid_costs
+
+        assigned_mask = matched_targets_matrix >= 0
+        return assigned_mask, matched_targets_matrix
 
 
-def assign(
-    predictions, targets, img_w, img_h, distance_cost_weight=3.0, cls_cost_weight=1.0
-):
-    # Clone only when necessary
-    preds_scaled = predictions.clone()
-    preds_scaled[..., 6:] *= img_w - 1
-    preds_scaled[..., 3] *= img_w - 1
-
-    targs_scaled = targets.clone()
-    targs_scaled[..., 6:] *= img_w - 1
-
-    # 1. Dist Cost
-    dist_score = distance_cost(preds_scaled, targs_scaled, img_w)
-    max_dist = torch.max(dist_score)
-    if max_dist > 0:
-        dist_score = 1 - (dist_score / max_dist) + 1e-2
-    else:
-        dist_score = torch.ones_like(dist_score)
-
-    # 2. Cls Cost
-    cls_score = focal_cost(predictions[:, :2], targets[:, 1].long())
-
-    # 3. Start XY Cost
-    pred_start = predictions[:, 2:4].clone()
-    pred_start[:, 0] *= img_h - 1
-    pred_start[:, 1] *= img_w - 1
-    targ_start = targets[:, 2:4].clone()
-    targ_start[:, 0] *= img_h - 1
-    targ_start[:, 1] *= img_w - 1
-
-    start_score = torch.cdist(pred_start, targ_start, p=2)
-    max_start = torch.max(start_score)
-    if max_start > 0:
-        start_score = (1 - start_score / max_start) + 1e-2
-
-    # 4. Theta Cost
-    theta_score = (
-        torch.cdist(predictions[:, 4].unsqueeze(-1), targets[:, 4].unsqueeze(-1), p=1)
-        * 180
-    )
-    max_theta = torch.max(theta_score)
-    if max_theta > 0:
-        theta_score = (1 - theta_score / max_theta) + 1e-2
-
-    cost = (
-        -((dist_score * start_score * theta_score) ** 2) * distance_cost_weight
-        + cls_score * cls_cost_weight
-    )
-
-    # 5. IoU
-    iou = line_iou(preds_scaled[..., 6:], targs_scaled[..., 6:], img_w, aligned=False)
-
-    return dynamic_k_assign(cost, iou)
+def assign(preds, targets, masks, img_w, img_h):
+    assigner = DynamicAssign()
+    return assigner(preds, targets, masks, img_w, img_h)

@@ -20,7 +20,7 @@ if "--num-gpus" in sys.argv:
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 40
+TARGET_BATCH_PER_GPU = 48
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
@@ -53,12 +53,12 @@ from .model_factory import create_llanet_model
 opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
 
 # === Loss Weights ===
-iou_loss_weight = 1.0
-cls_loss_weight = 0.8
-xyt_loss_weight = 1.0
-seg_loss_weight = 0.8
-category_loss_weight = 0.5
-attribute_loss_weight = 0.5
+iou_loss_weight = 2.0
+cls_loss_weight = 1.0
+xyt_loss_weight = 0.4
+seg_loss_weight = 1.0
+category_loss_weight = 1.0
+attribute_loss_weight = 1.0
 
 num_points = 72
 max_lanes = 24
@@ -111,6 +111,7 @@ param_config.num_classes = num_classes
 param_config.num_lane_categories = num_lane_categories
 param_config.num_lr_attributes = num_lr_attributes
 param_config.num_priors = num_priors
+
 # Model
 model = create_llanet_model(param_config)
 
@@ -126,23 +127,23 @@ batch_size = dynamic_total_batch_size
 epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
-train.checkpointer.period = epoch_per_iter
+train.checkpointer.period = 500
 train.eval_period = epoch_per_iter * 16
-train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
+train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane_1/"
 
 # Optimizer
 optimizer = get_config("config/common/optim.py").AdamW
-optimizer.lr = 5e-5
-optimizer.weight_decay = 1e-3
+optimizer.lr = 1e-4
 
 lr_multiplier = L(CompositeParamScheduler)(
     schedulers=[
         L(LinearParamScheduler)(start_value=0.1, end_value=1.0),
-        L(CosineParamScheduler)(start_value=1.0, end_value=0.1),
+        L(CosineParamScheduler)(start_value=1.0, end_value=0.01),
     ],
-    lengths=[0.3, 0.7],
+    lengths=[0.05, 0.95],  # 更快结束warmup
     interval_scaling=["rescaled", "rescaled"],
 )
+
 # === Transform Definition (Optimized) ===
 train_transforms = [
     dict(name="HorizontalFlip", parameters=dict(p=1.0), p=0.5),
@@ -217,7 +218,7 @@ dataloader.test.num_workers = safe_workers_per_gpu
 dataloader.evaluator = L(OpenLaneEvaluator)(
     cfg=param_config,
     evaluate_bin_path="/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate",
-    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/mobilenetv4_small_gsafpn_openlane/eval_results/",
+    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/mobilenetv4_small_gsafpn_openlane_1/eval_results/",
     iou_threshold=0.5,
     width=30,
     metric="OpenLane/F1",

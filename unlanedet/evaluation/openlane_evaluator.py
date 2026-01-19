@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import logging
 import os
@@ -7,6 +8,41 @@ import shutil
 import subprocess
 from scipy.optimize import linear_sum_assignment
 from .evaluator import DatasetEvaluator
+
+
+def lane_nms(predictions, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920):
+    """
+    NMS function with coordinate scaling fix.
+    """
+    if nms_overlap_thresh > 1.0:
+        nms_overlap_thresh /= 100.0
+
+    keep_index = []
+    sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+    sorted_indices = sorted_indices[:top_k]
+
+    lane_points = predictions[:, 6:] * img_w
+
+    while sorted_indices.size(0) > 0:
+        idx = sorted_indices[0]
+        keep_index.append(idx.item())
+
+        if sorted_indices.size(0) == 1:
+            break
+
+        sorted_indices = sorted_indices[1:]
+
+        curr_lane = lane_points[idx].unsqueeze(0)
+        rest_lanes = lane_points[sorted_indices]
+
+        # 计算 IoU
+        ious = line_iou(curr_lane, rest_lanes, img_w=img_w, length=15)
+
+        # NMS 过滤
+        mask = ious < nms_overlap_thresh
+        sorted_indices = sorted_indices[mask.view(-1)]
+
+    return keep_index
 
 
 class OpenLaneEvaluator(DatasetEvaluator):
@@ -105,23 +141,15 @@ class OpenLaneEvaluator(DatasetEvaluator):
         os.makedirs(self.result_dir, exist_ok=True)
 
     def process(self, inputs, outputs):
-        """
-        处理预测结果并保存。增加对多层嵌套 meta 的自动解包。
-        """
-        # 1. 确定 Batch Size
         batch_size = len(outputs)
 
         for i in range(batch_size):
             output_data = outputs[i]
 
-            # --- A. 鲁棒性获取 Meta 信息 ---
+            # --- 1. 解析 Meta 信息 ---
             raw_meta = inputs.get("meta", inputs.get("img_metas", [{}]))
-
-            # 自动处理 DataContainer
             if hasattr(raw_meta, "data"):
                 raw_meta = raw_meta.data
-
-            # 自动处理多层嵌套列表 (例如分布式下常见的 [[{...}]] 结构)
             while (
                 isinstance(raw_meta, list)
                 and len(raw_meta) > 0
@@ -129,80 +157,93 @@ class OpenLaneEvaluator(DatasetEvaluator):
             ):
                 raw_meta = raw_meta[0]
 
-            # 提取当前样本的字典
             meta = {}
             if isinstance(raw_meta, list) and i < len(raw_meta):
                 meta = raw_meta[i]
             elif isinstance(raw_meta, dict):
-                # 如果 meta 是字典形式 {'img_name': [...]}，则按索引取值
                 meta = {
                     k: v[i] if isinstance(v, (list, torch.Tensor)) and len(v) > i else v
                     for k, v in raw_meta.items()
                 }
 
-            # --- B. 自动探测路径字段 ---
-            # 尝试所有可能的字段名
-            rel_path = None
+            # 获取原始完整路径 (e.g., validation/segment-xxx/xxx.jpg)
+            original_rel_path = None
             for key in ["img_name", "filename", "img_path", "file_name"]:
                 if isinstance(meta, dict) and meta.get(key):
-                    rel_path = meta[key]
+                    original_rel_path = meta[key]
                     break
 
-            # 如果 rel_path 是绝对路径，尝试转为相对路径（OpenLane 工具要求）
-            if rel_path and "validation" in rel_path:
-                rel_path = rel_path[rel_path.find("validation") :]
-
-            # 移除路径前缀（validation/ 或 training/），避免与 self.result_dir 重复拼接
-            if rel_path:
-                for prefix in ["validation/", "training/"]:
-                    if rel_path.startswith(prefix):
-                        rel_path = rel_path[len(prefix) :]
-                        break
-
-            if not rel_path:
-                # 最后的调试手段：如果还是找不到，打印一次 meta 的结构
-                if i == 0:
-                    self.logger.warning(
-                        f"Metadata keys found: {meta.keys() if isinstance(meta, dict) else type(meta)}"
-                    )
-                self.logger.warning(f"Batch {i}: Missing path info, skipping.")
+            if not original_rel_path:
                 continue
 
-            # --- C. 后续处理逻辑 (保持不变) ---
+            # 计算用于保存文件的相对路径 (去除 validation/ 前缀，防止文件夹嵌套过深)
+            save_rel_path = original_rel_path
+            prefix_found = ""
+            if "validation/" in save_rel_path:
+                prefix_found = "validation/"
+                save_rel_path = save_rel_path[
+                    save_rel_path.find("validation/") + len("validation/") :
+                ]
+            elif "training/" in save_rel_path:
+                prefix_found = "training/"
+                save_rel_path = save_rel_path[
+                    save_rel_path.find("training/") + len("training/") :
+                ]
+
+            # --- 2. 准备预测数据 ---
             pred_lines = output_data.get("lane_lines", [])
-            if torch.is_tensor(pred_lines):
-                pred_lines = pred_lines.detach().cpu().numpy()
+            if not torch.is_tensor(pred_lines):
+                pred_lines = torch.tensor(pred_lines)
+            pred_lines = pred_lines.detach().cpu()
 
             if len(pred_lines) == 0:
-                self._save_empty_json(rel_path)
+                self._save_empty_json(save_rel_path, original_rel_path)
                 continue
 
-            # 置信度过滤 - confidence 在索引 5 的位置（格式：[2cls, 3offset, 1conf, n_xcoords]）
-            conf_threshold = self.cfg.test_parameters.conf_threshold
-            if pred_lines.shape[1] > 5:
-                scores = pred_lines[:, 5]  # 置信度在索引 5
-            else:
-                scores = pred_lines[:, 1]  # 兼容旧格式
+            # --- 3. Softmax 处理 (关键步骤) ---
+            # 原始输出前两列是 Logits，必须转概率
+            logits = pred_lines[:, :2]
+            probs = F.softmax(logits, dim=1)
+            scores = probs[:, 1]  # 前景概率
 
+            # 这里的 Threshold 可以设低一点，交给 NMS 去筛选
+            conf_threshold = self.cfg.test_parameters.conf_threshold
             valid_mask = scores > conf_threshold
+
             valid_preds = pred_lines[valid_mask]
+            valid_scores = scores[valid_mask]
 
             if len(valid_preds) == 0:
-                self._save_empty_json(rel_path)
+                self._save_empty_json(save_rel_path, original_rel_path)
                 continue
 
-            # 处理类别和属性 (逻辑同前)
-            valid_cats = np.zeros(len(valid_preds), dtype=int)
+            # --- 4. NMS 处理 (关键步骤) ---
+            keep_indices = lane_nms(
+                valid_preds,
+                valid_scores,
+                nms_overlap_thresh=self.cfg.test_parameters.nms_thres,
+                top_k=self.cfg.test_parameters.nms_topk,
+                img_w=self.cfg.img_w,  # 传入 img_w 用于反归一化
+            )
+
+            # 获取 NMS 后的最终预测
+            final_preds = valid_preds[keep_indices]
+
+            # --- 5. 处理类别和属性 ---
+            valid_cats = np.zeros(len(final_preds), dtype=int)
             if "category" in output_data and output_data["category"] is not None:
                 cat_logits = output_data["category"]
                 if torch.is_tensor(cat_logits):
-                    valid_cats = (
-                        torch.argmax(cat_logits[valid_mask], dim=1).cpu().numpy()
-                    )
+                    # 两次筛选：先 Mask 后 NMS
+                    cat_logits = cat_logits.detach().cpu()
+                    cat_logits_valid = cat_logits[valid_mask]
+                    cat_logits_final = cat_logits_valid[keep_indices]
+                    valid_cats = torch.argmax(cat_logits_final, dim=1).numpy()
 
-            # 坐标转换与保存
+            # --- 6. 解码坐标并保存 ---
+            # decode_lanes 内部会乘以 ori_img_w，所以这里传入 normalized 的 final_preds 即可
             decoded_lanes = self.decode_lanes(
-                valid_preds,
+                final_preds.numpy(),
                 self.cfg.img_w,
                 self.cfg.img_h,
                 self.cfg.ori_img_w,
@@ -220,28 +261,16 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 ys = [float(p[1]) for p in lane_points]
                 lane_lines_json.append({"category": official_cat_id, "uv": [xs, ys]})
 
-            # 保存时，rel_path 已经去掉了前缀（validation/ 或 training/），但 JSON 中的 file_path 需要完整路径
-            # 我们通过检测原始路径来确定应该用哪个前缀
-            full_path_for_json = rel_path
-            original_rel_path = None
-            for key in ["img_name", "filename", "img_path", "file_name"]:
-                if isinstance(meta, dict) and meta.get(key):
-                    original_rel_path = meta[key]
-                    break
-
-            if original_rel_path:
-                if original_rel_path.startswith("validation/"):
-                    full_path_for_json = "validation/" + rel_path
-                elif original_rel_path.startswith("training/"):
-                    full_path_for_json = "training/" + rel_path
-
+            # [关键修复] JSON 中的 file_path 必须包含 validation/ 或 training/ 前缀
+            # 使用最开始解析出来的 original_rel_path
             self._write_json(
-                rel_path,
-                {"file_path": full_path_for_json, "lane_lines": lane_lines_json},
+                save_rel_path,  # 文件名用短路径
+                {
+                    "file_path": original_rel_path,
+                    "lane_lines": lane_lines_json,
+                },  # 内容用长路径
             )
 
-        # Return empty list to avoid gathering GPU tensors in distributed evaluation
-        # OpenLaneEvaluator saves results incrementally to files, so no need to gather
         return []
 
     def _write_json(self, rel_path, content):
@@ -251,11 +280,16 @@ class OpenLaneEvaluator(DatasetEvaluator):
         if dir_name not in self._created_dirs:
             os.makedirs(dir_name, exist_ok=True)
             self._created_dirs.add(dir_name)
+            # Only print when the first directory is created (start of generation)
+            if len(self._created_dirs) == 1:
+                self.logger.info(
+                    f"[OpenLaneEvaluator] Generating validation predictions to: {self.result_dir}"
+                )
         with open(save_path, "w") as f:
             json.dump(content, f)
 
-    def _save_empty_json(self, rel_path):
-        self._write_json(rel_path, {"file_path": rel_path, "lane_lines": []})
+    def _save_empty_json(self, rel_path, full_path):
+        self._write_json(rel_path, {"file_path": full_path, "lane_lines": []})
 
     def evaluate(self, predictions=None):
         self.logger.info(
@@ -284,9 +318,15 @@ class OpenLaneEvaluator(DatasetEvaluator):
             self.logger.warning("No JSON results found! Evaluation skipped.")
             return {}
 
+        self.logger.info(
+            f"[OpenLaneEvaluator] Generating test_list.txt with {len(all_json_files)} images..."
+        )
         with open(self.test_list_path, "w") as f:
             for path in all_json_files:
                 f.write(path + "\n")
+        self.logger.info(
+            f"[OpenLaneEvaluator] test_list.txt generated at: {self.test_list_path}"
+        )
 
         # Official C++ Tool
         metrics = {}
@@ -311,13 +351,29 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
     def _run_official_evaluation(self):
         lane_anno_dir = getattr(self.cfg, "lane_anno_dir", "lane3d_300/")
-        dataset_dir = os.path.join(self.cfg.data_root, lane_anno_dir).as_posix() + "/"
-        image_dir = self.cfg.data_root.as_posix() + "/"
+        # Handle both string and Path types for data_root
+        data_root = self.cfg.data_root
+        if hasattr(data_root, "as_posix"):
+            data_root = data_root.as_posix()
+        # Remove trailing slashes and let os.path.join handle the path properly
+        dataset_dir = (
+            os.path.join(data_root.rstrip("/"), lane_anno_dir.rstrip("/")) + "/"
+        )
+        image_dir = data_root.rstrip("/") + "/"
         result_dir_root = self.output_dir
         output_file = os.path.join(self.output_dir, "official_eval_log.txt")
 
+        # Setup environment variables for OpenCV library path
+        env = os.environ.copy()
+        opencv_path = getattr(self.cfg, "opencv_path", None)
+        if opencv_path:
+            env["LD_LIBRARY_PATH"] = opencv_path
+            self.logger.info(
+                f"[OpenLaneEvaluator] Setting LD_LIBRARY_PATH={opencv_path}"
+            )
+
         cmd = [
-            self.evaluate_bin_path,
+            str(self.evaluate_bin_path),
             "-a",
             dataset_dir,
             "-d",
@@ -333,13 +389,34 @@ class OpenLaneEvaluator(DatasetEvaluator):
             "-o",
             output_file,
             "-j",
-            4,
+            str(4),
         ]
 
         metrics = {}
         try:
-            self.logger.info(f"Running Official Tool: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            self.logger.info(
+                f"[OpenLaneEvaluator] Running OpenLane official evaluation tool..."
+            )
+            self.logger.info(f"  Command: {' '.join(cmd)}")
+            self.logger.info(
+                f"  Parameters: width={self.width}, iou_threshold={self.iou_threshold}"
+            )
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300, env=env
+            )
+
+            # Log stderr if there's any error output
+            if result.stderr:
+                self.logger.error(
+                    f"[OpenLaneEvaluator] Evaluation tool stderr: {result.stderr}"
+                )
+
+            # Log stdout for debugging
+            if result.stdout:
+                self.logger.debug(
+                    f"[OpenLaneEvaluator] Evaluation tool stdout: {result.stdout}"
+                )
+
             if result.stdout:
                 for line in result.stdout.split("\n"):
                     line = line.strip()
@@ -351,8 +428,21 @@ class OpenLaneEvaluator(DatasetEvaluator):
                         )
                     elif line.startswith("Recall"):
                         metrics["OpenLane/Recall"] = float(line.split(":")[1].strip())
+            else:
+                self.logger.warning(
+                    "[OpenLaneEvaluator] No stdout from evaluation tool"
+                )
+        except subprocess.TimeoutExpired:
+            self.logger.error(
+                "[OpenLaneEvaluator] Evaluation tool timed out after 300 seconds"
+            )
         except Exception as e:
-            self.logger.error(f"Failed to execute evaluate binary: {e}")
+            self.logger.error(
+                f"[OpenLaneEvaluator] Failed to execute evaluate binary: {e}"
+            )
+            import traceback
+
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
         return metrics
 
     def _update_internal_metrics(

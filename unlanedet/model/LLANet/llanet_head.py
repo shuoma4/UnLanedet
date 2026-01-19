@@ -317,177 +317,186 @@ class LLANetHead(nn.Module):
             return ret_list
 
     def loss(self, outputs, batch):
-        """Vectorized Loss Calculation"""
+        """Vectorized Loss Calculation Optimized for GPU"""
         predictions_lists = outputs["predictions_lists"]
-        targets = batch["lane_line"]
+        targets_list = batch["lane_line"]  # List of [N, Dim] tensors
         batch_lane_categories = batch.get("lane_categories", None)
         batch_lane_attributes = batch.get("lane_attributes", None)
 
         cls_criterion = FocalLoss(alpha=0.25, gamma=2.0)
         device = self.priors.device
+        batch_size = len(targets_list)
 
+        # ============================================================
+        # 1. 预处理 Targets: Pad to Tensor (B, Max_Lanes, Dim)
+        # ============================================================
+        # 找到当前 Batch 中最大的车道线数量
+        max_lanes = 0
+        target_dim = 0
+        if len(targets_list) > 0:
+            lengths = [len(t) for t in targets_list]
+            max_lanes = max(lengths) if lengths else 0
+            if max_lanes > 0:
+                target_dim = targets_list[0].shape[1]
+
+        # 至少保证有维度，避免报错
+        max_lanes = max(max_lanes, 1)
+        if target_dim == 0:
+            target_dim = 6 + 72  # 默认维度防止空数据报错
+
+        # 初始化 Batch Tensor
+        batch_targets = torch.zeros((batch_size, max_lanes, target_dim), device=device)
+        batch_masks = torch.zeros(
+            (batch_size, max_lanes), device=device
+        )  # 1 for Valid, 0 for Padding
+
+        # 填充数据
+        for i, t in enumerate(targets_list):
+            num_t = t.shape[0]
+            if num_t > 0:
+                # 过滤有效线 (通常 index 1 是 valid flag)
+                # 假设 t 的格式与原始代码一致，其中 t[:, 1] == 1 表示有效
+                valid_mask = t[:, 1] == 1
+                valid_t = t[valid_mask]
+
+                num_valid = valid_t.shape[0]
+                if num_valid > 0:
+                    # 如果超过 max_lanes (理论上不会，但为了安全)
+                    num_valid = min(num_valid, max_lanes)
+                    batch_targets[i, :num_valid] = valid_t[:num_valid]
+                    batch_masks[i, :num_valid] = 1
+
+        # ============================================================
+        # 2. 向量化训练循环
+        # ============================================================
         total_cls_loss = 0.0
         total_reg_xytl_loss = 0.0
         total_iou_loss = 0.0
         total_category_loss = 0.0
         total_attribute_loss = 0.0
 
-        batch_size = len(targets)
+        # 导入新的向量化 assign
+        from ..CLRNet.dynamic_assign import assign
 
         for stage in range(self.refine_layers):
-            predictions_list = predictions_lists[stage]
+            predictions = predictions_lists[stage]  # (B, Num_Priors, Dim)
 
-            # --- Vectorized Collection Buffers ---
-            stage_reg_preds = []
-            stage_reg_targets = []
-            stage_pred_lines = []
-            stage_target_lines = []
+            # --- ONE-SHOT ASSIGNMENT FOR THE WHOLE BATCH ---
+            # assigned_mask: (B, Num_Priors) Bool - True if prior matched
+            # assigned_ids:  (B, Num_Priors) Long - Index of matched GT (0 to Max_Lanes-1)
+            with torch.no_grad():
+                assigned_mask, assigned_ids = assign(
+                    predictions, batch_targets, batch_masks, self.img_w, self.img_h
+                )
 
-            stage_cls_targets = torch.zeros(
-                (batch_size, self.num_priors), dtype=torch.long, device=device
-            )
-            stage_cat_preds, stage_cat_targets = [], []
-            stage_attr_preds, stage_attr_targets = [], []
+            # --- Classification Loss ---
+            # Focal Loss 输入: (N, C) logits, (N) targets
+            cls_targets = assigned_mask.long().view(-1)  # Flatten (B*N)
+            pred_cls_flat = predictions[..., :2].view(-1, 2)
 
-            num_positives = 0
+            # 计算正样本总数
+            num_positives = assigned_mask.sum()
+            cls_norm = max(num_positives.item(), 1.0)
 
-            # 1. Dynamic Matching (Optimized Loop)
-            for b in range(batch_size):
-                prediction = predictions_list[b]
-                target = targets[b][targets[b][:, 1] == 1]  # Valid GT
-
-                if len(target) > 0:
-                    with torch.no_grad():
-                        rows, cols = assign(prediction, target, self.img_w, self.img_h)
-
-                    if len(rows) > 0:
-                        stage_cls_targets[b, rows] = 1
-                        num_positives += len(rows)
-
-                        reg_pred = prediction[rows, 2:6]
-                        reg_target = target[cols, 2:6].clone()
-
-                        with torch.no_grad():
-                            pred_starts = torch.clamp(
-                                (reg_pred[:, 0] * self.n_strips).round().long(),
-                                0,
-                                self.n_strips,
-                            )
-                            target_starts = (
-                                (reg_target[:, 0] * self.n_strips).round().long()
-                            )
-                            reg_target[:, 3] -= (
-                                pred_starts - target_starts
-                            ) / self.n_strips
-
-                        stage_reg_preds.append(reg_pred)
-                        stage_reg_targets.append(reg_target)
-                        stage_pred_lines.append(prediction[rows, 6:])
-                        stage_target_lines.append(target[cols, 6:])
-
-                        if stage == self.refine_layers - 1:
-                            if self.enable_category and "category" in outputs:
-                                stage_cat_preds.append(outputs["category"][b, rows])
-                                stage_cat_targets.append(batch_lane_categories[b, cols])
-                            if self.enable_attribute and "attribute" in outputs:
-                                stage_attr_preds.append(outputs["attribute"][b, rows])
-                                stage_attr_targets.append(
-                                    batch_lane_attributes[b, cols]
-                                )
-
-            # 2. Vectorized Loss Computation
-            # Normalize by total positives to match "Mean" logic (batch-wise average)
-            cls_norm = max(num_positives, 1.0)
-            stage_cls_loss = cls_criterion(
-                predictions_list[..., :2].view(-1, 2), stage_cls_targets.view(-1)
-            ).sum()
+            stage_cls_loss = cls_criterion(pred_cls_flat, cls_targets).sum()
             total_cls_loss += stage_cls_loss / cls_norm
 
             if num_positives > 0:
-                cat_reg_preds = torch.cat(stage_reg_preds, dim=0)
-                cat_reg_targets = torch.cat(stage_reg_targets, dim=0)
+                # --- 选取正样本进行回归 ---
+                # predictions: (Num_Positives, Dim)
+                pos_preds = predictions[assigned_mask]
 
-                # Scale to Absolute
-                cat_reg_preds_abs = cat_reg_preds.clone()
-                cat_reg_preds_abs[:, 0] *= self.n_strips
-                cat_reg_preds_abs[:, 1] *= self.img_w - 1
-                cat_reg_preds_abs[:, 2] *= 180
-                cat_reg_preds_abs[:, 3] *= self.n_strips
+                # 获取对应的 GT
+                # batch_idx, prior_idx 用于定位
+                batch_idx, prior_idx = torch.where(assigned_mask)
+                target_idx = assigned_ids[batch_idx, prior_idx]  # (Num_Positives,)
 
-                cat_reg_targets_abs = cat_reg_targets.clone()
-                cat_reg_targets_abs[:, 0] *= self.n_strips
-                cat_reg_targets_abs[:, 1] *= self.img_w - 1
-                cat_reg_targets_abs[:, 2] *= 180
-                cat_reg_targets_abs[:, 3] *= self.n_strips
+                pos_targets = batch_targets[
+                    batch_idx, target_idx
+                ]  # (Num_Positives, Dim)
 
-                # Mean Reduction
+                # --- Regression Loss (XYTL) ---
+                reg_pred = pos_preds[:, 2:6]
+                reg_target = pos_targets[:, 2:6].clone()
+
+                # 调整 Target Start X (保持原逻辑)
+                with torch.no_grad():
+                    pred_starts = torch.clamp(
+                        (reg_pred[:, 0] * self.n_strips).round().long(),
+                        0,
+                        self.n_strips,
+                    )
+                    target_starts = (reg_target[:, 0] * self.n_strips).round().long()
+                    reg_target[:, 3] -= (pred_starts - target_starts) / self.n_strips
+
+                # 还原到绝对坐标
+                reg_pred_abs = reg_pred.clone()
+                reg_pred_abs[:, 0] *= self.n_strips
+                reg_pred_abs[:, 1] *= self.img_w - 1
+                reg_pred_abs[:, 2] *= 180
+                reg_pred_abs[:, 3] *= self.n_strips
+
+                reg_target_abs = reg_target.clone()
+                reg_target_abs[:, 0] *= self.n_strips
+                reg_target_abs[:, 1] *= self.img_w - 1
+                reg_target_abs[:, 2] *= 180
+                reg_target_abs[:, 3] *= self.n_strips
+
                 total_reg_xytl_loss += F.smooth_l1_loss(
-                    cat_reg_preds_abs, cat_reg_targets_abs, reduction="mean"
+                    reg_pred_abs, reg_target_abs, reduction="mean"
                 )
 
-                cat_pred_lines = torch.cat(stage_pred_lines, dim=0) * (self.img_w - 1)
-                cat_target_lines = torch.cat(stage_target_lines, dim=0) * (
-                    self.img_w - 1
-                )
+                # --- IoU Loss ---
+                # pos_preds index 6 开始是点集
+                line_pred = pos_preds[:, 6:] * (self.img_w - 1)
+                line_target = pos_targets[:, 6:] * (self.img_w - 1)
+
                 total_iou_loss += liou_loss(
-                    cat_pred_lines, cat_target_lines, self.img_w, length=15
+                    line_pred, line_target, self.img_w, length=15
                 )
 
+                # --- Category & Attribute Loss (仅在最后一层) ---
                 if stage == self.refine_layers - 1:
-                    if len(stage_cat_preds) > 0:
-                        total_category_loss += self.category_criterion(
-                            torch.cat(stage_cat_preds).log_softmax(dim=-1),
-                            torch.cat(stage_cat_targets),
-                        ) / max(
-                            len(stage_cat_preds), 1
-                        )  # Manual mean if needed, or if criterion is sum
+                    # Category
+                    if self.enable_category and "category" in outputs:
+                        cat_preds = outputs["category"][assigned_mask]
 
-                    if len(stage_attr_preds) > 0:
-                        total_attribute_loss += self.attribute_criterion(
-                            torch.cat(stage_attr_preds).log_softmax(dim=-1),
-                            torch.cat(stage_attr_targets),
-                        ) / max(len(stage_attr_preds), 1)
+                        # 处理 Category Targets (Padding check)
+                        if isinstance(batch_lane_categories, torch.Tensor):
+                            # 如果已经是 Tensor (B, Max_Lanes)，直接 gather
+                            cat_targets = batch_lane_categories[batch_idx, target_idx]
 
-        # 3. Final Weighted Sum
-        # 归一化说明：
-        # - cls_loss: 已经除以num_positives（匹配到的车道线数），再除以refine_layers得到平均每层的每根车道线损失
-        # - reg_xytl_loss: 已经用mean reduction（除以num_positives），再除以refine_layers得到平均每层的每根车道线损失
-        # - iou_loss: 已经除以num_positives，再除以refine_layers得到平均每层的每根车道线损失
-        # - loss_category: 只在最后一层计算，需要除以batch_size得到每张图的平均损失
-        # - loss_attribute: 只在最后一层计算，需要除以batch_size得到每张图的平均损失
+                            # 注意：这里除以 batch_size，符合你之前代码的意图
+                            total_category_loss += self.category_criterion(
+                                cat_preds.log_softmax(dim=-1), cat_targets
+                            ) / max(batch_size, 1)
+
+                    # Attribute
+                    if self.enable_attribute and "attribute" in outputs:
+                        attr_preds = outputs["attribute"][assigned_mask]
+                        if isinstance(batch_lane_attributes, torch.Tensor):
+                            attr_targets = batch_lane_attributes[batch_idx, target_idx]
+                            total_attribute_loss += self.attribute_criterion(
+                                attr_preds.log_softmax(dim=-1), attr_targets
+                            ) / max(batch_size, 1)
+
+        # 3. 汇总 Loss
         losses = {}
         losses["cls_loss"] = (
-            total_cls_loss
-            / self.refine_layers
-            * self.cfg.cls_loss_weight
+            total_cls_loss / self.refine_layers * self.cfg.cls_loss_weight
         )
         losses["reg_xytl_loss"] = (
-            total_reg_xytl_loss
-            / self.refine_layers
-            * self.cfg.xyt_loss_weight
+            total_reg_xytl_loss / self.refine_layers * self.cfg.xyt_loss_weight
         )
         losses["iou_loss"] = (
-            total_iou_loss
-            / self.refine_layers
-            * self.cfg.iou_loss_weight
+            total_iou_loss / self.refine_layers * self.cfg.iou_loss_weight
         )
-        # category和attribute只在最后一层计算，且已经除以了各自匹配到的数量
-        # 这里再除以batch_size得到每张图的平均损失
-        losses["loss_category"] = (
-            total_category_loss
-            / batch_size
-            * self.cfg.category_loss_weight
-        )
-        losses["loss_attribute"] = (
-            total_attribute_loss
-            / batch_size
-            * self.cfg.attribute_loss_weight
-        )
+        losses["loss_category"] = total_category_loss * self.cfg.category_loss_weight
+        losses["loss_attribute"] = total_attribute_loss * self.cfg.attribute_loss_weight
 
+        # Seg Loss (保持原样)
         seg_loss = torch.tensor(0.0, device=device)
         if outputs.get("seg", None) is not None and batch.get("seg", None) is not None:
-            # PlainDecoder已经将seg上采样到[img_h, img_w]尺寸
-            # 如果batch["seg"]尺寸不同才需要上采样
             seg_pred = outputs["seg"]
             if seg_pred.shape[-2:] != batch["seg"].shape[-2:]:
                 seg_pred = F.interpolate(
