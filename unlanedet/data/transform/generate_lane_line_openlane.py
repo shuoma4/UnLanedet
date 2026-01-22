@@ -3,15 +3,15 @@ import numpy as np
 import math
 import imgaug.augmenters as iaa
 import cv2
+import torch
 
+# 强制关闭 OpenCV 多线程
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
-# =======================================
 
 from imgaug.augmenters import Resize
 from imgaug.augmentables.lines import LineString, LineStringsOnImage
 from imgaug.augmentables.segmaps import SegmentationMapsOnImage
-from scipy.interpolate import InterpolatedUnivariateSpline
 from omegaconf import DictConfig
 
 
@@ -49,18 +49,24 @@ def CLRTransformsOpenLane(img_h, img_w):
 class GenerateLaneLineOpenLane(object):
     def __init__(self, transforms=None, cfg=None, training=True):
         self.transforms = transforms
+        self.cfg = cfg
         self.img_w, self.img_h = cfg.img_w, cfg.img_h
         self.num_points = cfg.num_points
         self.n_offsets = cfg.num_points
         self.n_strips = cfg.num_points - 1
         self.strip_size = self.img_h / self.n_strips
         self.max_lanes = cfg.max_lanes
-        self.offsets_ys = np.arange(self.img_h, -1, -self.strip_size)
-        self.cfg = cfg
+        
+        # Y轴坐标：从底部(img_h)到顶部(0)
+        self.offsets_ys = np.linspace(self.img_h, 0, self.num_points)
         self.training = training
 
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        self.use_preprocessed = getattr(cfg, "use_preprocessed", False)
+        self.cut_height = getattr(cfg, "cut_height", 270)
+        self.enable_3d = getattr(cfg, "enable_3d", False)
+
+        self.mean = np.array(cfg.img_norm["mean"], dtype=np.float32)
+        self.std = np.array(cfg.img_norm["std"], dtype=np.float32)
 
         if transforms is None:
             transforms = CLRTransformsOpenLane(self.img_h, self.img_w)
@@ -94,180 +100,169 @@ class GenerateLaneLineOpenLane(object):
         self.transform = iaa.Sequential(img_transforms)
 
     def lane_to_linestrings(self, lanes):
-        return [LineString(lane) for lane in lanes]
+        lines = []
+        for lane in lanes:
+            pts = np.array(lane)[:, :2]
+            lines.append(LineString(pts))
+        return lines
 
     def linestrings_to_lanes(self, line_strings):
-        return [line.coords for line in line_strings]
+        lanes = []
+        for ls in line_strings:
+            lanes.append(ls.coords)
+        return lanes
 
-    def sample_lane(self, points, sample_ys):
+    def sample_lane(self, points, sample_ys, visibility):
         points = np.array(points)
         if len(points) < 2:
-            raise Exception("Annotaion points have to be sorted")
+            raise Exception("Too few points")
+            
         x, y = points[:, 0], points[:, 1]
-        interp = InterpolatedUnivariateSpline(
-            y[::-1], x[::-1], k=min(3, len(points) - 1)
-        )
-        all_xs = interp(sample_ys)
-        inside_mask = (all_xs >= 0) & (all_xs < self.img_w)
-        xs_inside_image = all_xs[inside_mask]
-        xs_outside_image = all_xs[~inside_mask]
-        return xs_outside_image, xs_inside_image
+        
+        if visibility is not None:
+            vis = np.array(visibility)
+            if len(vis) != len(x):
+                min_len = min(len(vis), len(x))
+                vis = vis[:min_len]
+                x = x[:min_len]
+                y = y[:min_len]
+        else:
+            vis = np.ones_like(x)
+
+        sort_idx = np.argsort(y)
+        x = x[sort_idx]
+        y = y[sort_idx]
+        vis = vis[sort_idx]
+
+        unique_y, unique_indices = np.unique(y, return_index=True)
+        unique_x = x[unique_indices]
+        unique_vis = vis[unique_indices]
+
+        if len(unique_y) < 2:
+            raise Exception("Too few points after dedup")
+
+        all_xs = np.interp(sample_ys, unique_y, unique_x, left=-1e5, right=-1e5)
+        all_vis = np.interp(sample_ys, unique_y, unique_vis, left=0.0, right=0.0)
+        
+        return all_xs, all_vis
 
     def transform_annotation(self, anno, img_wh):
-        """
-        将原始标注转换为网络训练所需的 lane_line 格式
-
-        ===================================================
-        输入 anno["lanes"] 格式:
-        - list of lists, 每个 lane 包含多个 (x, y) 坐标点
-        - 坐标是图像像素坐标 (绝对坐标)
-        - 例如: lanes = [[(100, 200), (150, 250), (200, 300)], ...]
-
-        ===================================================
-        输出 lanes 张量格式 (shape: [max_lanes, 6 + n_offsets]):
-        - max_lanes: 最大车道线数量 (24)
-        - n_offsets: 采样点数量 (72)
-
-        各列含义:
-        ---------------------------------------------------
-        列索引 | 字段名称           | 形状说明                | 数值范围       | 单位/归一化
-        -------|-------------------|------------------------|--------------|-----------
-        0      | ignore_flag       | 是否忽略该车道线         | 0/1          | - (0=有效, 1=忽略)
-        1      | is_lane           | 是否为车道线             | 0/1          | - (0=是车道线, 1=背景)
-        2      | start_y           | 车道线起始 Y 坐标        | [0, 1]        | 归一化 (strip 索引 / n_strips)
-        3      | start_x           | 车道线起始 X 坐标        | [0, 1]        | 归一化 (像素 / img_w)
-        4      | theta             | 车道线平均角度           | [0, 1]        | 归一化 (角度/π)
-        5      | length            | 车道线长度               | [0, 1]        | 归一化 (strip 数量 / n_strips)
-        6+     | xs[0:n_offsets]  | 沿 Y 轴采样的 X 坐标序列  | [0, 1]        | 归一化 (像素 / img_w)
-        ---------------------------------------------------
-
-        关键说明:
-        1. start_y, start_x, theta, xs 都是归一化值 [0, 1]
-        2. length 是绝对值 (strip 数量)，范围 [1, 72]，未归一化！
-        3. xs 序列从下到上按固定 Y 间隔采样，共 72 个点
-
-        ===================================================
-        输出 lane_endpoints 张量格式 (shape: [max_lanes, 2]):
-        各列含义:
-        ---------------------------------------------------
-        列索引 | 字段名称           | 数值范围       | 单位/归一化
-        -------|-------------------|--------------|-----------
-        0      | endpoint_y        | [0, 1]        | 归一化 (strip 索引 / n_strips)
-        1      | endpoint_x        | [0, 1]        | 归一化 (像素 / img_w)
-        ---------------------------------------------------
-        """
         old_lanes = anno["lanes"]
-        # 过滤掉点数 <= 1 的车道线
-        old_lanes = filter(lambda x: len(x) > 1, old_lanes)
-        # 按 Y 坐标从下到上排序 (bottom to top)
-        old_lanes = [sorted(lane, key=lambda x: -x[1]) for lane in old_lanes]
+        old_visibilities = anno.get("lane_vis", [])
+        
+        old_categories = anno.get("lane_categories", [0] * len(old_lanes))
+        old_attributes = anno.get("lane_attributes", [0] * len(old_lanes))
+        
+        if not old_visibilities or len(old_visibilities) != len(old_lanes):
+            old_visibilities = [None] * len(old_lanes)
 
-        # 初始化 lanes 张量 (填充 -1e5 作为默认无效值)
-        # shape: [max_lanes, 6 + n_offsets]
-        lanes = (
-            np.ones(
-                (self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32
-            )
-            * -1e5
-        )
+        valid_indices = [i for i, x in enumerate(old_lanes) if len(x) > 1]
+        old_lanes = [old_lanes[i] for i in valid_indices]
+        old_visibilities = [old_visibilities[i] for i in valid_indices]
+        old_categories = [old_categories[i] for i in valid_indices]
+        old_attributes = [old_attributes[i] for i in valid_indices]
+
+        if len(old_lanes) > 0:
+            combined = list(zip(old_lanes, old_visibilities, old_categories, old_attributes))
+            combined.sort(key=lambda x: -x[0][0][1] if len(x[0]) > 0 else 0)
+            old_lanes, old_visibilities, old_categories, old_attributes = zip(*combined)
+
+        lanes = np.ones((self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32) * -1e5
         lanes_endpoints = np.ones((self.max_lanes, 2))
-        # 默认: 忽略所有车道线 (ignore_flag=1)
-        lanes[:, 0] = 1
-        # 默认: 标记为背景 (is_lane=1, 0 表示车道线)
+        lanes_vis_interpolated = np.zeros((self.max_lanes, self.n_offsets), dtype=np.float32)
+        padded_categories = np.zeros(self.max_lanes, dtype=np.int64)
+        padded_attributes = np.zeros(self.max_lanes, dtype=np.int64)
+        
+        lanes[:, 0] = 1 
         lanes[:, 1] = 0
 
         for lane_idx, lane in enumerate(old_lanes):
             if lane_idx >= self.max_lanes:
                 break
+            
+            visibility = old_visibilities[lane_idx]
 
-            # 从稀疏标注点采样固定 Y 位置的 X 坐标
             try:
-                xs_outside_image, xs_inside_image = self.sample_lane(
-                    lane, self.offsets_ys
-                )
+                all_xs, all_vis = self.sample_lane(lane, self.offsets_ys, visibility)
             except Exception:
                 continue
-
-            if len(xs_inside_image) <= 1:
+            
+            valid_mask = (all_xs >= 0) & (all_xs < self.img_w)
+            
+            if valid_mask.sum() < 2:
                 continue
-
-            # 合并图像内外的所有采样点
-            all_xs = np.hstack((xs_outside_image, xs_inside_image))
-
-            # 标记该车道线有效 (ignore_flag=0, is_lane=1)
+                
+            valid_indices = np.where(valid_mask)[0]
+            start_index = valid_indices[0] 
+            xs_inside = all_xs[valid_mask]
+            
             lanes[lane_idx, 0] = 0
             lanes[lane_idx, 1] = 1
 
-            # 列 2: start_y - 车道线起始 Y 坐标 (strip 索引 / n_strips, 归一化到 [0,1])
-            # 例如: 图像外有 5 个点, n_strips=71, 则 start_y = 5/71 ≈ 0.07
-            lanes[lane_idx, 2] = len(xs_outside_image) / self.n_strips
+            # 1. Start Y
+            lanes[lane_idx, 2] = self.offsets_ys[start_index] / self.img_h
+            
+            # 2. Start X
+            lanes[lane_idx, 3] = xs_inside[0] / self.img_w
 
-            # 列 3: start_x - 车道线起始 X 坐标 (像素 / img_w, 归一化到 [0,1])
-            # 例如: start_x = 100 / 800 = 0.125
-            lanes[lane_idx, 3] = xs_inside_image[0] / self.img_w
+            # 3. Theta (全局计算，更稳健)
+            # 使用起点和终点计算整体斜率
+            x_start = xs_inside[0]
+            x_end = xs_inside[-1]
+            y_start = self.offsets_ys[start_index]
+            y_end = self.offsets_ys[start_index + len(xs_inside) - 1]
+            
+            dx = x_end - x_start
+            dy = y_end - y_start # 注意：OpenLane中y向上是减小，但这里我们用物理距离
+            # 实际上我们希望 Theta 0.5 对应垂直。
+            # 如果 dy 用 y_index 的差值 (正数)，dx (正为右)。
+            # dy_phys = len * strip_size
+            dy_phys = (len(xs_inside) - 1) * self.strip_size
+            
+            theta = 0.5 + math.atan2(dx, dy_phys) / math.pi
+            lanes[lane_idx, 4] = theta
 
-            # 列 4: theta - 车道线平均角度 (归一化到 [0,1], 公式: 角度 / π)
-            # 计算方法: 使用 atan(垂直距离 / 水平距离) / π
-            # 注意: 这里的角度计算是从起始点到采样点的平均斜率
-            thetas = []
-            for i in range(1, len(xs_inside_image)):
-                theta = (
-                    math.atan(
-                        i
-                        * self.strip_size
-                        / (xs_inside_image[i] - xs_inside_image[0] + 1e-5)
-                    )
-                    / math.pi
-                )
-                # 将角度映射到 [0, 1] 范围 (处理负角度)
-                theta = theta if theta > 0 else 1 - abs(theta)
-                thetas.append(theta)
-            theta_far = sum(thetas) / len(thetas) if thetas else 0.0
-            lanes[lane_idx, 4] = theta_far
+            # 4. Length
+            lanes[lane_idx, 5] = len(xs_inside) / self.n_strips
 
-            # 列 5: length - 车道线长度 (归一化到 [0,1], strip 数量 / n_strips)
-            lanes[lane_idx, 5] = len(xs_inside_image) / self.n_strips
+            # 5. Points
+            target_indices_slice = lanes[lane_idx, 6:]
+            target_indices_slice[valid_mask] = xs_inside / self.img_w
+            lanes[lane_idx, 6:] = target_indices_slice
+            
+            lanes_vis_interpolated[lane_idx, :] = all_vis
 
-            # 列 6+: xs[0:n_offsets] - 采样点 X 坐标序列 (像素 / img_w, 归一化到 [0,1])
-            # 共 72 个点, 从下到上按固定 Y 间隔采样
-            lanes[lane_idx, 6 : 6 + len(all_xs)] = all_xs / self.img_w
+            lanes_endpoints[lane_idx, 0] = (start_index + len(xs_inside) - 1) / self.n_strips
+            lanes_endpoints[lane_idx, 1] = xs_inside[-1] / self.img_w
+            
+            padded_categories[lane_idx] = old_categories[lane_idx]
+            padded_attributes[lane_idx] = old_attributes[lane_idx]
 
-            # lane_endpoints: 车道线终点坐标 (用于训练)
-            # endpoint_y: (strip 索引 / n_strips, 归一化到 [0,1])
-            # endpoint_x: (像素 / img_w, 归一化到 [0,1])
-            lanes_endpoints[lane_idx, 0] = (len(all_xs) - 1) / self.n_strips
-            lanes_endpoints[lane_idx, 1] = xs_inside_image[-1] / self.img_w
-
-        new_anno = {"label": lanes, "lane_endpoints": lanes_endpoints}
+        new_anno = {
+            "label": lanes,
+            "lane_endpoints": lanes_endpoints,
+            "lane_vis_interpolated": lanes_vis_interpolated,
+            "lanes": old_lanes,
+            "padded_categories": padded_categories,
+            "padded_attributes": padded_attributes
+        }
         return new_anno
 
     def __call__(self, sample):
         img_org = sample["img"]
         img_h_curr, img_w_curr = img_org.shape[:2]
-        is_preprocessed_img = img_h_curr == self.img_h
-        global_cut_height = self.cfg.cut_height
-
-        if not is_preprocessed_img and global_cut_height > 0:
-            new_lanes = []
-            for i in sample["lanes"]:
-                lanes = []
-                for p in i:
-                    lanes.append((p[0], p[1] - global_cut_height))
-                new_lanes.append(lanes)
-            sample.update({"lanes": new_lanes})
-
+        
         line_strings_org = self.lane_to_linestrings(sample["lanes"])
         line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
 
-        # Use a dummy mask because imgaug expects one if we pass segmentation_maps
-        # but we handle segmentation manually later for speed
         dummy_mask_arr = np.zeros((img_h_curr, img_w_curr, 1), dtype=np.uint8)
         mask_org = SegmentationMapsOnImage(dummy_mask_arr, shape=img_org.shape)
 
+        success = False
+        
         for i in range(30):
             try:
                 if self.training:
-                    # Pass dummy mask to keep imgaug happy if transforms require it
                     img, line_strings, _ = self.transform(
                         image=img_org.copy().astype(np.uint8),
                         line_strings=line_strings_org,
@@ -278,42 +273,81 @@ class GenerateLaneLineOpenLane(object):
                         image=img_org.copy().astype(np.uint8),
                         line_strings=line_strings_org,
                     )
-                line_strings.clip_out_of_image_()
-                new_anno = {"lanes": self.linestrings_to_lanes(line_strings)}
+                
+                aug_lanes = self.linestrings_to_lanes(line_strings)
+                current_vis = sample.get("lane_vis", [])
+                
+                new_anno_input = {
+                    "lanes": aug_lanes, 
+                    "lane_vis": current_vis,
+                    "lane_categories": sample.get("lane_categories", []),
+                    "lane_attributes": sample.get("lane_attributes", [])
+                }
+                
                 annos = self.transform_annotation(
-                    new_anno, img_wh=(self.img_w, self.img_h)
+                    new_anno_input, img_wh=(self.img_w, self.img_h)
                 )
+                
                 label = annos["label"]
                 lane_endpoints = annos["lane_endpoints"]
-                break
+                lane_vis_interpolated = annos["lane_vis_interpolated"]
+                
+                if np.sum(label[:, 1] == 1) > 0:
+                     success = True
+                     break
+                     
+                if i > 10: 
+                    success = True
+                    break
+                    
             except Exception:
-                if (i + 1) == 30:
-                    exit()
+                continue
 
-        # === Normalization (ImageNet) ===
+        if not success:
+            label = np.ones((self.max_lanes, 2 + 1 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32) * -1e5
+            label[:, 0] = 1; label[:, 1] = 0
+            lane_endpoints = np.zeros((self.max_lanes, 2))
+            lane_vis_interpolated = np.zeros((self.max_lanes, self.n_offsets), dtype=np.float32)
+            padded_categories = np.zeros(self.max_lanes, dtype=np.int64)
+            padded_attributes = np.zeros(self.max_lanes, dtype=np.int64)
+            new_anno_input = {"lanes": sample["lanes"]}
+        else:
+            padded_categories = annos["padded_categories"]
+            padded_attributes = annos["padded_attributes"]
+
         img = img.astype(np.float32) / 255.0
         img = (img - self.mean) / self.std
 
         sample["img"] = img
         sample["lane_line"] = label
         sample["lanes_endpoints"] = lane_endpoints
-        sample["gt_points"] = new_anno["lanes"]
+        sample["lane_vis_interpolated"] = lane_vis_interpolated
+        sample["gt_points"] = new_anno_input["lanes"]
+        
+        sample["lane_categories"] = padded_categories
+        sample["lane_attributes"] = padded_attributes
 
-        # === Optimized Seg Mask (Downsample 8x, uint8) ===
-        # Reduce memory usage significantly
+        if self.enable_3d and "lanes_3d" in sample:
+            sample["lanes_3d"] = sample["lanes_3d"]
+            if "intrinsic" in sample: sample["intrinsic"] = sample["intrinsic"]
+            if "extrinsic" in sample: sample["extrinsic"] = sample["extrinsic"]
+
         mask_scale = 8
         mask_h, mask_w = int(self.img_h // mask_scale), int(self.img_w // mask_scale)
         seg_map = np.zeros((mask_h, mask_w), dtype=np.uint8)
 
-        lanes_points = new_anno["lanes"]
-        for lane in lanes_points:
-            if len(lane) < 2:
-                continue
-            pts = np.array([lane], dtype=np.float32) / mask_scale
-            pts = pts.astype(np.int32)
-            cv2.polylines(seg_map, pts, isClosed=False, color=1, thickness=1)
+        try:
+            lanes_points = new_anno_input["lanes"]
+            for lane in lanes_points:
+                if len(lane) < 2:
+                    continue
+                pts = np.array([lane], dtype=np.float32)
+                pts = pts / mask_scale
+                pts = pts.astype(np.int32)
+                cv2.polylines(seg_map, pts, isClosed=False, color=1, thickness=1)
+        except:
+            pass
 
         sample["seg"] = seg_map.astype(np.int64)
-        # ===============================================
 
         return sample

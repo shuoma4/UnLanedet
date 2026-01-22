@@ -20,7 +20,7 @@ if "--num-gpus" in sys.argv:
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 48
+TARGET_BATCH_PER_GPU = 40
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
@@ -41,35 +41,33 @@ from ..modelzoo import get_config
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
 from .model_factory import create_llanet_model
 
-opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
 
 iou_loss_weight = 2.0
 cls_loss_weight = 2.0
-xyt_loss_weight = 0.2
+xyt_loss_weight = 0.1
 seg_loss_weight = 1.0
-category_loss_weight = 2.0
+category_loss_weight = 1.0
 attribute_loss_weight = 0.5
 
-# SimOTA dynamic assignment weights (Geometry-Aware)
-# 增大几何权重，降低分类权重，让分配更关注距离而非分类置信度
+# dynamic assignment weights (Geometry-Aware)
+assign_method_name = "CLRNet"  # Ooptions : GeometryAware or CLRNet
 w_cls = 2.0
 w_geom = 4.0
 w_iou = 2.0
 
-# Dynamic weight scheduling (Curriculum Learning)
-# 动态权重调度（课程学习）
-start_w_cls = 0.5  # SimOTA 分类权重的起始值
-start_cls_loss_weight = 0.001  # 分类损失权重的起始值
-start_category_loss_weight = 0.001  # 类别损失权重的起始值
-start_attribute_loss_weight = 0.001  # 属性损失权重的起始值
-warmup_epochs = 5  # 预热轮数
+# 预热参数设置
+start_w_cls = 0.5
+start_cls_loss_weight = 0.001
+start_category_loss_weight = 0.001
+start_attribute_loss_weight = 0.001
+warmup_epochs = 5
 
-num_points = 72
-max_lanes = 24
-sample_y = range(589, 230, -20)
-num_priors = 96
-num_lane_categories = 15
-num_lr_attributes = 4
+num_points = 72  # 采样点
+max_lanes = 24  # 最大车道数
+sample_y = range(589, 230, -20)  # 采样y坐标
+num_priors = 96  # 车道线候选框数目
+num_lane_categories = 15  # 车道线类别数目
+num_lr_attributes = 4  # 车道线左右属性数目
 
 test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
 
@@ -84,12 +82,17 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 64
 num_classes = 4 + 1
-data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/"
+data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/"  # openlane 数据集根目录
 lane_anno_dir = "lane3d_300/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
+opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
+
+use_preprocessed = True  #  是否采取预处理方式
+enable_3d = False  #  是否读取3D数据
 
 param_config = OmegaConf.create()
 param_config.opencv_path = opencv_path
-param_config.use_preprocessed = True
+param_config.use_preprocessed = use_preprocessed
+param_config.enable_3d = enable_3d
 param_config.use_pretrained_backbone = True
 param_config.iou_loss_weight = iou_loss_weight
 param_config.cls_loss_weight = cls_loss_weight
@@ -107,7 +110,7 @@ param_config.start_attribute_loss_weight = start_attribute_loss_weight
 param_config.warmup_epochs = warmup_epochs
 param_config.num_points = num_points
 param_config.max_lanes = max_lanes
-param_config.sample_y = [i for i in range(589, 230, -20)]
+# param_config.sample_y = [i for i in range(589, 230, -20)]
 param_config.test_parameters = test_parameters
 param_config.ori_img_w = ori_img_w
 param_config.ori_img_h = ori_img_h
@@ -125,15 +128,10 @@ param_config.num_lane_categories = num_lane_categories
 param_config.num_lr_attributes = num_lr_attributes
 param_config.num_priors = num_priors
 
-
 # Training Config
 train = get_config("config/common/train.py").train
 epochs = 15
-
-# Dataset size for OpenLane lane3d_300
 train_samples = 45903  # 训练集样本数
-
-# Dynamic Batch Size
 batch_size = dynamic_total_batch_size
 epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs
@@ -143,18 +141,17 @@ train.eval_period = epoch_per_iter * 16
 train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
 param_config.output_dir = train.output_dir
 
-# Model
+# Model Config
 param_config.featuremap_out_channel = 64  # neck 层输出通道数目
 param_config.fc_hidden_dim = 64  # head层 全连接层隐藏层维度
 param_config.epoch_per_iter = epoch_per_iter
 param_config.assign_method = "CLRNet"  # optional GeometryAware
 model = create_llanet_model(param_config)
 
-# Optimizer
+# Optimizer Config
 optimizer = get_config("config/common/optim.py").AdamW
-optimizer.lr = 3e-4  # 从 5e-5 提升到 3e-4，避免陷入局部最优
+optimizer.lr = 3e-4
 optimizer.weight_decay = 1e-3
-
 lr_multiplier = L(CompositeParamScheduler)(
     schedulers=[
         L(LinearParamScheduler)(start_value=0.1, end_value=1.0),
@@ -163,8 +160,19 @@ lr_multiplier = L(CompositeParamScheduler)(
     lengths=[0.3, 0.7],
     interval_scaling=["rescaled", "rescaled"],
 )
-# === Transform Definition (Optimized) ===
-train_transforms = [
+
+# Transform Config
+# 根据 use_preprocessed 设置 train transforms
+if param_config.use_preprocessed:
+    base_transforms = []
+else:
+    base_transforms = [
+        dict(
+            name="Resize", parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0
+        )
+    ]
+
+train_transforms = base_transforms + [
     dict(name="HorizontalFlip", parameters=dict(p=1.0), p=0.5),
     dict(name="ChannelShuffle", parameters=dict(p=1.0), p=0.1),
     dict(
@@ -197,15 +205,11 @@ train_process = [
     ),
 ]
 
+# 验证时的处理
+val_transforms = base_transforms
 val_process = [
     L(GenerateLaneLineOpenLane)(
-        transforms=[
-            dict(
-                name="Resize",
-                parameters=dict(size=dict(height=img_h, width=img_w)),
-                p=1.0,
-            )
-        ],
+        transforms=val_transforms,
         training=False,
         cfg=param_config,
     ),

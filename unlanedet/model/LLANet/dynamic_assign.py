@@ -14,7 +14,7 @@ class GeometryAwareAssign(nn.Module):
         super(GeometryAwareAssign, self).__init__()
         self.simota_q = 10
 
-        self.target_w_cls = getattr(cfg, "w_cls", 4.0)
+        self.w_cls = getattr(cfg, "w_cls", 4.0)
         self.w_geom = getattr(cfg, "w_geom", 5.0)
         self.w_iou = getattr(cfg, "w_iou", 2.0)
 
@@ -28,14 +28,14 @@ class GeometryAwareAssign(nn.Module):
 
     def forward(self, preds, targets, masks, img_w, img_h, current_iter=0):
         # 动态权重计算
-        warmup_iters = self.warmup_epochs * self.epoch_per_iter
-        if current_iter < warmup_iters:
-            alpha = current_iter / warmup_iters
-            current_w_cls = self.start_w_cls + alpha * (
-                self.target_w_cls - self.start_w_cls
-            )
-        else:
-            current_w_cls = self.target_w_cls
+        # warmup_iters = self.warmup_epochs * self.epoch_per_iter
+        # if current_iter < warmup_iters:
+        #     alpha = current_iter / warmup_iters
+        #     current_w_cls = self.start_w_cls + alpha * (
+        #         self.target_w_cls - self.start_w_cls
+        #     )
+        # else:
+        #     current_w_cls = self.target_w_cls
 
         device = preds.device
         batch_size, num_priors, _ = preds.shape
@@ -113,7 +113,7 @@ class GeometryAwareAssign(nn.Module):
         mask_expanded = masks.unsqueeze(1).expand(-1, num_priors, -1)
 
         total_cost = (
-            current_w_cls * cls_cost
+            self.w_cls * cls_cost
             + self.w_geom * geom_cost
             + self.w_iou * iou_cost
             + 100000.0 * (~mask_expanded.bool()).float()

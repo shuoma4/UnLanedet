@@ -634,18 +634,45 @@ class OpenLaneEvaluator(DatasetEvaluator):
         return {"Internal/Category_Acc": cat_acc, "Internal/Attribute_Acc": attr_acc}
 
     def decode_lanes(self, preds, img_w, img_h, ori_img_w, ori_img_h, num_points):
+        """
+        将模型预测的归一化坐标解码回原始图像尺寸 (1920x1280)
+
+        关键步骤：
+        1. 模型输出：归一化坐标 (基于 img_w=800, img_h=320)
+        2. Y轴：从底(320)到顶(0) 均匀采样
+        3. 反变换：先从 800x320 还原到裁剪后尺寸，再加上 cut_height
+
+        Args:
+            preds: 模型预测，形状 [num_lanes, 2+1+1+1+1+72]
+            img_w: 训练图像宽度 (800)
+            img_h: 训练图像高度 (320)
+            ori_img_w: 原始图像宽度 (1920)
+            ori_img_h: 原始图像高度 (1280)
+            num_points: 采样点数 (72)
+        """
         decoded = []
         cut_height = self.cfg.cut_height
-        strip_size = img_h / (num_points - 1)
-        orig_crop_h = ori_img_h - cut_height
+        strip_size = img_h / (num_points - 1)  # 320 / 71 ≈ 4.507
+        orig_crop_h = ori_img_h - cut_height  # 1280 - 270 = 1010
 
         for lane in preds:
-            xs = lane[6:]  # Normalized X
+            xs = lane[6:]  # Normalized X [0-1]
             lane_points = []
             for i, x in enumerate(xs):
-                y_train = img_h - 1 - i * strip_size
+                # 模型输出的 Y 坐标是线性采样的：从 img_h 到 0
+                # index 0 -> y = 320 (底部)
+                # index 71 -> y = 0 (顶部)
+                y_train = img_h - i * strip_size
+
+                # 【关键】Y 坐标反变换
+                # 1. 归一化：y_train / img_h (范围 0~1)
+                # 2. 映射到裁剪后高度：乘以 orig_crop_h (范围 0~1010)
+                # 3. 还原 cut_height：加上 cut_height (范围 270~1280)
                 y_orig = (y_train / img_h) * orig_crop_h + cut_height
+
+                # X 坐标反变换：归一化 * 原始宽度
                 x_orig = x * ori_img_w
+
                 lane_points.append((x_orig, y_orig))
             decoded.append(lane_points)
         return decoded
