@@ -81,10 +81,6 @@ class OpenLaneEvaluator(DatasetEvaluator):
         self.iou_threshold = iou_threshold
         self.width = width
         self.metric = metric  # Renamed back to metric to match original logic if needed, but primary_metric_name was better. Wait, the old code used primary_metric_name?
-        # Let's check what I removed. I removed `self.primary_metric_name = metric`.
-        # And I put `self.metric = metric`.
-        # I should stick to what was there before my bad edit.
-
         self.logger = logging.getLogger(__name__)
 
         # 1. Output Directory Setup
@@ -96,8 +92,6 @@ class OpenLaneEvaluator(DatasetEvaluator):
         else:
             self.output_dir = output_dir
 
-        # Structure required by official tool: .../validation/segment-xxx/xxx.json
-        # Note: save_rel_path includes 'validation/' prefix, so we use output_dir as root
         self.result_dir = self.output_dir
         self.test_list_path = os.path.join(self.output_dir, "test_list.txt")
 
@@ -140,7 +134,6 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         # Configuration for visualization
         self.generate_visualization = getattr(cfg, "generate_visualization", False)
-
         self.reset()
 
     def reset(self):
@@ -187,14 +180,10 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         batch_size = len(outputs)
 
-        # DEBUG MARKER
-        print(f"MARKER: Batch processed. Batch size: {batch_size}", flush=True)
-
         for i in range(batch_size):
             output_data = outputs[i]
 
             # --- 1. 解析 Meta 信息 ---
-            # Try to get img_name directly from inputs (if meta is missing)
             original_rel_path = None
             if "img_name" in inputs:
                 names = inputs["img_name"]
@@ -279,58 +268,19 @@ class OpenLaneEvaluator(DatasetEvaluator):
             # 原始输出前两列是 Logits，必须转概率
             logits = pred_lines[:, :2]
             probs = F.softmax(logits, dim=1)
-            scores = probs[:, 1]  # 前景概率
+            scores = probs[:, 1]
 
-            # DEBUG: Print scores statistics
-            if i % 100 == 0:
-                self.logger.info(
-                    f"DEBUG Batch {i}: Scores range: {scores.min().item():.4f} - {scores.max().item():.4f}, Mean: {scores.mean().item():.4f}"
-                )
-                self.logger.info(
-                    f"DEBUG Batch {i}: Conf threshold: {self.cfg.test_parameters.conf_threshold}"
-                )
-
-            # 这里的 Threshold 可以设低一点，交给 NMS 去筛选
             conf_threshold = self.cfg.test_parameters.conf_threshold
             valid_mask = scores > conf_threshold
-
-            # Fallback logic: if no lanes found, retry with lower threshold
-            if valid_mask.sum() == 0 and len(scores) > 0:
-                fallback_threshold = 0.01
-                valid_mask = scores > fallback_threshold
-                if i % 100 == 0:
-                    self.logger.info(
-                        f"DEBUG Batch {i}: Fallback to threshold {fallback_threshold}, kept {valid_mask.sum()}"
-                    )
-
             valid_preds = pred_lines[valid_mask]
             valid_scores = scores[valid_mask]
 
-            # DEBUG: Print number of valid preds
-            if i % 100 == 0:
-                self.logger.info(
-                    f"DEBUG Batch {i}: Valid preds after conf threshold (with fallback): {len(valid_preds)}"
-                )
-
-            if len(valid_preds) == 0:
-                if i % 100 == 0:
-                    self.logger.info(
-                        f"DEBUG Batch {i}: No valid preds. Scores Max={scores.max().item():.4f}"
-                    )
+            if valid_mask.sum() == 0 and len(scores) > 0:
+                self.logger.error(f"No preds' confidence > {conf_threshold}")
                 self._save_empty_json(save_rel_path, original_rel_path)
                 continue
 
-            # Prepare preds for NMS (scale to pixels/strips like in LLANetHead)
-            # indices in valid_preds: 0:start_y, 1:start_x, 2:length, 3...:offsets
             nms_preds = valid_preds.clone()
-            # Note: lane_nms inside this file multiplies xs by img_w, so we don't scale xs here.
-            # We also don't need to scale length/start here as lane_nms doesn't use them for IoU (it uses xs).
-            if torch.is_tensor(nms_preds):
-                pass
-            else:
-                pass
-
-            # --- 4. NMS 处理 (关键步骤) ---
             keep_indices = lane_nms(
                 nms_preds,
                 valid_scores,
@@ -338,27 +288,17 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 top_k=self.cfg.test_parameters.nms_topk,
                 img_w=self.cfg.img_w,  # 传入 img_w 用于反归一化
             )
-
-            # DEBUG: Print NMS results
-            if i % 100 == 0:
-                self.logger.info(
-                    f"DEBUG Batch {i}: Kept after NMS: {len(keep_indices)}"
-                )
-
             # 获取 NMS 后的最终预测
             final_preds = valid_preds[keep_indices]
-
             # --- 5. 处理类别和属性 ---
             valid_cats = np.zeros(len(final_preds), dtype=int)
             valid_attrs = np.zeros(len(final_preds), dtype=int)
-
             # Handle Category
             current_cat_logits = None
             if cat_logits_batch is not None:
                 current_cat_logits = cat_logits_batch[i]
             elif isinstance(output_data, dict) and "category" in output_data:
                 current_cat_logits = output_data["category"]
-
             if current_cat_logits is not None:
                 if torch.is_tensor(current_cat_logits):
                     current_cat_logits = current_cat_logits.detach().cpu()
@@ -388,13 +328,6 @@ class OpenLaneEvaluator(DatasetEvaluator):
                         attr_logits_valid = current_attr_logits[valid_mask]
                         # Filter by NMS keep_indices
                         attr_logits_final = attr_logits_valid[keep_indices]
-
-                        # DEBUG: Print attribute logits shape
-                        if i % 100 == 0:
-                            self.logger.info(
-                                f"DEBUG Batch {i}: Attr logits shape: {attr_logits_final.shape}"
-                            )
-
                         valid_attrs = torch.argmax(attr_logits_final, dim=1).numpy()
                     else:
                         self.logger.warning(
@@ -420,8 +353,6 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 official_cat_id = self.id_to_openlane_cat.get(model_cat_id, 0)
 
                 model_attr_id = int(valid_attrs[j])
-                # Map 0-based model attribute to official attribute
-                # Removing +1 offset as GT likely uses 0 for unknown/background
                 official_attr_id = model_attr_id
 
                 # Convert to [ [x1, x2, ...], [y1, y2, ...] ] format for OpenLane C++ evaluator
@@ -440,14 +371,12 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 }
                 lane_lines_json.append(lane_obj)
 
-            # [关键修复] JSON 中的 file_path 必须包含 validation/ 或 training/ 前缀
-            # 使用最开始解析出来的 original_rel_path
             self._write_json(
-                save_rel_path,  # 文件名用短路径
+                save_rel_path,
                 {
                     "file_path": original_rel_path,
                     "lane_lines": lane_lines_json,
-                },  # 内容用长路径
+                },
             )
 
         return []
@@ -526,12 +455,9 @@ class OpenLaneEvaluator(DatasetEvaluator):
             for file in files:
                 if file.endswith(".json"):
                     full_path = os.path.join(root, file)
-                    # 直接读取 JSON 文件中的 file_path 字段
                     try:
                         with open(full_path, "r") as f:
                             content = json.load(f)
-                            # 只保留 validation/ 路径，过滤掉 training/ 路径
-                            # Relaxed check: Accept if 'validation/' is in path, or if path is not empty
                             img_path = None
                             if "file_path" in content:
                                 img_path = content["file_path"]
@@ -663,7 +589,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
         )
         image_dir = data_root.rstrip("/") + "/"
         result_dir_root = self.output_dir
-        output_file = os.path.join(self.output_dir, "official_eval_log.txt")
+        output_file = os.path.join(self.output_dir, "eval_res/")
 
         # Setup environment variables for OpenCV library path
         env = os.environ.copy()
@@ -693,6 +619,8 @@ class OpenLaneEvaluator(DatasetEvaluator):
             "-j",
             str(4),
         ]
+        if self.generate_visualization:
+            cmd.append("-v")  # 保存可视化图片
 
         metrics = {}
         try:
@@ -801,66 +729,24 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         for lane in preds:
             # lane indices: 0:score, 1:cat, 2:start_y, 3:start_x, 4:length, 5..76:offsets
-
-            # 1. Get start_y and length for filtering
             start_y = lane[2].item() if torch.is_tensor(lane) else lane[2]
             length = lane[5].item() if torch.is_tensor(lane) else lane[5]
-
-            # DEBUG: Check range of start_y and length
-            # print(f"DEBUG: start_y={start_y:.4f}, length={length:.4f}")
-
-            # Calculate valid Y range in original image coordinates
-            # Start_y from model (LLANet) follows prior_ys: 1.0 (Bottom) to 0.0 (Top)
-            # Evaluator Y coordinate system: 0.0 (Top) to 1.0 (Bottom) in terms of crop height?
-            # Wait, y_start_orig = real_start_y * orig_crop_h + cut_height
-            # If real_start_y = 1.0 -> y = 1280 (Bottom).
-            # If model start_y = 1.0 (Bottom), then real_start_y should be 1.0.
-            # However, empirically, the model output seems to need inversion or
-            # start_y is actually distance from Top?
-            # Based on visualization debug: start_y=0.2 -> y_start=470 (Top).
-            # But lanes are at Bottom. So we need 1.0 - start_y to get 0.8 -> 1078 (Bottom).
             real_start_y = 1.0 - start_y
-
             y_start_orig = real_start_y * orig_crop_h + cut_height
             y_end_orig = (real_start_y - length) * orig_crop_h + cut_height
-
-            # DEBUG: Check range of start_y and length
-            if len(decoded) < 3:  # Print first 3 lanes
-                print(
-                    f"DEBUG: start_y={start_y:.4f}, start_x={lane[3].item():.4f}, theta={lane[4].item():.4f}, length={length:.4f}, real_start={real_start_y:.4f}"
-                )
-                print(
-                    f"DEBUG: y_start_orig={y_start_orig:.4f}, y_end_orig={y_end_orig:.4f}"
-                )
-
             xs = lane[6:].detach().cpu().numpy() if torch.is_tensor(lane) else lane[6:]
-
-            # Reverse to match Top-to-Bottom Y generation loop below
             xs = xs[::-1]
-
             lane_points = []
             for i, x in enumerate(xs):
-                # index 0 -> y = 0 (Top) -> y_orig = 270
-                # index 71 -> y = 320 (Bottom) -> y_orig = 1280
                 y_train = i * strip_size
                 y_orig = (y_train / img_h) * orig_crop_h + cut_height
                 x_orig = x * ori_img_w
-
-                # Filter points outside valid range [y_end_orig, y_start_orig]
-                # Also filter X coordinates
                 if y_orig < y_end_orig - 2 or y_orig > y_start_orig + 2:
                     continue
-
-                # Experimental fix: Flip X - REMOVED
-                # x = 1.0 - x
                 x_orig = x * ori_img_w
-
                 if x_orig < 0 or x_orig > ori_img_w:
                     continue
-
                 lane_points.append((x_orig, y_orig))
-
-            # Reverse points to match GT order (Bottom-to-Top)
             lane_points = lane_points[::-1]
             decoded.append(lane_points)
         return decoded

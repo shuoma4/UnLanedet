@@ -168,6 +168,7 @@ vis_debug_detailed
 debug_vis
 source
 .trae
+vis
 
 # extra ide
 .codebuddy 

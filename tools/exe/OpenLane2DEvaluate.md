@@ -149,9 +149,9 @@ CSV results saved to: ./csv_results/
 ```
 
 输出文件位置：
-- `{output_folder}csv_results/iou_list.csv` - IoU列表
-- `{output_folder}csv_results/category_stats.csv` - 类别统计
-- `{output_folder}csv_results/attribute_stats.csv` - 属性统计
+- `{output_folder}/csv_results/iou_list.csv` - IoU列表
+- `{output_folder}/csv_results/category_stats.csv` - 类别统计
+- `{output_folder}/csv_results/attribute_stats.csv` - 属性统计
 
 ---
 

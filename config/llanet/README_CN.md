@@ -149,10 +149,7 @@ python tools/train_net.py \
 ```bash
 export CUDA_VISIBLE_DEVICES=0  # 评估可以用单GPU
 
-python tools/train_net.py \
-    --config-file configs/llanet/mobilenetv4_openlane.py \
-    --eval-only \
-    --opts train.init_checkpoint=/path/to/model_best.pth
+python tools/train_net.py --config-file $CONFIG --eval-only train.init_checkpoint=$CHECKPOINT
 ```
 
 ### 6. 单张图片推理

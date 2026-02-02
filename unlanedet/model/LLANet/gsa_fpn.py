@@ -328,8 +328,6 @@ class GSAFPN(nn.Module):
                         )
                 if getattr(m, "bias", None) is not None:
                     nn.init.constant_(m.bias, 0)
-        if self.debug:
-            print(f"[GSAFPN][init] conv_layers={n_conv}, att_conv_layers={n_att} (att std=0.01)")
 
     def forward(self, inputs):
         """前向传播
@@ -346,23 +344,16 @@ class GSAFPN(nn.Module):
             raise TypeError(f"inputs 必须为 list/tuple, got {type(inputs)}")
         inputs = list(inputs)
 
-        # DEBUG: Check inputs stats
-        for i, inp in enumerate(inputs):
-            inp_min = inp.min().item()
-            inp_max = inp.max().item()
-            inp_mean = inp.mean().item()
-            print(f"[GSAFPN] Input {i} stats: Min={inp_min}, Max={inp_max}, Mean={inp_mean}", flush=True)
-
         # 改进输入裁剪逻辑：按 backbone_end_level 动态选择输入特征
-        assert len(inputs) >= self.backbone_end_level, (
-            f"inputs 数量不足: got {len(inputs)}, expect >= {self.backbone_end_level}"
-        )
+        assert (
+            len(inputs) >= self.backbone_end_level
+        ), f"inputs 数量不足: got {len(inputs)}, expect >= {self.backbone_end_level}"
         if len(inputs) > self.backbone_end_level:
             # 保留最后 backbone_end_level 个特征（通常对应更高层级）
             inputs = inputs[-self.backbone_end_level :]
-        assert len(inputs) == self.backbone_end_level, (
-            f"裁剪后 inputs 数量不匹配: got {len(inputs)}, expect {self.backbone_end_level}"
-        )
+        assert (
+            len(inputs) == self.backbone_end_level
+        ), f"裁剪后 inputs 数量不匹配: got {len(inputs)}, expect {self.backbone_end_level}"
 
         # ===== 1. SCM横向连接 =====
         laterals = [
@@ -447,17 +438,4 @@ class GSAFPN(nn.Module):
             len(outs) == self.num_outs
         ), f"输出 outs 数量不匹配: got {len(outs)}, expect {self.num_outs}"
 
-        if self.debug:
-            with torch.no_grad():
-                for i, o in enumerate(outs):
-                    o_f = o.float()
-                    nan_cnt = int(torch.isnan(o_f).sum().item())
-                    inf_cnt = int(torch.isinf(o_f).sum().item())
-                    print(
-                        f"[GSAFPN][debug] out[{i}] shape={tuple(o.shape)} "
-                        f"dtype={o.dtype} device={o.device} requires_grad={o.requires_grad} "
-                        f"mean={o_f.mean().item():.4g} std={o_f.std(unbiased=False).item():.4g} "
-                        f"min={o_f.min().item():.4g} max={o_f.max().item():.4g} "
-                        f"nan={nan_cnt} inf={inf_cnt}"
-                    )
         return tuple(outs)

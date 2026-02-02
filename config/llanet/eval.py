@@ -88,7 +88,7 @@ opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 
 dataset_statistics = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"
 
 use_preprocessed = True  #  是否采取预处理方式
-enable_3d = False  #  是否使用3D数据
+enable_3d = False  #  是否读取3D数据
 
 param_config = OmegaConf.create()
 param_config.opencv_path = opencv_path
@@ -145,7 +145,7 @@ total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter * 16
-train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
+train.output_dir = "./output/llanet/eval/"
 
 # Model Config
 param_config.featuremap_out_channel = 64  # neck 层输出通道数目
@@ -257,7 +257,7 @@ param_config.generate_visualization = True  # 开启可视化
 dataloader.evaluator = L(OpenLaneEvaluator)(
     cfg=param_config,
     evaluate_bin_path="/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate",
-    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/mobilenetv4_small_gsafpn_openlane/eval_results/",
+    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/eval/eval_results/",
     iou_threshold=0.5,
     width=30,
     metric="OpenLane/F1",

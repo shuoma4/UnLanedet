@@ -136,17 +136,6 @@ class ROIGather(nn.Module):
         bs = x.size(0)
         roi = roi.contiguous().view(bs * self.num_priors, -1)
 
-        # DEBUG: Check stats
-        if layer_index == 0 or layer_index == 1:
-            print(
-                f"DEBUG Layer {layer_index} ROI stats: Min={roi.min().item():.4f}, Max={roi.max().item():.4f}, Mean={roi.mean().item():.4f}",
-                flush=True,
-            )
-            print(
-                f"DEBUG Layer {layer_index} FC Weight stats: Min={self.fc.weight.min().item():.4f}, Max={self.fc.weight.max().item():.4f}",
-                flush=True,
-            )
-
         roi_fc = self.fc(roi)
         if torch.isnan(roi_fc).any():
             print(
