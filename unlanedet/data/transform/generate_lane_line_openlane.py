@@ -7,6 +7,84 @@ import torch
 import logging
 from scipy.interpolate import InterpolatedUnivariateSpline
 
+SAMPLE_YS = np.array(
+    [
+        319.6830,
+        299.1755,
+        288.1069,
+        278.8685,
+        271.2010,
+        264.5021,
+        258.1576,
+        252.1329,
+        246.5941,
+        241.4484,
+        236.5802,
+        232.0505,
+        227.8064,
+        223.7576,
+        219.8788,
+        216.1666,
+        212.5930,
+        209.1743,
+        205.9125,
+        202.7910,
+        199.8333,
+        197.0328,
+        194.4030,
+        191.8849,
+        189.4959,
+        187.2366,
+        185.0870,
+        183.0033,
+        181.0229,
+        179.1508,
+        177.3247,
+        175.5872,
+        173.8830,
+        172.2575,
+        170.7122,
+        169.2310,
+        167.8029,
+        166.4013,
+        165.0256,
+        163.6902,
+        162.3892,
+        161.1257,
+        159.9209,
+        158.7296,
+        157.5868,
+        156.4646,
+        155.3836,
+        154.3106,
+        153.2744,
+        152.2586,
+        151.2432,
+        150.2484,
+        149.2443,
+        148.2803,
+        147.2915,
+        146.3137,
+        145.3547,
+        144.3467,
+        143.3510,
+        142.3108,
+        141.2397,
+        140.1361,
+        138.9647,
+        137.7536,
+        136.4428,
+        135.0326,
+        133.4488,
+        131.7072,
+        129.3437,
+        125.9605,
+        119.7482,
+        3.1798,
+    ],
+    dtype=np.float32,
+)
+
 # 强制关闭 OpenCV 多线程
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
@@ -39,7 +117,18 @@ class GenerateLaneLineOpenLane(object):
         self.strip_size = self.img_h / self.n_strips
         self.max_lanes = cfg.max_lanes
         # Y轴坐标：从底部(img_h)到顶部(0)
-        self.offsets_ys = np.linspace(self.img_h, 0, self.num_points)
+        # self.offsets_ys = np.linspace(self.img_h, 0, self.num_points)
+        if hasattr(cfg, "sample_y") and cfg.sample_y is not None:
+             self.offsets_ys = np.array(cfg.sample_y, dtype=np.float32)
+        elif self.num_points == 72:
+             # Fallback if not provided in config but num_points is 72 (backward compatibility)
+             # But user requested external injection, so we rely on config mainly.
+             # If SAMPLE_YS is removed, this fallback will fail if we use it.
+             # For now, let's assume config must provide it or we fallback to linspace if not 72?
+             # Actually, better to default to linspace if no sample_y provided.
+             self.offsets_ys = np.linspace(self.img_h, 0, self.num_points)
+        else:
+            self.offsets_ys = np.linspace(self.img_h, 0, self.num_points)
         self.training = training
         self.cut_height = getattr(cfg, "cut_height", 270)
         self.enable_3d = getattr(cfg, "enable_3d", False)
@@ -128,14 +217,6 @@ class GenerateLaneLineOpenLane(object):
             return np.array([]), np.array([])
         sort_idx = np.argsort(points[:, 1])[::-1]
         points = points[sort_idx]
-        _, unique_indices = np.unique(points[:, 1], return_index=True)
-        valid_points = [points[0]]
-        for i in range(1, len(points)):
-            if abs(points[i, 1] - points[i - 1, 1]) > 1e-4:
-                valid_points.append(points[i])
-        points = np.array(valid_points)
-        if len(points) < 2:
-            return np.array([]), np.array([])
         diffs = points[1:] - points[:-1]
         seg_lens = np.sqrt((diffs**2).sum(axis=1))
         arc_len = np.concatenate([[0.0], np.cumsum(seg_lens)])
@@ -155,18 +236,12 @@ class GenerateLaneLineOpenLane(object):
         return sampled[:, 0], sampled[:, 1]
 
     def sample_lane(self, points, sample_ys, visibility):
-        dense_x, dense_y = self.sample_lane_fixed(points, num_samples=72)
+        dense_x, dense_y = self.sample_lane_fixed(points, num_samples=320)
         if len(dense_x) < 2:
             return np.zeros_like(sample_ys) - 1e5, np.zeros_like(sample_ys)
         interp_xs = np.interp(
             sample_ys, dense_y[::-1], dense_x[::-1], left=-1e5, right=-1e5
         )
-        if sample_ys[0] > dense_y[0]:
-            p1_x, p1_y = dense_x[0], dense_y[0]
-            p2_x, p2_y = dense_x[1], dense_y[1]
-            slope = (p2_x - p1_x) / (p2_y - p1_y + 1e-6)
-            extrap_mask = sample_ys > p1_y
-            interp_xs[extrap_mask] = p1_x + (sample_ys[extrap_mask] - p1_y) * slope
         all_vis = np.where(
             (interp_xs >= 0) & (interp_xs < self.img_w) & (interp_xs > -1e4),
             1.0,

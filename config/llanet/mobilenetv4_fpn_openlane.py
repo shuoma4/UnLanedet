@@ -57,7 +57,6 @@ w_iou = 2.0
 
 # 预热参数设置
 start_w_cls = 0.5
-start_cls_loss_weight = 0.001
 start_category_loss_weight = 0.001
 start_attribute_loss_weight = 0.001
 warmup_epochs = 5
@@ -106,7 +105,6 @@ param_config.w_cls = w_cls
 param_config.w_geom = w_geom
 param_config.w_iou = w_iou
 param_config.start_w_cls = start_w_cls
-param_config.start_cls_loss_weight = start_cls_loss_weight
 param_config.start_category_loss_weight = start_category_loss_weight
 param_config.start_attribute_loss_weight = start_attribute_loss_weight
 param_config.warmup_epochs = warmup_epochs

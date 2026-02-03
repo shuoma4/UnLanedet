@@ -64,7 +64,6 @@ class LLANetHead(nn.Module):
         # Dynamic weight scheduling parameters
         self.epoch_per_iter = cfg.epoch_per_iter
         self.warmup_epochs = cfg.warmup_epochs
-        self.start_cls_loss_weight = cfg.start_cls_loss_weight
         self.cls_loss_weight = cfg.cls_loss_weight
         self.start_category_loss_weight = cfg.start_category_loss_weight
         self.category_loss_weight = cfg.category_loss_weight
@@ -173,7 +172,7 @@ class LLANetHead(nn.Module):
         self.init_weights()
 
     def __init_buffers(self):
-        # sample_x_indexs: sample points for ROI Gather (Top-to-Bottom: 0 -> n_strips)
+        # Initialize sample_x_indexs
         self.register_buffer(
             name="sample_x_indexs",
             tensor=(
@@ -181,8 +180,26 @@ class LLANetHead(nn.Module):
                 * self.n_strips
             ).long(),
         )
+
+        use_external = False
+        if hasattr(self.cfg, "sample_y") and self.cfg.sample_y is not None:
+            try:
+                sample_y = torch.tensor(self.cfg.sample_y, dtype=torch.float32)
+                prior_ys = sample_y / self.img_h
+                self.register_buffer(name="prior_ys", tensor=prior_ys)
+                self.register_buffer(
+                    name="prior_feat_ys",
+                    tensor=prior_ys[self.sample_x_indexs],
+                )
+                self.logger.info(
+                    "Init prior Y buffers using external sample_y from config."
+                )
+                use_external = True
+            except Exception as e:
+                self.logger.error(f"Failed to use external sample_y: {e}")
+
         use_pdf = False
-        if self.stats_data is not None:
+        if not use_external and self.stats_data is not None:
             try:
                 has_y = (
                     "start_y_grid" in self.stats_data
@@ -207,11 +224,6 @@ class LLANetHead(nn.Module):
                     q_off = np.linspace(0.0, 1.0, self.n_offsets, dtype=np.float32)
                     y_feat = np.interp(q_feat, y_cdf, y_grid)
                     y_off = np.interp(q_off, y_cdf, y_grid)
-                    # prior_feat_ys: sample points for ROI Gather (Top-to-Bottom: 0 -> 1)
-                    # prior_ys: physical y-coordinates for regression/IoU (Bottom-to-Top: 1 -> 0)
-                    # This matches self.offsets_ys = np.linspace(self.img_h, 0, self.num_points) in generate_lane_line_openlane.py
-                    # which maps index 0 to img_h (Bottom) and index n_offsets-1 to 0 (Top).
-                    # Normalized: index 0 -> 1.0 (Bottom), index n_offsets-1 -> 0.0 (Top).
                     self.register_buffer(
                         name="prior_feat_ys",
                         tensor=torch.from_numpy(y_feat).float(),
@@ -245,7 +257,8 @@ class LLANetHead(nn.Module):
                     self.logger.info("Registered start X PDF buffers.")
             except Exception as e:
                 self.logger.warning(f"Init buffers from PDF failed: {e}")
-        if not use_pdf:
+
+        if not use_external and not use_pdf:
             self.register_buffer(
                 name="prior_feat_ys",
                 tensor=torch.flip(
@@ -358,12 +371,23 @@ class LLANetHead(nn.Module):
             )
 
     def _init_prior_embeddings(self):
-        # Force default initialization to match CLRNet
-        # self.stats_data check removed to ensure parity with CLRNet's heuristic initialization
-        self.logger.info(
-            "Using default prior embeddings initialization (CLRNet style)."
-        )
-        self._init_prior_embeddings_default()
+        # Use statistics for prior embeddings initialization if available
+        if self.stats_data is not None and "cluster_centers" in self.stats_data:
+            self.logger.info("Using statistics for prior embeddings initialization.")
+            self.prior_embeddings = nn.Embedding(self.num_priors, 3)
+            cluster_centers = self.stats_data["cluster_centers"]
+            init_prior_embeddings_with_stats(
+                self.prior_embeddings,
+                cluster_centers,
+                self.stats_data,
+                img_w=self.img_w,
+                img_h=self.img_h,
+            )
+        else:
+            self.logger.info(
+                "Using default prior embeddings initialization (CLRNet style)."
+            )
+            self._init_prior_embeddings_default()
 
     def generate_priors_from_embeddings(self):
         device = self.prior_embeddings.weight.device
@@ -417,12 +441,7 @@ class LLANetHead(nn.Module):
         device = batch_features[-1].device
 
         if self.training:
-            if self.prior_embeddings.weight.device != device:
-                self.prior_embeddings = self.prior_embeddings.to(device)
             self.priors, self.priors_on_featmap = self.generate_priors_from_embeddings()
-        if self.priors.device != device:
-            self.priors = self.priors.to(device)
-            self.priors_on_featmap = self.priors_on_featmap.to(device)
 
         priors = self.priors.expand(batch_size, -1, -1)
         priors_on_featmap = self.priors_on_featmap.expand(batch_size, -1, -1)

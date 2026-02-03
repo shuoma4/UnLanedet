@@ -47,7 +47,7 @@ cls_loss_weight = 2.0
 xyt_loss_weight = 0.2
 seg_loss_weight = 1.0
 category_loss_weight = 1.0
-attribute_loss_weight = 0.5
+attribute_loss_weight = 2.0
 
 # dynamic assignment weights (Geometry-Aware)
 assign_method_name = "CLRNet"  # Ooptions : GeometryAware or CLRNet
@@ -57,14 +57,86 @@ w_iou = 2.0
 
 # 预热参数设置
 start_w_cls = 0.5
-start_cls_loss_weight = 0.001
-start_category_loss_weight = 0.001
-start_attribute_loss_weight = 0.001
-warmup_epochs = 5
+start_category_loss_weight = 1e-6
+start_attribute_loss_weight = 1e-6
+warmup_epochs = 15
 
 num_points = 72  # 采样点
 max_lanes = 24  # 最大车道数
-sample_y = range(589, 230, -20)  # 采样y坐标
+sample_y = [
+    319.6830,
+    299.5512,
+    288.5065,
+    279.2727,
+    271.4870,
+    264.8033,
+    258.4423,
+    252.3457,
+    246.7409,
+    241.5483,
+    236.7402,
+    232.2556,
+    228.0149,
+    223.9565,
+    220.0715,
+    216.3945,
+    212.8578,
+    209.5068,
+    206.2328,
+    203.1490,
+    200.2306,
+    197.4218,
+    194.7998,
+    192.2586,
+    189.8559,
+    187.5989,
+    185.4789,
+    183.3751,
+    181.3846,
+    179.4417,
+    177.5906,
+    175.8278,
+    174.0870,
+    172.4608,
+    170.8910,
+    169.3960,
+    167.9545,
+    166.5370,
+    165.1603,
+    163.7978,
+    162.4912,
+    161.2275,
+    160.0119,
+    158.8347,
+    157.7052,
+    156.5931,
+    155.5149,
+    154.4476,
+    153.4098,
+    152.3994,
+    151.4078,
+    150.4291,
+    149.4424,
+    148.4789,
+    147.4794,
+    146.4789,
+    145.4863,
+    144.4530,
+    143.4194,
+    142.3374,
+    141.2352,
+    140.1034,
+    138.9282,
+    137.7363,
+    136.4494,
+    135.0610,
+    133.4988,
+    131.7550,
+    129.3719,
+    126.0014,
+    120.2298,
+    19.4064,
+]  # 采样y坐标
 num_priors = 96  # 车道线候选框数目
 num_lane_categories = 15  # 车道线类别数目
 num_lr_attributes = 4  # 车道线左右属性数目
@@ -83,7 +155,7 @@ bg_weight = 0.4
 featuremap_out_channel = 64
 num_classes = 4 + 1
 data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/"  # openlane 数据集根目录
-lane_anno_dir = "lane3d_300/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
+lane_anno_dir = "lane3d_1000/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
 opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
 dataset_statistics = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"
 
@@ -111,7 +183,6 @@ param_config.w_cls = w_cls
 param_config.w_geom = w_geom
 param_config.w_iou = w_iou
 param_config.start_w_cls = start_w_cls
-param_config.start_cls_loss_weight = start_cls_loss_weight
 param_config.start_category_loss_weight = start_category_loss_weight
 param_config.start_attribute_loss_weight = start_attribute_loss_weight
 param_config.warmup_epochs = warmup_epochs
@@ -138,14 +209,14 @@ param_config.num_priors = num_priors
 # Training Config
 train = get_config("config/common/train.py").train
 epochs = 30
-train_samples = 45903  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
+train_samples = 142226  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
 batch_size = dynamic_total_batch_size
 epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
-train.eval_period = epoch_per_iter * 16
-train.output_dir = "./output/llanet/mobilenetv4_small_gsafpn_openlane/"
+train.eval_period = epoch_per_iter * 100  # 暂时不评估
+train.output_dir = "./output/llanet/mobilenetv4_openlane/"
 
 # Model Config
 param_config.featuremap_out_channel = 64  # neck 层输出通道数目
@@ -253,11 +324,11 @@ dataloader.test.total_batch_size = int(dynamic_total_batch_size / 2)
 dataloader.test.num_workers = safe_workers_per_gpu
 
 param_config.parse_evaluate_result_script = "tools/read_open2d_csv_results.py"
-param_config.generate_visualization = True  # 开启可视化
+param_config.generate_visualization = False  # 开启可视化
 dataloader.evaluator = L(OpenLaneEvaluator)(
     cfg=param_config,
     evaluate_bin_path="/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate",
-    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/mobilenetv4_small_gsafpn_openlane/eval_results/",
+    output_dir=f"{train.output_dir}/eval_results/",
     iou_threshold=0.5,
     width=30,
     metric="OpenLane/F1",
