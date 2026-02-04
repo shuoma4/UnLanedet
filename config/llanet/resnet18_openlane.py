@@ -37,8 +37,8 @@ from unlanedet.model.LLANet.llanet_head import LLANetHead
 from unlanedet.model.LLANet.gsa_fpn import GSAFPN
 from unlanedet.model.LLANet.llanet import LLANet
 from unlanedet.data.transform import *
-from unlanedet.data.transform.generate_lane_line_openlane import (
-    GenerateLaneLineOpenLane,
+from unlanedet.data.transform.res_lane_encoder import (
+    ResLaneEncoder,
 )
 from fvcore.common.param_scheduler import (
     CosineParamScheduler,
@@ -187,9 +187,7 @@ train_transforms = [
 ]
 
 train_process = [
-    L(GenerateLaneLineOpenLane)(
-        transforms=train_transforms, cfg=param_config, training=True
-    ),
+    L(ResLaneEncoder)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
         keys=["img", "lane_line", "seg"],
         collect_keys=["lane_categories", "lane_attributes"],
@@ -197,7 +195,7 @@ train_process = [
 ]
 
 val_process = [
-    L(GenerateLaneLineOpenLane)(
+    L(ResLaneEncoder)(
         transforms=[
             dict(
                 name="Resize",

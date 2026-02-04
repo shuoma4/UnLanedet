@@ -1,6 +1,9 @@
 import os
 import sys
 
+from unlanedet import config
+from unlanedet.model.LLANet import prior
+
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -29,8 +32,8 @@ from ..modelzoo import get_config
 from omegaconf import OmegaConf
 from unlanedet.config import LazyCall as L
 from unlanedet.data.transform import *
-from unlanedet.data.transform.generate_lane_line_openlane import (
-    GenerateLaneLineOpenLane,
+from unlanedet.data.transform.res_lane_encoder import (
+    ResLaneEncoder,
 )
 from fvcore.common.param_scheduler import (
     CosineParamScheduler,
@@ -41,6 +44,7 @@ from ..modelzoo import get_config
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
 from .model_factory import create_llanet_model
 from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
+from config.llanet.priors import SAMPLE_YS_EQUIDISTANT
 
 iou_loss_weight = 2.0
 cls_loss_weight = 2.0
@@ -61,87 +65,13 @@ start_category_loss_weight = 1e-6
 start_attribute_loss_weight = 1e-6
 warmup_epochs = 15
 
-num_points = 72  # 采样点
+sample_y = SAMPLE_YS_EQUIDISTANT
+num_points = int(len(sample_y))  # 偏移采样点
 max_lanes = 24  # 最大车道数
-sample_y = [
-    319.6830,
-    299.5512,
-    288.5065,
-    279.2727,
-    271.4870,
-    264.8033,
-    258.4423,
-    252.3457,
-    246.7409,
-    241.5483,
-    236.7402,
-    232.2556,
-    228.0149,
-    223.9565,
-    220.0715,
-    216.3945,
-    212.8578,
-    209.5068,
-    206.2328,
-    203.1490,
-    200.2306,
-    197.4218,
-    194.7998,
-    192.2586,
-    189.8559,
-    187.5989,
-    185.4789,
-    183.3751,
-    181.3846,
-    179.4417,
-    177.5906,
-    175.8278,
-    174.0870,
-    172.4608,
-    170.8910,
-    169.3960,
-    167.9545,
-    166.5370,
-    165.1603,
-    163.7978,
-    162.4912,
-    161.2275,
-    160.0119,
-    158.8347,
-    157.7052,
-    156.5931,
-    155.5149,
-    154.4476,
-    153.4098,
-    152.3994,
-    151.4078,
-    150.4291,
-    149.4424,
-    148.4789,
-    147.4794,
-    146.4789,
-    145.4863,
-    144.4530,
-    143.4194,
-    142.3374,
-    141.2352,
-    140.1034,
-    138.9282,
-    137.7363,
-    136.4494,
-    135.0610,
-    133.4988,
-    131.7550,
-    129.3719,
-    126.0014,
-    120.2298,
-    19.4064,
-]  # 采样y坐标
 num_priors = 96  # 车道线候选框数目
 num_lane_categories = 15  # 车道线类别数目
 num_lr_attributes = 4  # 车道线左右属性数目
-
-test_parameters = dict(conf_threshold=0.2, nms_thres=0.5, nms_topk=max_lanes)
+test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
 
 ori_img_w = 1920
 ori_img_h = 1280
@@ -155,7 +85,7 @@ bg_weight = 0.4
 featuremap_out_channel = 64
 num_classes = 4 + 1
 data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/"  # openlane 数据集根目录
-lane_anno_dir = "lane3d_1000/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
+lane_anno_dir = "lane3d_300/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
 opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
 dataset_statistics = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"
 
@@ -188,7 +118,6 @@ param_config.start_attribute_loss_weight = start_attribute_loss_weight
 param_config.warmup_epochs = warmup_epochs
 param_config.num_points = num_points
 param_config.max_lanes = max_lanes
-# param_config.sample_y = [i for i in range(589, 230, -20)]
 param_config.test_parameters = test_parameters
 param_config.ori_img_w = ori_img_w
 param_config.ori_img_h = ori_img_h
@@ -209,7 +138,7 @@ param_config.num_priors = num_priors
 # Training Config
 train = get_config("config/common/train.py").train
 epochs = 30
-train_samples = 142226  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
+train_samples = 45903  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
 batch_size = dynamic_total_batch_size
 epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs
@@ -281,9 +210,7 @@ train_transforms = base_transforms + [
 ]
 
 train_process = [
-    L(GenerateLaneLineOpenLane)(
-        transforms=train_transforms, cfg=param_config, training=True
-    ),
+    L(ResLaneEncoder)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
         keys=["img", "lane_line", "seg"],
         collect_keys=["lane_categories", "lane_attributes"],
@@ -293,7 +220,7 @@ train_process = [
 # 验证时的处理
 val_transforms = base_transforms
 val_process = [
-    L(GenerateLaneLineOpenLane)(
+    L(ResLaneEncoder)(
         transforms=val_transforms,
         training=False,
         cfg=param_config,

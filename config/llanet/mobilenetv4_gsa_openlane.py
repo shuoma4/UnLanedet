@@ -29,8 +29,8 @@ from ..modelzoo import get_config
 from omegaconf import OmegaConf
 from unlanedet.config import LazyCall as L
 from unlanedet.data.transform import *
-from unlanedet.data.transform.generate_lane_line_openlane import (
-    GenerateLaneLineOpenLane,
+from unlanedet.data.transform.res_lane_encoder import (
+    ResLaneEncoder,
 )
 from fvcore.common.param_scheduler import (
     CosineParamScheduler,
@@ -61,86 +61,14 @@ start_category_loss_weight = 1e-6
 start_attribute_loss_weight = 1e-6
 warmup_epochs = 15
 
-num_points = 72  # 采样点
+num_points = int(len(SAMPLE_YS_IOSDENSITY))  # 采样点
 max_lanes = 24  # 最大车道数
-sample_y = [
-    319.6830,
-    299.5512,
-    288.5065,
-    279.2727,
-    271.4870,
-    264.8033,
-    258.4423,
-    252.3457,
-    246.7409,
-    241.5483,
-    236.7402,
-    232.2556,
-    228.0149,
-    223.9565,
-    220.0715,
-    216.3945,
-    212.8578,
-    209.5068,
-    206.2328,
-    203.1490,
-    200.2306,
-    197.4218,
-    194.7998,
-    192.2586,
-    189.8559,
-    187.5989,
-    185.4789,
-    183.3751,
-    181.3846,
-    179.4417,
-    177.5906,
-    175.8278,
-    174.0870,
-    172.4608,
-    170.8910,
-    169.3960,
-    167.9545,
-    166.5370,
-    165.1603,
-    163.7978,
-    162.4912,
-    161.2275,
-    160.0119,
-    158.8347,
-    157.7052,
-    156.5931,
-    155.5149,
-    154.4476,
-    153.4098,
-    152.3994,
-    151.4078,
-    150.4291,
-    149.4424,
-    148.4789,
-    147.4794,
-    146.4789,
-    145.4863,
-    144.4530,
-    143.4194,
-    142.3374,
-    141.2352,
-    140.1034,
-    138.9282,
-    137.7363,
-    136.4494,
-    135.0610,
-    133.4988,
-    131.7550,
-    129.3719,
-    126.0014,
-    120.2298,
-    19.4064,
-]  # 采样y坐标
 num_priors = 96  # 车道线候选框数目
 num_lane_categories = 15  # 车道线类别数目
 num_lr_attributes = 4  # 车道线左右属性数目
+from .priors import SAMPLE_YS_IOSDENSITY
 
+sample_y = SAMPLE_YS_IOSDENSITY
 test_parameters = dict(conf_threshold=0.2, nms_thres=0.5, nms_topk=max_lanes)
 
 ori_img_w = 1920
@@ -282,9 +210,7 @@ train_transforms = base_transforms + [
 ]
 
 train_process = [
-    L(GenerateLaneLineOpenLane)(
-        transforms=train_transforms, cfg=param_config, training=True
-    ),
+    L(ResLaneEncoder)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
         keys=["img", "lane_line", "seg"],
         collect_keys=["lane_categories", "lane_attributes"],
@@ -294,7 +220,7 @@ train_process = [
 # 验证时的处理
 val_transforms = base_transforms
 val_process = [
-    L(GenerateLaneLineOpenLane)(
+    L(ResLaneEncoder)(
         transforms=val_transforms,
         training=False,
         cfg=param_config,

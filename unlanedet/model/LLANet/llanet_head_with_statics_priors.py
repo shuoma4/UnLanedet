@@ -34,7 +34,7 @@ class LLANetHeadWithStaticsPriors(nn.Module):
         sample_points=36,
         cfg=None,
     ):
-        super(LLANetHead, self).__init__()
+        super(LLANetHeadWithStaticsPriors, self).__init__()
         if cfg is None:
             raise ValueError("cfg must be provided")
         self.cfg = cfg
@@ -158,12 +158,12 @@ class LLANetHeadWithStaticsPriors(nn.Module):
         self.init_weights()
 
     def __init_detailed_logger(self):
-        self.detailed_loss_logger = cfg.get("detailed_loss_logger", None)
+        self.detailed_loss_logger = self.cfg.get("detailed_loss_logger", None)
         if (
             self.detailed_loss_logger is None
-            and cfg.get("detailed_loss_logger_config") is not None
+            and self.cfg.get("detailed_loss_logger_config") is not None
         ):
-            conf = cfg.get("detailed_loss_logger_config")
+            conf = self.cfg.get("detailed_loss_logger_config")
             self.detailed_loss_logger = DetailedLossLogger(
                 output_dir=conf.output_dir, filename=conf.filename
             )

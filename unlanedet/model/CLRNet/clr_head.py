@@ -1,5 +1,4 @@
 import math
-import logging
 
 import cv2
 import torch
@@ -70,11 +69,6 @@ class CLRHead(nn.Module):
 
         # generate xys for feature map
         self.seg_decoder = PlainDecoder(cfg)
-        self.seg_conv = Conv2d(
-            prior_feat_channels * refine_layers,
-            cfg.featuremap_out_channel,
-            kernel_size=1,
-        )
 
         reg_modules = list()
         cls_modules = list()
@@ -105,8 +99,6 @@ class CLRHead(nn.Module):
 
         # init the weights here
         self.init_weights()
-        self.print_step = 0
-        self.logger = logging.getLogger("unlanedet")
 
     # function to init layer weights
     def init_weights(self):
@@ -267,21 +259,6 @@ class CLRHead(nn.Module):
             )  # (B, num_priors, 2)
             reg = reg.reshape(batch_size, -1, reg.shape[1])
 
-            # DEBUG: Log Reg Mean
-            if (
-                self.training
-                and stage == self.refine_layers - 1
-                and torch.distributed.is_initialized()
-                and torch.distributed.get_rank() == 0
-            ):
-                # Reduce frequency if needed, but for now every iter is fine or use a counter
-                # We don't have current_iter here easily without passing it.
-                # But we can just print occasionally or always?
-                # Printing always might spam.
-                # Let's try to access iteration if possible, or just print.
-                # Or use a static counter.
-                pass
-
             predictions = priors.clone()
             predictions[:, :, :2] = cls_logits
 
@@ -327,16 +304,6 @@ class CLRHead(nn.Module):
                 ],
                 dim=1,
             )
-            seg_features = self.seg_conv(seg_features)
-            # DEBUG: Check shapes
-            if self.print_step % 100 == 0 and torch.distributed.get_rank() == 0:
-                self.logger.info(
-                    f"DEBUG: seg_features shape after conv: {seg_features.shape}"
-                )
-                self.logger.info(
-                    f"DEBUG: cfg.featuremap_out_channel: {self.cfg.featuremap_out_channel}"
-                )
-
             seg = self.seg_decoder(seg_features)
             output = {"predictions_lists": predictions_lists}
             output.update(**seg)
@@ -368,7 +335,7 @@ class CLRHead(nn.Module):
                     .cpu()
                     .numpy()[::-1]
                     .cumprod()[::-1]
-                ).astype(bool)
+                ).astype(np.bool)
             )
             lane_xs[end + 1 :] = -2
             lane_xs[:start][mask] = -2
@@ -417,10 +384,6 @@ class CLRHead(nn.Module):
         cls_loss = torch.tensor(0.0).to(self.priors.device)
         reg_xytl_loss = torch.tensor(0.0).to(self.priors.device)
         iou_loss = torch.tensor(0.0).to(self.priors.device)
-
-        # Stats collection
-        all_reg_preds = []
-        all_reg_targets = []
 
         for stage in range(self.refine_layers):
             predictions_list = predictions_lists[stage]
@@ -481,46 +444,6 @@ class CLRHead(nn.Module):
 
                 target_yxtl[:, 0] *= self.n_strips
                 target_yxtl[:, 2] *= 180
-
-                # DEBUG: Log Reg Mean
-                if (
-                    stage == self.refine_layers - 1
-                    and self.print_step % 100 == 0
-                    and (
-                        not torch.distributed.is_initialized()
-                        or torch.distributed.get_rank() == 0
-                    )
-                ):
-                    with torch.no_grad():
-                        self.logger.info(f"CLRNet Iter {self.print_step} Stats:")
-                        self.logger.info(
-                            f"  Reg Y: Pred Mean={reg_yxtl[:,0].mean():.2f}, Tgt Mean={target_yxtl[:,0].mean():.2f}"
-                        )
-                        self.logger.info(
-                            f"  Reg X: Pred Mean={reg_yxtl[:,1].mean():.2f}, Tgt Mean={target_yxtl[:,1].mean():.2f}"
-                        )
-                        self.logger.info(
-                            f"  Reg Theta: Pred Mean={reg_yxtl[:,2].mean():.2f}, Tgt Mean={target_yxtl[:,2].mean():.2f}"
-                        )
-                        self.logger.info(
-                            f"  Reg Len: Pred Mean={reg_yxtl[:,3].mean():.2f}, Tgt Mean={target_yxtl[:,3].mean():.2f}"
-                        )
-                        l_y = F.smooth_l1_loss(
-                            reg_yxtl[:, 0], target_yxtl[:, 0], reduction="none"
-                        ).mean()
-                        l_x = F.smooth_l1_loss(
-                            reg_yxtl[:, 1], target_yxtl[:, 1], reduction="none"
-                        ).mean()
-                        l_t = F.smooth_l1_loss(
-                            reg_yxtl[:, 2], target_yxtl[:, 2], reduction="none"
-                        ).mean()
-                        l_l = F.smooth_l1_loss(
-                            reg_yxtl[:, 3], target_yxtl[:, 3], reduction="none"
-                        ).mean()
-                        self.logger.info(
-                            f"  Loss Comp: Y={l_y:.4f}, X={l_x:.4f}, Theta={l_t:.4f}, Len={l_l:.4f}"
-                        )
-
                 reg_xytl_loss = (
                     reg_xytl_loss
                     + F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction="none").mean()
@@ -531,24 +454,16 @@ class CLRHead(nn.Module):
                 )
 
         # extra segmentation loss
-        seg_pred = F.log_softmax(output["seg"], dim=1)
-        seg_target = batch["seg"].long()
-        # Resize seg_pred to match seg_target if needed
-        if seg_pred.shape[-2:] != seg_target.shape[-2:]:
-            seg_pred = F.interpolate(
-                seg_pred,
-                size=seg_target.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        seg_loss = self.criterion(seg_pred, seg_target)
-
-        # Increment print step
-        self.print_step += 1
+        seg_loss = self.criterion(
+            F.log_softmax(output["seg"], dim=1), batch["seg"].long()
+        )
 
         cls_loss /= len(targets) * self.refine_layers
         reg_xytl_loss /= len(targets) * self.refine_layers
         iou_loss /= len(targets) * self.refine_layers
+
+        # loss = cls_loss * cls_loss_weight + reg_xytl_loss * xyt_loss_weight \
+        #     + seg_loss * seg_loss_weight + iou_loss * iou_loss_weight
 
         return_value = {
             "cls_loss": cls_loss * cls_loss_weight,

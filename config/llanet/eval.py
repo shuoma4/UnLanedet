@@ -29,8 +29,8 @@ from ..modelzoo import get_config
 from omegaconf import OmegaConf
 from unlanedet.config import LazyCall as L
 from unlanedet.data.transform import *
-from unlanedet.data.transform.generate_lane_line_openlane import (
-    GenerateLaneLineOpenLane,
+from unlanedet.data.transform.res_lane_encoder import (
+    ResLaneEncoder,
 )
 from fvcore.common.param_scheduler import (
     CosineParamScheduler,
@@ -208,9 +208,7 @@ train_transforms = base_transforms + [
 ]
 
 train_process = [
-    L(GenerateLaneLineOpenLane)(
-        transforms=train_transforms, cfg=param_config, training=True
-    ),
+    L(ResLaneEncoder)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
         keys=["img", "lane_line", "seg"],
         collect_keys=["lane_categories", "lane_attributes"],
@@ -220,7 +218,7 @@ train_process = [
 # 验证时的处理
 val_transforms = base_transforms
 val_process = [
-    L(GenerateLaneLineOpenLane)(
+    L(ResLaneEncoder)(
         transforms=val_transforms,
         training=False,
         cfg=param_config,

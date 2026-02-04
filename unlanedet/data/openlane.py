@@ -7,6 +7,7 @@ import pickle
 from tqdm import tqdm
 from .base_dataset import BaseDataset
 import logging
+from .transform import generate_lane_mask
 
 # OpenLane 官方类别映射
 LANE_CATEGORIES = {
@@ -45,10 +46,48 @@ VALID_LANE_CATEGORIES = {
     21: 14,
 }
 
+LANE_ATTRIBUTES = {
+    0: "unknown",  # 未知
+    1: "left-left",  # 左侧
+    2: "left",  # 右侧
+    3: "right-right",  # 右侧
+    4: "right",  # 左侧
+}
+
 
 class OpenLane(BaseDataset):
     """
-    完整的OpenLane数据集类，修复了维度不匹配的错误
+    OpenLane数据集类
+    func: load openlane dataset, generate anno pkl cache file to speed up loading and training
+    input:
+        data_root: root directory of the dataset
+        split: dataset split, e.g. train, val, test
+        cut_height: height to cut the image from bottom, default is 300
+        img_w: width of the image after height cut and resized, default is 800
+        img_h: height of the image after height cut and resized, default is 320
+        max_lanes: maximum number of lanes to keep, default is 24
+        enable_3d: whether to enable 3d lane points, default is True
+        use_preprocessed: whether to use preprocessed images, default is False
+
+
+    getitem return to a dict:
+        {
+            "img": after height cut and resized image
+            "img_path": full path of the image(after height cut and resized when use preprocess, otherwise original image path)
+            "origin_img_path": original image path
+            "lane_lines": 2d lane points (N, 2), also after height cut and resized, sorted by y (from bottom of the image to top)
+            "mask": lane seg mask (H, W), dtype=uint8
+            "lane_vis": visibility of each lane point (N,), 1 means visible, 0 means invisible
+            "lane_categories": lane category of each lane point (N,), mapped from VALID_LANE_CATEGORIES
+            "lane_attributes": lane attributes of each lane point (N,), mapped from LANE_ATTRIBUTES
+            "lane_track_ids": track id of each lane point (N,), -1 means no track id
+            "intrinsic": camera intrinsic matrix (3, 3)
+            "extrinsic": camera extrinsic matrix (4, 4)
+            "pose": camera pose matrix (4, 4)
+            "lanes_3d": 3d lane points (N, 3), also after height cut and resized, sorted by y (from bottom of the image to top)
+            "segment_name": segment name of the lane point (N,)
+        }
+
     """
 
     def __init__(self, data_root, split, cut_height, processes=None, cfg=None):
@@ -60,7 +99,6 @@ class OpenLane(BaseDataset):
         self.img_h = self.cfg.get("img_h", 320)
         self.max_lanes = self.cfg.get("max_lanes", 24)
         self.enable_3d = self.cfg.get("enable_3d", True)
-        self.enable_attributes = self.cfg.get("enable_attributes", True)
         # 图像尺寸
         self.ori_w, self.ori_h = 1920, 1280
         self.cut_height = cut_height
@@ -177,7 +215,9 @@ class OpenLane(BaseDataset):
                 # 构建样本
                 sample = {
                     "img_path": img_path,  # 用于训练的图片完整路径(无论是否经过预处理)
-                    "img_name": rel_file_path,  # 原图路径(相对于data_root)
+                    "origin_img_path": osp.join(
+                        self.data_root, rel_file_path
+                    ),  # 原图路径(相对于data_root)
                     "lanes": lanes,  # 2D车道线坐标
                     "lanes_3d": lanes_3d,  # 3D车道线坐标
                     "lane_vis": visibilities,  # 可见性信息
@@ -263,7 +303,6 @@ class OpenLane(BaseDataset):
         return points[sort_idx], vis_valid[sort_idx]
 
     def process_3d_points(self, x_coords, y_coords, z_coords, v_coords_2d):
-        """处理3D车道线点坐标 - 修复维度不匹配错误"""
         # 确保所有数组长度一致
         min_len = min(len(x_coords), len(y_coords), len(z_coords), len(v_coords_2d))
         if min_len == 0:
@@ -280,7 +319,7 @@ class OpenLane(BaseDataset):
             return np.zeros((0, 3), dtype=np.float32)
         points_3d = np.stack([x_valid, y_valid, z_valid], axis=1)
         # 按y坐标排序（与2D保持一致）
-        sort_idx = points_3d[:, 1].argsort()
+        sort_idx = points_3d[:, 1].argsort()[::-1]
         return points_3d[sort_idx]
 
     def __getitem__(self, idx):
@@ -305,17 +344,19 @@ class OpenLane(BaseDataset):
             img.shape[0] != self.img_h or img.shape[1] != self.img_w
         ):
             img = cv2.resize(img, (self.img_w, self.img_h))
-
+        # 生成分割掩码
+        mask = generate_lane_mask(img, data_info["lanes"], data_info["lane_categories"])
         # 构建样本
         sample = {
             "img": img,
             "lanes": data_info["lanes"],  # 2D车道线坐标
+            "mask": mask,  # 车道线分割掩码
             "lane_vis": data_info["lane_vis"],  # 可见性信息
             "lane_categories": data_info["lane_categories"],  # 车道线类别
             "lane_attributes": data_info["lane_attributes"],  # 车道线属性
             "lane_track_ids": data_info["lane_track_ids"],  # 时序tracking ID
             "img_path": data_info["img_path"],  # 图片完整路径(无论是否经过预处理)
-            "img_name": data_info["img_name"],  # 原图路径(相对于data_root)
+            "origin_img_path": data_info["origin_img_path"],
             "intrinsic": data_info["intrinsic"],  # 相机内参
             "extrinsic": data_info["extrinsic"],  # 相机外参
             "pose": data_info["pose"],  # 相机位姿
@@ -324,7 +365,7 @@ class OpenLane(BaseDataset):
         if self.enable_3d and "lanes_3d" in data_info:
             sample["lanes_3d"] = data_info["lanes_3d"]
         # 添加segment信息（时序部分有用）
-        img_name = data_info["img_name"]
+        img_name = data_info["origin_img_path"]
         parts = img_name.split("/")
         if len(parts) >= 2:
             sample["segment_name"] = parts[1]

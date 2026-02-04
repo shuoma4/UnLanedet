@@ -256,80 +256,48 @@ class CLRNetAssign(nn.Module):
                 torch.zeros((batch_size, num_priors), device=device, dtype=torch.long),
             )
 
-        # 准备输出容器
         matched_targets_matrix = torch.full(
             (batch_size, num_priors), -1, dtype=torch.long, device=device
         )
-
-        # 预处理：转回绝对坐标
         preds_abs = preds.clone()
-        preds_abs[..., 3] *= img_w - 1  # Start X
-        preds_abs[..., 6:] *= img_w - 1  # Lane Points
-
+        preds_abs[..., 3] *= img_w - 1
+        preds_abs[..., 6:] *= img_w - 1
         targets_abs = targets.clone()
-        targets_abs[..., 3] *= (
-            img_w - 1
-        )  # Target Start X is already normalized in generate_lane_line_openlane.py!
+        targets_abs[..., 3] *= img_w - 1
         targets_abs[..., 6:] *= img_w - 1
-
-        # --- Vectorized Cost Calculation ---
-
-        # 1. Distance Cost (Lane Points)
-        # Target validity mask: [B, M, 72]
         target_valid_mask = (targets_abs[..., 6:] >= 0) & (targets_abs[..., 6:] < img_w)
-
-        # Combined mask for distance: [B, 1, M, 72]
         combined_mask = target_valid_mask.unsqueeze(1)
         combined_len = combined_mask.sum(dim=3).float().clamp(min=1.0)  # [B, 1, M]
-
-        # Diff: [B, N, 1, 72] - [B, 1, M, 72] -> [B, N, M, 72]
         diff = torch.abs(
             preds_abs[..., 6:].unsqueeze(2) - targets_abs[..., 6:].unsqueeze(1)
         )
         diff = diff * combined_mask
         distances = diff.sum(dim=3) / combined_len  # [B, N, M]
-
-        # Max normalization per sample
         dist_max = distances.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
         distances_score = 1 - (distances / dist_max) + 1e-2
-
-        # 2. Start XY Cost
         cur_pred_start = preds_abs[..., 2:4].clone()
         cur_pred_start[..., 0] *= img_h - 1
-
         cur_target_start = targets_abs[..., 2:4].clone()
         cur_target_start[..., 0] *= img_h - 1
-
-        # cdist: [B, N, M]
         start_dists = torch.cdist(cur_pred_start, cur_target_start, p=2)
         start_max = start_dists.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
         start_xys_score = 1 - (start_dists / start_max) + 1e-2
-
-        # 3. Theta Cost
         cur_pred_theta = preds_abs[..., 4].unsqueeze(2)  # [B, N, 1]
         cur_target_theta = targets_abs[..., 4].unsqueeze(1)  # [B, 1, M]
         theta_dists = torch.abs(cur_pred_theta - cur_target_theta) * 180
         theta_max = theta_dists.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
         theta_score = 1 - (theta_dists / theta_max) + 1e-2
-
-        # 4. Classification Cost
         gt_labels = targets_abs[..., 1].long()  # [B, M]
         cls_cost = focal_cost(preds_abs[..., :2], gt_labels)  # [B, N, M]
-
-        # 5. Total Cost
         reg_score = (
             distances_score.clamp(min=1e-3)
             * start_xys_score.clamp(min=1e-3)
             * theta_score.clamp(min=1e-3)
         )
         total_cost = -(reg_score**2) * self.w_reg + cls_cost * 1.0
-
-        # Mask invalid targets
         valid_targets_mask = masks.unsqueeze(1).expand(-1, num_priors, -1).bool()
         total_cost[~valid_targets_mask] = 1e8  # Assign high cost to invalid targets
 
-        # 6. SimOTA (Dynamic K)
-        # line_iou supports batch now: [B, N, M]
         l_iou = line_iou(
             preds_abs[..., 6:],
             targets_abs[..., 6:],
@@ -343,59 +311,30 @@ class CLRNetAssign(nn.Module):
         n_candidate_k = min(4, num_priors)
         topk_ious, _ = torch.topk(l_iou, n_candidate_k, dim=1)  # [B, K, M]
         dynamic_ks = torch.clamp(topk_ious.sum(1).int(), min=1)  # [B, M]
-        # Set k=0 for invalid targets to avoid matching them
         dynamic_ks[~masks.bool()] = 0
-
-        # Vectorized SimOTA Matching
-        # Avoid synchronization: max_k is bounded by n_candidate_k
         max_k = n_candidate_k
 
         if max_k > 0:
-            # 1. Select Top-K priors for each target based on cost
-            # total_cost: [B, N, M] -> TopK over N -> [B, max_k, M]
             _, topk_indices = torch.topk(total_cost, k=max_k, dim=1, largest=False)
-
-            # 2. Create selection mask based on dynamic_ks
-            # grid: [1, max_k, 1]
             grid = torch.arange(max_k, device=device).view(1, -1, 1)
-            # selection_mask: [B, max_k, M]
             selection_mask = grid < dynamic_ks.unsqueeze(1)
-
-            # 3. Construct matching matrix [B, N, M]
             matching_matrix = torch.zeros(
                 (batch_size, num_priors, num_targets), device=device
             )
-            # Scatter 1.0 at topk_indices where mask is True
             matching_matrix.scatter_(1, topk_indices, selection_mask.float())
-
-            # 4. Conflict Resolution (Multiple targets matched to same prior)
             matched_counts = matching_matrix.sum(dim=2)  # [B, N]
             conflict_mask = matched_counts > 1  # [B, N]
-
             if conflict_mask.any():
-                # Find best target among matched ones for conflicted priors
                 masked_cost = total_cost.clone()
                 masked_cost[matching_matrix == 0] = float("inf")
-
-                # argmin over targets
                 best_target_idx = masked_cost.argmin(dim=2)  # [B, N]
-
-                # Create one-hot for the winner
                 new_matches = F.one_hot(
                     best_target_idx, num_classes=num_targets
                 ).float()
-
-                # Update conflicts
                 matching_matrix[conflict_mask] = new_matches[conflict_mask]
-
-            # 5. Convert to output format
-            # has_match: [B, N]
             has_match = matching_matrix.sum(dim=2) > 0.5
-            # target_indices: [B, N]
             target_indices = matching_matrix.argmax(dim=2)
-
             matched_targets_matrix[has_match] = target_indices[has_match]
-
         assigned_mask = matched_targets_matrix >= 0
         return assigned_mask, matched_targets_matrix
 

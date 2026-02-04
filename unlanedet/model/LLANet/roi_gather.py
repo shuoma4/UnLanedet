@@ -130,64 +130,24 @@ class ROIGather(nn.Module):
             roi: prior features with gathered global information, shape: (Batch, num_priors, fc_hidden_dim)
         """
         roi = self.roi_fea(roi_features, layer_index)
-        if torch.isnan(roi).any():
-            print(f"NaN in roi after roi_fea at layer {layer_index}", flush=True)
-
         bs = x.size(0)
         roi = roi.contiguous().view(bs * self.num_priors, -1)
-
         roi_fc = self.fc(roi)
-        if torch.isnan(roi_fc).any():
-            print(
-                f"NaN in roi after FC (before norm) at layer {layer_index}", flush=True
-            )
-        if torch.isinf(roi_fc).any():
-            print(
-                f"Inf in roi after FC (before norm) at layer {layer_index}", flush=True
-            )
-
         roi = F.relu(self.fc_norm(roi_fc))
-        if torch.isnan(roi).any():
-            print(f"NaN in roi after fc_norm at layer {layer_index}", flush=True)
-
         roi = roi.view(bs, self.num_priors, -1)
         query = roi
-
         value = self.resize(self.f_value(x))
-        if torch.isnan(value).any():
-            print(f"NaN in value at layer {layer_index}", flush=True)
-
         query = self.f_query(query)
-        if torch.isnan(query).any():
-            print(f"NaN in query at layer {layer_index}", flush=True)
-
         key = self.f_key(x)
-        if torch.isnan(key).any():
-            print(f"NaN in key at layer {layer_index}", flush=True)
-
         value = value.permute(0, 2, 1)
         key = self.resize(key)
         sim_map = torch.matmul(query, key)
-        if torch.isnan(sim_map).any():
-            print(f"NaN in sim_map before softmax at layer {layer_index}", flush=True)
-
         sim_map = (self.in_channels**-0.5) * sim_map
         sim_map = F.softmax(sim_map, dim=-1)
-        if torch.isnan(sim_map).any():
-            print(f"NaN in sim_map after softmax at layer {layer_index}", flush=True)
-
         context = torch.matmul(sim_map, value)
-        if torch.isnan(context).any():
-            print(f"NaN in context at layer {layer_index}", flush=True)
-
         context = self.W(context)
-
         roi = roi + F.dropout(context, p=0.1, training=self.training)
-        if torch.isnan(roi).any():
-            print(f"NaN in roi output at layer {layer_index}", flush=True)
-
         return roi
-
 
 def LinearModule(hidden_dim):
     return [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]
