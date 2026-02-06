@@ -48,10 +48,10 @@ VALID_LANE_CATEGORIES = {
 
 LANE_ATTRIBUTES = {
     0: "unknown",  # 未知
-    1: "left-left",  # 左侧
-    2: "left",  # 右侧
-    3: "right-right",  # 右侧
-    4: "right",  # 左侧
+    1: "left-left",  # 左2车道
+    2: "left",  # 左1车道
+    3: "right",  # 右1车道
+    4: "right-right",  # 左2车道
 }
 
 

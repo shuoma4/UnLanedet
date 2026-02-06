@@ -6,6 +6,10 @@ import torch.nn.functional as F
 from ...layers import Conv2d, get_norm
 
 
+def LinearModule(hidden_dim):
+    return nn.ModuleList([nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)])
+
+
 class FeatureResize(nn.Module):
     def __init__(self, size=(10, 25)):
         super(FeatureResize, self).__init__()
@@ -34,7 +38,7 @@ class ROIGather(nn.Module):
         sample_points,
         fc_hidden_dim,
         refine_layers,
-        mid_channels=64,  # 给一个默认值，但通常会被覆盖
+        mid_channels=64,
         norm_type="BN",
     ):
         super(ROIGather, self).__init__()
@@ -132,10 +136,11 @@ class ROIGather(nn.Module):
         roi = self.roi_fea(roi_features, layer_index)
         bs = x.size(0)
         roi = roi.contiguous().view(bs * self.num_priors, -1)
-        roi_fc = self.fc(roi)
-        roi = F.relu(self.fc_norm(roi_fc))
+
+        roi = F.relu(self.fc_norm(self.fc(roi)))
         roi = roi.view(bs, self.num_priors, -1)
         query = roi
+
         value = self.resize(self.f_value(x))
         query = self.f_query(query)
         key = self.f_key(x)
@@ -144,10 +149,10 @@ class ROIGather(nn.Module):
         sim_map = torch.matmul(query, key)
         sim_map = (self.in_channels**-0.5) * sim_map
         sim_map = F.softmax(sim_map, dim=-1)
+
         context = torch.matmul(sim_map, value)
         context = self.W(context)
-        roi = roi + F.dropout(context, p=0.1, training=self.training)
-        return roi
 
-def LinearModule(hidden_dim):
-    return [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]
+        roi = roi + F.dropout(context, p=0.1, training=self.training)
+
+        return roi

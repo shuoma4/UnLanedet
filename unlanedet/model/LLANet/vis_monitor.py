@@ -1,4 +1,5 @@
 import os
+
 import cv2
 import numpy as np
 import torch
@@ -25,7 +26,7 @@ def visualize_training_progress(
     prior_ys,
     enable_category=True,
     enable_attribute=True,
-    save_dir="/data1/lxy_log/workspace/ms/UnLanedet/debug_vis",
+    save_dir='/data1/lxy_log/workspace/ms/UnLanedet/debug_vis',
 ):
     """
     Visualize training progress including ground truth and matched predictions.
@@ -54,19 +55,17 @@ def visualize_training_progress(
         save_dir (str): Directory to save visualization results.
     """
     os.makedirs(save_dir, exist_ok=True)
-    vis_txt_path = os.path.join(save_dir, f"iter_{current_iter}.txt")
+    vis_txt_path = os.path.join(save_dir, f'iter_{current_iter}.txt')
 
     # 1. 图像预处理
     pad = 100
-    device = batch["img"].device
+    device = batch['img'].device
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-    img_tensor = batch["img"][0]
+    img_tensor = batch['img'][0]
     img_tensor = img_tensor * std[0] + mean[0]
-    img_np = (
-        (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    )
+    img_np = (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
     img_vis = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     img_vis = cv2.copyMakeBorder(
         img_vis,
@@ -81,12 +80,8 @@ def visualize_training_progress(
     # 2. 绘制 GT (绿色)
     if len(targets_list) > 0:
         gt_lanes = targets_list[0]
-        gt_cats = (
-            batch_lane_categories[0] if batch_lane_categories is not None else None
-        )
-        gt_attrs = (
-            batch_lane_attributes[0] if batch_lane_attributes is not None else None
-        )
+        gt_cats = batch_lane_categories[0] if batch_lane_categories is not None else None
+        gt_attrs = batch_lane_attributes[0] if batch_lane_attributes is not None else None
 
         for i_gt, lane in enumerate(gt_lanes):
             if lane[1] == 1:
@@ -112,7 +107,7 @@ def visualize_training_progress(
                     gt_a = gt_attrs[i_gt].item() if gt_attrs is not None else -1
                     cv2.putText(
                         img_vis,
-                        f"GT_{i_gt}|C{gt_c}|A{gt_a}",
+                        f'GT_{i_gt}|C{gt_c}|A{gt_a}',
                         (start_pt[0], start_pt[1] + 15),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -122,23 +117,19 @@ def visualize_training_progress(
 
     # 3. 绘制 Matched Preds & 写 Log
     b0_mask = batch_idx == 0
-    with open(vis_txt_path, "w") as f:
-        f.write(f"Iteration {current_iter} - Batch 0 Analysis\n")
-        f.write("=" * 60 + "\n")
+    with open(vis_txt_path, 'w') as f:
+        f.write(f'Iteration {current_iter} - Batch 0 Analysis\n')
+        f.write('=' * 60 + '\n')
 
         if b0_mask.sum() > 0:
             b0_pos_preds = pos_preds[b0_mask]
             b0_priors_idx = prior_idx[b0_mask]
 
             b0_cat_logits = (
-                outputs["category"][0][b0_priors_idx]
-                if (enable_category and "category" in outputs)
-                else None
+                outputs['category'][0][b0_priors_idx] if (enable_category and 'category' in outputs) else None
             )
             b0_attr_logits = (
-                outputs["attribute"][0][b0_priors_idx]
-                if (enable_attribute and "attribute" in outputs)
-                else None
+                outputs['attribute'][0][b0_priors_idx] if (enable_attribute and 'attribute' in outputs) else None
             )
 
             b0_iou = ious[b0_mask]
@@ -154,16 +145,8 @@ def visualize_training_progress(
                 score = lane[1]
                 prob = 1 / (1 + np.exp(-score))
 
-                cat_id = (
-                    torch.argmax(b0_cat_logits[k]).item()
-                    if b0_cat_logits is not None
-                    else -1
-                )
-                attr_id = (
-                    torch.argmax(b0_attr_logits[k]).item()
-                    if b0_attr_logits is not None
-                    else -1
-                )
+                cat_id = torch.argmax(b0_cat_logits[k]).item() if b0_cat_logits is not None else -1
+                attr_id = torch.argmax(b0_attr_logits[k]).item() if b0_attr_logits is not None else -1
 
                 color = (
                     np.random.randint(50, 255),
@@ -185,7 +168,7 @@ def visualize_training_progress(
                     cv2.polylines(img_vis, [np.array(points)], False, color, 2)
                     start_pt = points[0]
                     cv2.circle(img_vis, start_pt, 4, color, -1)
-                    info = f"P{k}|{prob:.2f}|C{cat_id}"
+                    info = f'P{k}|{prob:.2f}|C{cat_id}'
                     cv2.putText(
                         img_vis,
                         info,
@@ -206,17 +189,15 @@ def visualize_training_progress(
                     )
 
                 gt_id_val = b0_tgt_idx[k].item()
+                f.write(f'Pred #{k} (Matched GT_{gt_id_val}) | Conf: {prob:.4f} | Cat: {cat_id} | Attr: {attr_id}\n')
+                f.write(f'  IoU: {b0_iou[k]:.4f}\n')
                 f.write(
-                    f"Pred #{k} (Matched GT_{gt_id_val}) | Conf: {prob:.4f} | Cat: {cat_id} | Attr: {attr_id}\n"
+                    f'  Reg Loss -> Y: {b0_ly[k]:.2f}, X: {b0_lx[k]:.2f}, Theta: {b0_lt[k]:.2f}, Len: {b0_ll[k]:.2f}\n'
                 )
-                f.write(f"  IoU: {b0_iou[k]:.4f}\n")
-                f.write(
-                    f"  Reg Loss -> Y: {b0_ly[k]:.2f}, X: {b0_lx[k]:.2f}, Theta: {b0_lt[k]:.2f}, Len: {b0_ll[k]:.2f}\n"
-                )
-                f.write("-" * 40 + "\n")
+                f.write('-' * 40 + '\n')
         else:
-            f.write("No matched predictions in Batch 0.\n")
+            f.write('No matched predictions in Batch 0.\n')
 
     # 保存图片
-    vis_img_path = os.path.join(save_dir, f"iter_{current_iter}.jpg")
+    vis_img_path = os.path.join(save_dir, f'iter_{current_iter}.jpg')
     cv2.imwrite(vis_img_path, img_vis)

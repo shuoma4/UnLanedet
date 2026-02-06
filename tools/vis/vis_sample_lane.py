@@ -12,34 +12,113 @@ plt.rcParams["font.family"] = "AR PL UMing CN"
 # ============================ 配置参数 ============================
 
 CACHE_PATH = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/openlane_lane3d_1000_train_cuth-270_800x320_cache_v1.pkl"
-OUTPUT_DIR = "./vis/sample_lane/"
+OUTPUT_DIR = "./vis/sample_lane/spline"
 NUM_SAMPLE_POINTS = 192
 IMG_W = 800
 IMG_H = 320
 SHOW_IMAGES = False
 
 # ======== ID 选择模式 ========
-ID_MODE = "list"  # ["hook", "range", "list"]
+ID_MODE = "hook"  # ["hook", "range", "list"]
 
 # ============================ 工具函数 ============================
 
 
-def compute_lane_slope_std(points):
+def compute_lane_curvature_circle(points):
     """
-    计算车道线弯曲程度：使用相邻点斜率 std
+    基于圆拟合的车道线曲率估计
     points: (N,2)
-    return: std of slopes
+    return: scalar curvature (1 / R)
     """
     pts = np.array(points, dtype=np.float32)
-    if len(pts) < 2:
+    if len(pts) < 3:
         return 0.0
 
-    dx = pts[1:, 0] - pts[:-1, 0]
-    dy = pts[1:, 1] - pts[:-1, 1]
-    dx = np.where(np.abs(dx) < 1e-6, 1e-6, dx)  # 避免除零
-    slopes = dy / dx
-    return float(np.std(slopes))
+    x = pts[:, 0]
+    y = pts[:, 1]
 
+    # 构造线性最小二乘：x^2 + y^2 + ax + by + c = 0
+    A = np.stack([x, y, np.ones_like(x)], axis=1)
+    B = -(x**2 + y**2)
+
+    try:
+        a, b, c = np.linalg.lstsq(A, B, rcond=None)[0]
+        R_sq = (a * a + b * b) / 4.0 - c
+        if R_sq <= 1e-6:
+            return 0.0
+        R = np.sqrt(R_sq)
+        return float(1.0 / R)
+    except np.linalg.LinAlgError:
+        return 0.0
+
+
+def compute_lane_curvature_spline(points, num_samples=50):
+    """
+    基于样条插值 + 二阶导的车道线曲率估计（鲁棒版本）
+    points: (N,2)
+    return: scalar curvature (mean curvature)
+    """
+    pts = np.array(points, dtype=np.float32)
+    if len(pts) < 4:
+        return 0.0
+
+    # 按 y 排序
+    order = np.argsort(pts[:, 1])
+    pts = pts[order]
+
+    # 去除重复点 / 极近点
+    filtered = [pts[0]]
+    for i in range(1, len(pts)):
+        if np.linalg.norm(pts[i] - filtered[-1]) > 1e-3:
+            filtered.append(pts[i])
+    pts = np.array(filtered, dtype=np.float32)
+
+    if len(pts) < 4:
+        return 0.0
+
+    x = pts[:, 0]
+    y = pts[:, 1]
+
+    # 弧长参数化
+    diffs = pts[1:] - pts[:-1]
+    seg_lens = np.sqrt((diffs**2).sum(axis=1))
+
+    # 过滤掉 seg_lens = 0 的情况
+    valid = seg_lens > 1e-4
+    if not np.any(valid):
+        return 0.0
+
+    t = np.concatenate([[0.0], np.cumsum(seg_lens)])
+
+    # 强制严格递增（数值兜底）
+    for i in range(1, len(t)):
+        if t[i] <= t[i - 1]:
+            t[i] = t[i - 1] + 1e-4
+
+    if t[-1] < 1e-3:
+        return 0.0
+
+    try:
+        k = min(3, len(t) - 1)
+        fx = InterpolatedUnivariateSpline(t, x, k=k)
+        fy = InterpolatedUnivariateSpline(t, y, k=k)
+
+        ts = np.linspace(0, t[-1], num_samples)
+
+        dx = fx.derivative(1)(ts)
+        dy = fy.derivative(1)(ts)
+        ddx = fx.derivative(2)(ts)
+        ddy = fy.derivative(2)(ts)
+
+        denom = (dx * dx + dy * dy) ** 1.5 + 1e-6
+        curvature = np.abs(dx * ddy - dy * ddx) / denom
+
+        return float(np.mean(curvature))
+
+    except Exception as e:
+        # 兜底：样条失败直接返回 0
+        return 0.0
+ 
 
 def load_dataset_cache(cache_path):
     if not osp.exists(cache_path):
@@ -182,7 +261,7 @@ def visualize_sample_fixed(data_info, idx, num_sample_points, output_dir, img_w,
     print(f"Saved: {output_path}")
 
 
-# ============================ Hook 选择弯曲车道（斜率 std） ============================
+# ============================ Hook 选择弯曲车道（曲率） ============================
 
 
 def analyze_openlane_slope_std_topk(pkl_path, top_k=50):
@@ -193,19 +272,19 @@ def analyze_openlane_slope_std_topk(pkl_path, top_k=50):
     lane_records = []  # (slope_std, sample_id, lane_id)
 
     for sample_id, sample in tqdm(
-        enumerate(data_infos), total=len(data_infos), desc="计算车道斜率 std"
+        enumerate(data_infos), total=len(data_infos), desc="计算车道曲率"
     ):
         for lane_id, lane in enumerate(sample["lanes"]):
-            std_val = compute_lane_slope_std(lane)
-            lane_records.append((std_val, sample_id, lane_id))
+            curv_val = compute_lane_curvature_spline(lane)
+            lane_records.append((curv_val, sample_id, lane_id))
 
     lane_records.sort(key=lambda x: x[0], reverse=True)  # 弯曲程度高的在前
     topk_lanes = lane_records[:top_k]
     topk_sample_ids = np.array([x[1] for x in topk_lanes], dtype=np.int64)
 
     stats = {
-        "lane_mean_slope_std": float(np.mean([x[0] for x in lane_records])),
-        "lane_max_slope_std": float(lane_records[0][0]),
+        "lane_mean_curvature": float(np.mean([x[0] for x in lane_records])),
+        "lane_max_curvature": float(lane_records[0][0]),
     }
 
     return topk_sample_ids, stats
@@ -240,7 +319,7 @@ ID_LIST = [
 def get_sample_ids(pkl_path, data_infos):
     if ID_MODE == "hook":
         ids, stats = ID_HOOK(pkl_path)
-        print("使用 Hook 选择样本（斜率 std 最大 top-k 弯曲车道）")
+        print("使用 Hook 选择样本（斜率最大 top-k 弯曲车道）")
         print("Hook Stats:", stats)
         return ids
     elif ID_MODE == "range":
@@ -262,7 +341,7 @@ def get_sample_ids(pkl_path, data_infos):
 
 def main():
     print("=" * 60)
-    print("OpenLane 可视化（固定点采样 + 弯曲车道 top-k based on slope std）")
+    print("OpenLane 可视化（固定点采样 + 弯曲车道 top-k based on curvature）")
     print("=" * 60)
 
     data_infos = load_dataset_cache(CACHE_PATH)
@@ -270,7 +349,7 @@ def main():
 
     for idx in sample_ids:
         print(f"\n处理样本 {idx}/{len(data_infos)-1}")
-        print(f"样本信息: {data_infos[idx]['img_name']}")
+        print(f"样本信息: {data_infos[idx]['img_path']}")
         print(f"车道线数量: {len(data_infos[idx]['lanes'])}")
 
         visualize_sample_fixed(

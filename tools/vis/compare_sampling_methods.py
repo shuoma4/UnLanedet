@@ -16,8 +16,8 @@ sys.path.append(os.getcwd())
 from unlanedet.data.transform.generate_lane_line import (
     GenerateLaneLine as GenerateLaneLinev1,
 )
-from unlanedet.data.transform.res_lane_encoder import (
-    ResLaneEncoder,
+from unlanedet.data.transform.openlane_generate import (
+    OpenLaneGenerate,
 )
 from config.llanet.priors import SAMPLE_YS_IOSDENSITY
 
@@ -72,7 +72,7 @@ cfg = MockConfig()
 cfg.sample_y = SAMPLE_YS_IOSDENSITY
 cfg.num_points = len(SAMPLE_YS_IOSDENSITY)
 gen_v1 = GenerateLaneLinev1(transforms=[], cfg=cfg, training=False)
-gen_openlane = ResLaneEncoder(transforms=[], cfg=cfg, training=False)
+gen_openlane = OpenLaneGenerate(transforms=[], cfg=cfg, training=False)
 
 # Define Y sample points (same as used in the classes)
 # Note: GenerateLaneLine uses np.arange(self.img_h, -1, -self.strip_size)

@@ -1,18 +1,20 @@
+import collections
 import math
+import numbers
 import random
+from collections.abc import Sequence
+
 import cv2
 import numpy as np
 import torch
-import numbers
-import collections
-from PIL import Image
-from collections.abc import Sequence
-from .datacontainer import DataContainer as DC 
+
+from .datacontainer import DataContainer as DC
 
 try:
     collections = collections.abc
 except:
     pass
+
 
 def is_str(x):
     """Whether the input is an string instance.
@@ -20,6 +22,7 @@ def is_str(x):
     Note: This method is deprecated since python 2 is no longer supported.
     """
     return isinstance(x, str)
+
 
 def to_tensor(data):
     """Convert objects of various python types to :obj:`torch.Tensor`.
@@ -45,6 +48,7 @@ def to_tensor(data):
     else:
         raise TypeError(f'type {type(data)} cannot be converted to tensor.')
 
+
 class DCToTensor(object):
     def __init__(self, keys=['img', 'mask'], collect_keys=[], cfg=None):
         self.keys = keys
@@ -59,12 +63,13 @@ class DCToTensor(object):
                 data[key] = sample[key]
                 continue
             if key in self.keys:
-                data[key] = DC(to_tensor(sample[key]),stack=False)
+                data[key] = DC(to_tensor(sample[key]), stack=False)
             if key in self.collect_keys:
                 data[key] = sample[key]
         data['img'] = data['img'].permute(2, 0, 1)
         return data
-    
+
+
 class ListToTensor(object):
     def __init__(self, keys=['img', 'mask'], collect_keys=[], cfg=None):
         self.keys = keys
@@ -79,7 +84,7 @@ class ListToTensor(object):
                 data[key] = sample[key]
                 continue
             if key in self.keys:
-                if isinstance(sample[key],DC):
+                if isinstance(sample[key], DC):
                     data[key] = sample[key]
                 else:
                     data[key] = to_tensor(sample[key])
@@ -88,7 +93,7 @@ class ListToTensor(object):
         data['img'] = data['img'].permute(2, 0, 1)
         return data
 
-    
+
 class ToTensor(object):
     """Convert some results to :obj:`torch.Tensor` by given keys.
 
@@ -115,82 +120,86 @@ class ToTensor(object):
 
     def __repr__(self):
         return self.__class__.__name__ + f'(keys={self.keys})'
-    
+
+
 class RandomLROffsetLABEL(object):
-    def __init__(self,max_offset, cfg=None):
+    def __init__(self, max_offset, cfg=None):
         self.max_offset = max_offset
+
     def __call__(self, sample):
-        img = sample['img'] 
-        label = sample['mask'] 
-        offset = np.random.randint(-self.max_offset,self.max_offset)
+        img = sample['img']
+        label = sample['mask']
+        offset = np.random.randint(-self.max_offset, self.max_offset)
         h, w = img.shape[:2]
 
         img = np.array(img)
         if offset > 0:
-            img[:,offset:,:] = img[:,0:w-offset,:]
-            img[:,:offset,:] = 0
+            img[:, offset:, :] = img[:, 0 : w - offset, :]
+            img[:, :offset, :] = 0
         if offset < 0:
             real_offset = -offset
-            img[:,0:w-real_offset,:] = img[:,real_offset:,:]
-            img[:,w-real_offset:,:] = 0
+            img[:, 0 : w - real_offset, :] = img[:, real_offset:, :]
+            img[:, w - real_offset :, :] = 0
 
         label = np.array(label)
         if offset > 0:
-            label[:,offset:] = label[:,0:w-offset]
-            label[:,:offset] = 0
+            label[:, offset:] = label[:, 0 : w - offset]
+            label[:, :offset] = 0
         if offset < 0:
             offset = -offset
-            label[:,0:w-offset] = label[:,offset:]
-            label[:,w-offset:] = 0
+            label[:, 0 : w - offset] = label[:, offset:]
+            label[:, w - offset :] = 0
         sample['img'] = img
         sample['mask'] = label
-        
-        return sample 
+
+        return sample
+
 
 class RandomUDoffsetLABEL(object):
-    def __init__(self,max_offset, cfg=None):
+    def __init__(self, max_offset, cfg=None):
         self.max_offset = max_offset
+
     def __call__(self, sample):
-        img = sample['img'] 
-        label = sample['mask'] 
-        offset = np.random.randint(-self.max_offset,self.max_offset)
+        img = sample['img']
+        label = sample['mask']
+        offset = np.random.randint(-self.max_offset, self.max_offset)
         h, w = img.shape[:2]
 
         img = np.array(img)
         if offset > 0:
-            img[offset:,:,:] = img[0:h-offset,:,:]
-            img[:offset,:,:] = 0
+            img[offset:, :, :] = img[0 : h - offset, :, :]
+            img[:offset, :, :] = 0
         if offset < 0:
             real_offset = -offset
-            img[0:h-real_offset,:,:] = img[real_offset:,:,:]
-            img[h-real_offset:,:,:] = 0
+            img[0 : h - real_offset, :, :] = img[real_offset:, :, :]
+            img[h - real_offset :, :, :] = 0
 
         label = np.array(label)
         if offset > 0:
-            label[offset:,:] = label[0:h-offset,:]
-            label[:offset,:] = 0
+            label[offset:, :] = label[0 : h - offset, :]
+            label[:offset, :] = 0
         if offset < 0:
             offset = -offset
-            label[0:h-offset,:] = label[offset:,:]
-            label[h-offset:,:] = 0
+            label[0 : h - offset, :] = label[offset:, :]
+            label[h - offset :, :] = 0
         sample['img'] = img
         sample['mask'] = label
-        return sample 
-    
+        return sample
+
+
 class Resize(object):
     def __init__(self, size, cfg=None):
-        assert (isinstance(size, collections.Iterable) and len(size) == 2)
+        assert isinstance(size, collections.Iterable) and len(size) == 2
         self.size = size
 
     def __call__(self, sample):
         out = list()
-        sample['img'] = cv2.resize(sample['img'], self.size,
-                              interpolation=cv2.INTER_CUBIC)
+        sample['img'] = cv2.resize(sample['img'], self.size, interpolation=cv2.INTER_CUBIC)
         if 'mask' in sample:
-            sample['mask'] = cv2.resize(sample['mask'], self.size,
-                                  interpolation=cv2.INTER_NEAREST)
+            sample['mask'] = cv2.resize(sample['mask'], self.size, interpolation=cv2.INTER_NEAREST)
         return sample
-    
+
+
 class RandomCrop(object):
     def __init__(self, size, cfg=None):
         if isinstance(size, numbers.Number):
@@ -209,9 +218,10 @@ class RandomCrop(object):
         w2 = min(w1 + tw, w)
 
         for img in img_group:
-            assert (img.shape[0] == h and img.shape[1] == w)
+            assert img.shape[0] == h and img.shape[1] == w
             out_images.append(img[h1:h2, w1:w2, ...])
         return out_images
+
 
 class CenterCrop(object):
     def __init__(self, size, cfg=None):
@@ -231,10 +241,11 @@ class CenterCrop(object):
         w2 = min(w1 + tw, w)
 
         for img in img_group:
-            assert (img.shape[0] == h and img.shape[1] == w)
+            assert img.shape[0] == h and img.shape[1] == w
             out_images.append(img[h1:h2, w1:w2, ...])
         return out_images
-    
+
+
 class RandomRotation(object):
     def __init__(self, degree=(-10, 10), interpolation=(cv2.INTER_LINEAR, cv2.INTER_NEAREST), padding=None, cfg=None):
         self.degree = degree
@@ -246,15 +257,26 @@ class RandomRotation(object):
     def _rotate_img(self, sample, map_matrix):
         h, w = sample['img'].shape[0:2]
         sample['img'] = cv2.warpAffine(
-            sample['img'], map_matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=self.padding)
+            sample['img'],
+            map_matrix,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=self.padding,
+        )
 
     def _rotate_mask(self, sample, map_matrix):
         if 'mask' not in sample:
             return
         h, w = sample['mask'].shape[0:2]
         sample['mask'] = cv2.warpAffine(
-            sample['mask'], map_matrix, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=self.padding)
-
+            sample['mask'],
+            map_matrix,
+            (w, h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=self.padding,
+        )
 
     def __call__(self, sample):
         v = random.random()
@@ -267,30 +289,29 @@ class RandomRotation(object):
             self._rotate_mask(sample, map_matrix)
         return sample
 
+
 class RandomBlur(object):
     def __init__(self, applied, cfg=None):
         self.applied = applied
 
     def __call__(self, img_group):
-        assert (len(self.applied) == len(img_group))
+        assert len(self.applied) == len(img_group)
         v = random.random()
         if v < 0.5:
             out_images = []
             for img, a in zip(img_group, self.applied):
                 if a:
-                    img = cv2.GaussianBlur(
-                        img, (5, 5), random.uniform(1e-6, 0.6))
+                    img = cv2.GaussianBlur(img, (5, 5), random.uniform(1e-6, 0.6))
                 out_images.append(img)
                 if len(img.shape) > len(out_images[-1].shape):
-                    out_images[-1] = out_images[-1][...,
-                                                    np.newaxis]  # single channel image
+                    out_images[-1] = out_images[-1][..., np.newaxis]  # single channel image
             return out_images
         else:
             return img_group
-        
+
+
 class RandomHorizontalFlip(object):
-    """Randomly horizontally flips the given numpy Image with a probability of 0.5
-    """
+    """Randomly horizontally flips the given numpy Image with a probability of 0.5"""
 
     def __init__(self, cfg=None):
         pass
@@ -299,7 +320,8 @@ class RandomHorizontalFlip(object):
         v = random.random()
         if v < 0.5:
             sample['img'] = np.fliplr(sample['img'])
-            if 'mask' in sample: sample['mask'] = np.fliplr(sample['mask'])
+            if 'mask' in sample:
+                sample['mask'] = np.fliplr(sample['mask'])
             if 'lanes' in sample:
                 width = sample['img'].shape[1]
                 lanes = sample['lanes']
@@ -312,6 +334,7 @@ class RandomHorizontalFlip(object):
                 sample['lanes'] = new_lanes
         return sample
 
+
 class Normalize(object):
     def __init__(self, img_norm, cfg=None):
         self.mean = np.array(img_norm['mean'], dtype=np.float32)
@@ -320,7 +343,7 @@ class Normalize(object):
     def __call__(self, sample):
         m = self.mean
         s = self.std
-        img = sample['img'] 
+        img = sample['img']
         if len(m) == 1:
             img = img - np.array(m)  # single channel image
             img = img / np.array(s)
@@ -329,13 +352,13 @@ class Normalize(object):
             img = img / np.array(s)[np.newaxis, np.newaxis, ...]
         sample['img'] = img
 
-        return sample 
+        return sample
 
 
 class Preprocess(object):
-    def __init__(self,preprocess):
+    def __init__(self, preprocess):
         self.preprocess = preprocess
-    
+
     def __call__(self, data):
         for t in self.preprocess:
             data = t(data)
@@ -343,8 +366,11 @@ class Preprocess(object):
                 return None
         return data
 
+
 class RandomAffine:
-    def __init__(self, affine_ratio, degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0, border=(0, 0),keys=[]):
+    def __init__(
+        self, affine_ratio, degrees=10, translate=0.1, scale=0.1, shear=10, perspective=0.0, border=(0, 0), keys=[]
+    ):
         assert 0 <= affine_ratio <= 1
         self.affine_ratio = affine_ratio
         self.degrees = degrees
@@ -357,13 +383,13 @@ class RandomAffine:
 
     def _transform_data(self, results, M, width, height):
         # transform img
-        img = results["img"].copy()
+        img = results['img'].copy()
         if (self.border[0] != 0) or (self.border[1] != 0) or (M != np.eye(3)).any():  # image changed
             if self.perspective:
                 im = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(0, 0, 0))
             else:  # affine
                 im = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(0, 0, 0))
-        results["img"] = im
+        results['img'] = im
 
         # transform lane
         for key in self.key_list:
@@ -372,8 +398,8 @@ class RandomAffine:
             for lane in lanes:
                 new_lane = []
                 for p in lane:
-                    p = np.expand_dims(np.array(p), axis=1)    # (2, 1)
-                    p = np.concatenate((p, np.ones(shape=(1, 1), dtype=np.float)), axis=0)    # (3, 1)
+                    p = np.expand_dims(np.array(p), axis=1)  # (2, 1)
+                    p = np.concatenate((p, np.ones(shape=(1, 1), dtype=np.float)), axis=0)  # (3, 1)
                     new_p = (M[:2] @ p).squeeze().tolist()
                     new_lane.append(new_p)
                 new_lanes.append(new_lane)
@@ -427,6 +453,5 @@ class RandomAffine:
             # Combined rotation matrix
             M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
             self._transform_data(results, M, width, height)
-
 
         return results

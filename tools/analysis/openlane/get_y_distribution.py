@@ -9,7 +9,7 @@ from tqdm import tqdm
 # ============================
 CACHE_PATH = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/openlane_lane3d_1000_train_cuth-270_800x320_cache_v1.pkl"
 NUM_POINTS = 72
-OUTPUT_DIR = "tools/analysis/openlane"
+OUTPUT_DIR = "source/openlane_statistics/y_distribution"
 IMG_H = 320
 
 
@@ -93,6 +93,25 @@ def sample_lane_weighted(points, num_samples, alpha=1.0, beta=1.0, img_h=320):
 
 
 # ============================
+# 构造采样高度（顶部加密）
+# ============================
+def build_sample_ys_with_top_dense(all_ys, num_points, gamma=1.5):
+    """
+    利用分位数统计构造采样高度，并在图像顶部加密采样
+
+    gamma > 1  => 顶部更密集（建议 2~3）
+    gamma = 1  => 退化为普通等分位采样
+    """
+    u = np.linspace(0, 1, num_points)
+    q_points = (u**gamma) * 100.0  # 顶部分位加密
+
+    sample_ys = np.percentile(all_ys, q_points)
+    sample_ys = np.sort(sample_ys)[::-1]  # 从下到上
+
+    return sample_ys
+
+
+# ============================
 # 主流程：统计 y 分布
 # ============================
 def get_y_distribution():
@@ -110,17 +129,18 @@ def get_y_distribution():
             if len(lane) < 2:
                 continue
 
-            y_min, y_max = lane[:, 1].min(), lane[:, 1].max()
-            length_y = abs(y_max - y_min)
-            num_sample = int(np.clip(length_y, 30, 180))
+            # y_min, y_max = lane[:, 1].min(), lane[:, 1].max()
+            # length_y = abs(y_max - y_min)
+            # num_sample = int(np.clip(length_y, 30, 180))
 
-            xs, ys = sample_lane_weighted(
-                lane,
-                num_samples=num_sample,
-                alpha=1.2,  # 上部区域先验
-                beta=1.5,  # 曲率增强 
-                img_h=IMG_H,
-            )
+            # xs, ys = sample_lane_weighted(
+            #     lane,
+            #     num_samples=num_sample,
+            #     alpha=1.2,  # 上部区域先验
+            #     beta=1.5,  # 曲率增强
+            #     img_h=IMG_H,
+            # )
+            ys = lane[:, 1]  # 原始y坐标
             if len(ys) > 0:
                 all_ys.extend(ys)
 
@@ -137,9 +157,11 @@ def get_y_distribution():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     plt.savefig(os.path.join(OUTPUT_DIR, "y_dist_weighted.png"))
 
-    q_points = np.linspace(0, 100, NUM_POINTS)
-    sample_ys = np.percentile(all_ys, q_points)
-    sample_ys = np.sort(sample_ys)[::-1]
+    # 构造采样高度（顶部加密）
+    sample_ys = build_sample_ys_with_top_dense(all_ys, NUM_POINTS, gamma=1)
+
+    # 保存sample_ys
+    np.save(os.path.join(OUTPUT_DIR, "sample_ys_gt.npy"), sample_ys)
 
     print("\nGenerated sample_ys:")
     print("sample_ys = np.array([")

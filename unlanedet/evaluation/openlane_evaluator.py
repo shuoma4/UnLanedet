@@ -1,14 +1,16 @@
-import torch
-import torch.nn.functional as F
-import numpy as np
+import json
 import logging
 import os
-import json
 import shutil
 import subprocess
+
+import numpy as np
+import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
-from .evaluator import DatasetEvaluator
+
 from ..model.LLANet.line_iou import line_iou
+from .evaluator import DatasetEvaluator
 
 
 def lane_nms(predictions, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920):
@@ -65,7 +67,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
         output_dir=None,
         iou_threshold=0.5,
         width=30,
-        metric="OpenLane/F1",
+        metric='OpenLane/F1',
     ):
         """
         Args:
@@ -85,27 +87,23 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         # 1. Output Directory Setup
         if output_dir is None:
-            if hasattr(cfg, "train") and hasattr(cfg.train, "output_dir"):
-                self.output_dir = os.path.join(cfg.train.output_dir, "eval_results")
+            if hasattr(cfg, 'train') and hasattr(cfg.train, 'output_dir'):
+                self.output_dir = os.path.join(cfg.train.output_dir, 'eval_results')
             else:
-                self.output_dir = "./output/eval_results"
+                self.output_dir = './output/eval_results'
         else:
             self.output_dir = output_dir
 
         self.result_dir = self.output_dir
-        self.test_list_path = os.path.join(self.output_dir, "test_list.txt")
+        self.test_list_path = os.path.join(self.output_dir, 'test_list.txt')
 
         # Visualization directories for annotated images
-        self.visualization_dir = os.path.join(self.output_dir, "visualization")
-        self.annotated_images_dir = os.path.join(
-            self.visualization_dir, "annotated_images"
-        )
+        self.visualization_dir = os.path.join(self.output_dir, 'visualization')
+        self.annotated_images_dir = os.path.join(self.visualization_dir, 'annotated_images')
         self.script_path = getattr(
             cfg,
-            "parse_evaluate_result_script",
-            os.path.join(
-                os.path.dirname(__file__), "../../../tools/read_open2d_csv_results.py"
-            ),
+            'parse_evaluate_result_script',
+            os.path.join(os.path.dirname(__file__), '../../../tools/read_open2d_csv_results.py'),
         )
 
         # 2. Category Mapping (Model 0-14 -> OpenLane Official IDs)
@@ -128,12 +126,12 @@ class OpenLaneEvaluator(DatasetEvaluator):
         }
 
         # 3. Stats Initialization
-        self.num_categories = getattr(cfg, "num_lane_categories", 15)
-        self.num_attributes = getattr(cfg, "num_lr_attributes", 4)
+        self.num_categories = getattr(cfg, 'num_lane_categories', 15)
+        self.num_attributes = getattr(cfg, 'num_lr_attributes', 4)
         self._created_dirs = set()
 
         # Configuration for visualization
-        self.generate_visualization = getattr(cfg, "generate_visualization", False)
+        self.generate_visualization = getattr(cfg, 'generate_visualization', False)
         self.reset()
 
     def reset(self):
@@ -154,7 +152,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 if os.path.exists(self.visualization_dir):
                     shutil.rmtree(self.visualization_dir)
             except Exception as e:
-                self.logger.warning(f"Failed to clean output dir: {e}")
+                self.logger.warning(f'Failed to clean output dir: {e}')
 
         os.makedirs(self.result_dir, exist_ok=True)
 
@@ -162,7 +160,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
         if self.generate_visualization:
             os.makedirs(self.annotated_images_dir, exist_ok=True)
             self.logger.info(
-                f"[OpenLaneEvaluator] Visualization enabled. Annotated images will be saved to: {self.annotated_images_dir}"
+                f'[OpenLaneEvaluator] Visualization enabled. Annotated images will be saved to: {self.annotated_images_dir}'
             )
 
     def process(self, inputs, outputs):
@@ -171,12 +169,12 @@ class OpenLaneEvaluator(DatasetEvaluator):
         attr_logits_batch = None
 
         if isinstance(outputs, dict):
-            if "category" in outputs:
-                cat_logits_batch = outputs["category"]
-            if "attribute" in outputs:
-                attr_logits_batch = outputs["attribute"]
-            if "lane_lines" in outputs:
-                outputs = outputs["lane_lines"]
+            if 'category' in outputs:
+                cat_logits_batch = outputs['category']
+            if 'attribute' in outputs:
+                attr_logits_batch = outputs['attribute']
+            if 'lane_lines' in outputs:
+                outputs = outputs['lane_lines']
 
         batch_size = len(outputs)
 
@@ -185,26 +183,18 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
             # --- 1. 解析 Meta 信息 ---
             original_rel_path = None
-            if "img_name" in inputs:
-                names = inputs["img_name"]
+            if 'img_name' in inputs:
+                names = inputs['img_name']
                 if isinstance(names, list) and i < len(names):
                     original_rel_path = names[i]
-                elif (
-                    hasattr(names, "data")
-                    and isinstance(names.data, list)
-                    and i < len(names.data)
-                ):
+                elif hasattr(names, 'data') and isinstance(names.data, list) and i < len(names.data):
                     original_rel_path = names.data[i]
 
             if not original_rel_path:
-                raw_meta = inputs.get("meta", inputs.get("img_metas", [{}]))
-                if hasattr(raw_meta, "data"):
+                raw_meta = inputs.get('meta', inputs.get('img_metas', [{}]))
+                if hasattr(raw_meta, 'data'):
                     raw_meta = raw_meta.data
-                while (
-                    isinstance(raw_meta, list)
-                    and len(raw_meta) > 0
-                    and isinstance(raw_meta[0], list)
-                ):
+                while isinstance(raw_meta, list) and len(raw_meta) > 0 and isinstance(raw_meta[0], list):
                     raw_meta = raw_meta[0]
 
                 meta = {}
@@ -212,35 +202,25 @@ class OpenLaneEvaluator(DatasetEvaluator):
                     meta = raw_meta[i]
                 elif isinstance(raw_meta, dict):
                     meta = {
-                        k: (
-                            v[i]
-                            if isinstance(v, (list, torch.Tensor)) and len(v) > i
-                            else v
-                        )
+                        k: (v[i] if isinstance(v, (list, torch.Tensor)) and len(v) > i else v)
                         for k, v in raw_meta.items()
                     }
 
-                for key in ["img_name", "filename", "img_path", "file_name"]:
+                for key in ['img_name', 'filename', 'img_path', 'file_name']:
                     if isinstance(meta, dict) and meta.get(key):
                         original_rel_path = meta[key]
                         break
 
             if not original_rel_path:
-                self.logger.warning(
-                    f"[WARNING] Meta content (partial): {str(inputs.keys())}"
-                )
+                self.logger.warning(f'[WARNING] Meta content (partial): {str(inputs.keys())}')
                 continue
 
             # FIX: Normalize path prefix to match annotation directory structure (lane3d_300/validation)
-            if "training_resized_800_320/validation" in original_rel_path:
-                original_rel_path = original_rel_path.replace(
-                    "training_resized_800_320/validation", "validation"
-                )
-            elif "validation_resized_800_320/" in original_rel_path:
-                original_rel_path = original_rel_path.replace(
-                    "validation_resized_800_320/", "validation/"
-                )
-            elif original_rel_path.startswith("validation/"):
+            if 'training_resized_800_320/validation' in original_rel_path:
+                original_rel_path = original_rel_path.replace('training_resized_800_320/validation', 'validation')
+            elif 'validation_resized_800_320/' in original_rel_path:
+                original_rel_path = original_rel_path.replace('validation_resized_800_320/', 'validation/')
+            elif original_rel_path.startswith('validation/'):
                 pass  # Already correct
 
             # Use full relative path (including validation/) for saving to match GT structure
@@ -248,7 +228,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
             # --- 2. 准备预测数据 ---
             if isinstance(output_data, dict):
-                pred_lines = output_data.get("lane_lines", [])
+                pred_lines = output_data.get('lane_lines', [])
             else:
                 pred_lines = output_data
 
@@ -297,8 +277,8 @@ class OpenLaneEvaluator(DatasetEvaluator):
             current_cat_logits = None
             if cat_logits_batch is not None:
                 current_cat_logits = cat_logits_batch[i]
-            elif isinstance(output_data, dict) and "category" in output_data:
-                current_cat_logits = output_data["category"]
+            elif isinstance(output_data, dict) and 'category' in output_data:
+                current_cat_logits = output_data['category']
             if current_cat_logits is not None:
                 if torch.is_tensor(current_cat_logits):
                     current_cat_logits = current_cat_logits.detach().cpu()
@@ -310,15 +290,15 @@ class OpenLaneEvaluator(DatasetEvaluator):
                         valid_cats = torch.argmax(cat_logits_final, dim=1).numpy()
                     else:
                         self.logger.warning(
-                            f"Shape mismatch for category: {current_cat_logits.shape} vs mask {valid_mask.shape}"
+                            f'Shape mismatch for category: {current_cat_logits.shape} vs mask {valid_mask.shape}'
                         )
 
             # Handle Attribute
             current_attr_logits = None
             if attr_logits_batch is not None:
                 current_attr_logits = attr_logits_batch[i]
-            elif isinstance(output_data, dict) and "attribute" in output_data:
-                current_attr_logits = output_data["attribute"]
+            elif isinstance(output_data, dict) and 'attribute' in output_data:
+                current_attr_logits = output_data['attribute']
 
             if current_attr_logits is not None:
                 if torch.is_tensor(current_attr_logits):
@@ -331,7 +311,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
                         valid_attrs = torch.argmax(attr_logits_final, dim=1).numpy()
                     else:
                         self.logger.warning(
-                            f"Shape mismatch for attribute: {current_attr_logits.shape} vs mask {valid_mask.shape}"
+                            f'Shape mismatch for attribute: {current_attr_logits.shape} vs mask {valid_mask.shape}'
                         )
 
             # --- 6. 解码坐标并保存 ---
@@ -365,24 +345,24 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 line_2d = [xs, ys]
 
                 lane_obj = {
-                    "category": official_cat_id,
-                    "attribute": official_attr_id,
-                    "uv": line_2d,
+                    'category': official_cat_id,
+                    'attribute': official_attr_id,
+                    'uv': line_2d,
                 }
                 lane_lines_json.append(lane_obj)
 
             self._write_json(
                 save_rel_path,
                 {
-                    "file_path": original_rel_path,
-                    "lane_lines": lane_lines_json,
+                    'file_path': original_rel_path,
+                    'lane_lines': lane_lines_json,
                 },
             )
 
         return []
 
     def _write_json(self, rel_path, content):
-        json_rel_path = rel_path.replace(".jpg", ".json")
+        json_rel_path = rel_path.replace('.jpg', '.json')
         save_path = os.path.join(self.result_dir, json_rel_path)
         dir_name = os.path.dirname(save_path)
         if dir_name not in self._created_dirs:
@@ -390,10 +370,8 @@ class OpenLaneEvaluator(DatasetEvaluator):
             self._created_dirs.add(dir_name)
             # Only print when the first directory is created (start of generation)
             if len(self._created_dirs) == 1:
-                self.logger.info(
-                    f"[OpenLaneEvaluator] Generating validation predictions to: {self.result_dir}"
-                )
-        with open(save_path, "w") as f:
+                self.logger.info(f'[OpenLaneEvaluator] Generating validation predictions to: {self.result_dir}')
+        with open(save_path, 'w') as f:
             json.dump(content, f)
 
         # Generate visualization if enabled
@@ -406,113 +384,99 @@ class OpenLaneEvaluator(DatasetEvaluator):
         """
         try:
             # Extract image filename from rel_path
-            img_filename = os.path.basename(rel_path).replace(".json", ".jpg")
+            img_filename = os.path.basename(rel_path).replace('.json', '.jpg')
 
             # Path to the read_open2d_csv_results.py script
             script_path = self.script_path
 
             if not os.path.exists(script_path):
-                self.logger.warning(f"Visualization script not found: {script_path}")
+                self.logger.warning(f'Visualization script not found: {script_path}')
                 return
 
             # Prepare command to generate visualization
             # The script expects to read from csv_results/, so we need to run evaluation first
             # For now, we'll create a placeholder to indicate this should be called after evaluation
             vis_cmd = [
-                "python",
+                'python',
                 script_path,
-                "--csv-folder",
-                os.path.join(self.output_dir, "csv_results"),
-                "--visualize",
-                "--output-dir",
+                '--csv-folder',
+                os.path.join(self.output_dir, 'csv_results'),
+                '--visualize',
+                '--output-dir',
                 self.annotated_images_dir,
             ]
 
             # Store visualization command for later execution
-            if not hasattr(self, "_vis_commands"):
+            if not hasattr(self, '_vis_commands'):
                 self._vis_commands = []
             self._vis_commands.append(
                 {
-                    "cmd": vis_cmd,
-                    "img_filename": img_filename,
-                    "json_content": json_content,
+                    'cmd': vis_cmd,
+                    'img_filename': img_filename,
+                    'json_content': json_content,
                 }
             )
 
         except Exception as e:
-            self.logger.warning(f"Failed to prepare visualization for {rel_path}: {e}")
+            self.logger.warning(f'Failed to prepare visualization for {rel_path}: {e}')
 
     def _save_empty_json(self, rel_path, full_path):
-        self._write_json(rel_path, {"file_path": full_path, "lane_lines": []})
+        self._write_json(rel_path, {'file_path': full_path, 'lane_lines': []})
 
     def evaluate(self, predictions=None):
-        self.logger.info(
-            f"[OpenLaneEvaluator] Inference finished. Generating test list..."
-        )
+        self.logger.info('[OpenLaneEvaluator] Inference finished. Generating test list...')
 
         all_json_files = []
         for root, dirs, files in os.walk(self.result_dir):
             for file in files:
-                if file.endswith(".json"):
+                if file.endswith('.json'):
                     full_path = os.path.join(root, file)
                     try:
-                        with open(full_path, "r") as f:
+                        with open(full_path, 'r') as f:
                             content = json.load(f)
                             img_path = None
-                            if "file_path" in content:
-                                img_path = content["file_path"]
+                            if 'file_path' in content:
+                                img_path = content['file_path']
 
                             if img_path:
                                 all_json_files.append(img_path)
                     except Exception as e:
-                        self.logger.warning(f"Failed to read {full_path}: {e}")
+                        self.logger.warning(f'Failed to read {full_path}: {e}')
 
         if len(all_json_files) == 0:
-            self.logger.warning("No JSON results found! Evaluation skipped.")
+            self.logger.warning('No JSON results found! Evaluation skipped.')
             return {}
 
-        self.logger.info(
-            f"[OpenLaneEvaluator] Generating test_list.txt with {len(all_json_files)} images..."
-        )
-        with open(self.test_list_path, "w") as f:
+        self.logger.info(f'[OpenLaneEvaluator] Generating test_list.txt with {len(all_json_files)} images...')
+        with open(self.test_list_path, 'w') as f:
             for path in all_json_files:
-                f.write(path + "\n")
-        self.logger.info(
-            f"[OpenLaneEvaluator] test_list.txt generated at: {self.test_list_path}"
-        )
+                f.write(path + '\n')
+        self.logger.info(f'[OpenLaneEvaluator] test_list.txt generated at: {self.test_list_path}')
 
         # Official C++ Tool
         metrics = {}
         if not os.path.exists(self.evaluate_bin_path):
-            self.logger.error(
-                f"Cannot find official evaluate binary at: {self.evaluate_bin_path}"
-            )
+            self.logger.error(f'Cannot find official evaluate binary at: {self.evaluate_bin_path}')
         else:
             metrics = self._run_official_evaluation()
 
             # Generate visualizations after evaluation if enabled
-            if (
-                self.generate_visualization
-                and hasattr(self, "_vis_commands")
-                and self._vis_commands
-            ):
+            if self.generate_visualization and hasattr(self, '_vis_commands') and self._vis_commands:
                 self._execute_visualizations()
 
         # Merge Internal Python Metrics
         local_metrics = self._get_internal_metrics()
         metrics.update(local_metrics)
 
-        self.logger.info("=" * 40)
-        self.logger.info(f"OpenLane Evaluation Results:")
+        self.logger.info('=' * 40)
+        self.logger.info('OpenLane Evaluation Results:')
         for k, v in metrics.items():
-            self.logger.info(f"{k}: {v:.4f}")
-        self.logger.info("=" * 40)
+            self.logger.info(f'{k}: {v:.4f}')
+        self.logger.info('=' * 40)
 
         # Log visualization results
         if self.generate_visualization:
-            self.logger.info(
-                f"[OpenLaneEvaluator] Visualizations saved to: {self.annotated_images_dir}"
-            )
+            self.logger.info(f'[OpenLaneEvaluator] Visualizations saved to: {self.annotated_images_dir}')
 
         return metrics
 
@@ -522,162 +486,124 @@ class OpenLaneEvaluator(DatasetEvaluator):
         """
         try:
             # First run the official evaluation to generate csv_results/
-            self.logger.info(
-                "[OpenLaneEvaluator] Running evaluation to generate CSV results for visualization..."
-            )
+            self.logger.info('[OpenLaneEvaluator] Running evaluation to generate CSV results for visualization...')
 
             # The CSV results should already be generated by _run_official_evaluation
-            csv_results_dir = os.path.join(self.output_dir, "csv_results")
+            csv_results_dir = os.path.join(self.output_dir, 'csv_results')
 
             if not os.path.exists(csv_results_dir):
-                self.logger.warning(
-                    f"CSV results directory not found: {csv_results_dir}"
-                )
+                self.logger.warning(f'CSV results directory not found: {csv_results_dir}')
                 return
 
             # Generate visualizations using read_open2d_csv_results.py
             script_path = self.script_path
 
             if not os.path.exists(script_path):
-                self.logger.warning(f"Visualization script not found: {script_path}")
+                self.logger.warning(f'Visualization script not found: {script_path}')
                 return
 
             # Create visualization command
             vis_cmd = [
-                "python",
+                'python',
                 script_path,
-                "--csv-folder",
+                '--csv-folder',
                 csv_results_dir,
-                "--plot",
-                os.path.join(self.visualization_dir, "performance.png"),
-                "--excel",
-                os.path.join(self.visualization_dir, "evaluation_results.xlsx"),
+                '--plot',
+                os.path.join(self.visualization_dir, 'performance.png'),
+                '--excel',
+                os.path.join(self.visualization_dir, 'evaluation_results.xlsx'),
             ]
 
-            self.logger.info(
-                f"[OpenLaneEvaluator] Generating evaluation plots and Excel report..."
-            )
+            self.logger.info('[OpenLaneEvaluator] Generating evaluation plots and Excel report...')
 
             # Execute visualization command
-            result = subprocess.run(
-                vis_cmd, capture_output=True, text=True, timeout=300
-            )
+            result = subprocess.run(vis_cmd, capture_output=True, text=True, timeout=300)
 
             if result.returncode == 0:
-                self.logger.info(
-                    f"[OpenLaneEvaluator] Evaluation visualization completed successfully"
-                )
+                self.logger.info('[OpenLaneEvaluator] Evaluation visualization completed successfully')
             else:
-                self.logger.warning(
-                    f"[OpenLaneEvaluator] Visualization generation had issues: {result.stderr}"
-                )
+                self.logger.warning(f'[OpenLaneEvaluator] Visualization generation had issues: {result.stderr}')
 
         except Exception as e:
-            self.logger.warning(
-                f"[OpenLaneEvaluator] Failed to execute visualizations: {e}"
-            )
+            self.logger.warning(f'[OpenLaneEvaluator] Failed to execute visualizations: {e}')
 
     def _run_official_evaluation(self):
-        lane_anno_dir = getattr(self.cfg, "lane_anno_dir", "lane3d_300/")
+        lane_anno_dir = getattr(self.cfg, 'lane_anno_dir', 'lane3d_300/')
         # Handle both string and Path types for data_root
         data_root = self.cfg.data_root
-        if hasattr(data_root, "as_posix"):
+        if hasattr(data_root, 'as_posix'):
             data_root = data_root.as_posix()
         # Remove trailing slashes and let os.path.join handle the path properly
-        dataset_dir = (
-            os.path.join(data_root.rstrip("/"), lane_anno_dir.rstrip("/")) + "/"
-        )
-        image_dir = data_root.rstrip("/") + "/"
+        dataset_dir = os.path.join(data_root.rstrip('/'), lane_anno_dir.rstrip('/')) + '/'
+        image_dir = data_root.rstrip('/') + '/'
         result_dir_root = self.output_dir
-        output_file = os.path.join(self.output_dir, "eval_res/")
+        output_file = os.path.join(self.output_dir, 'eval_res/')
 
         # Setup environment variables for OpenCV library path
         env = os.environ.copy()
-        opencv_path = getattr(self.cfg, "opencv_path", None)
+        opencv_path = getattr(self.cfg, 'opencv_path', None)
         if opencv_path:
-            env["LD_LIBRARY_PATH"] = opencv_path
-            self.logger.info(
-                f"[OpenLaneEvaluator] Setting LD_LIBRARY_PATH={opencv_path}"
-            )
+            env['LD_LIBRARY_PATH'] = opencv_path
+            self.logger.info(f'[OpenLaneEvaluator] Setting LD_LIBRARY_PATH={opencv_path}')
 
         cmd = [
             str(self.evaluate_bin_path),
-            "-a",
+            '-a',
             dataset_dir,
-            "-d",
+            '-d',
             result_dir_root,
-            "-i",
+            '-i',
             image_dir,
-            "-l",
+            '-l',
             self.test_list_path,
-            "-w",
+            '-w',
             str(self.width),
-            "-t",
+            '-t',
             str(self.iou_threshold),
-            "-o",
+            '-o',
             output_file,
-            "-j",
+            '-j',
             str(4),
         ]
         if self.generate_visualization:
-            cmd.append("-v")  # 保存可视化图片
+            cmd.append('-v')  # 保存可视化图片
 
         metrics = {}
         try:
-            self.logger.info(
-                f"[OpenLaneEvaluator] Running OpenLane official evaluation tool..."
-            )
-            self.logger.info(f"  Command: {' '.join(cmd)}")
-            self.logger.info(
-                f"  Parameters: width={self.width}, iou_threshold={self.iou_threshold}"
-            )
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=3000, env=env
-            )
+            self.logger.info('[OpenLaneEvaluator] Running OpenLane official evaluation tool...')
+            self.logger.info(f'  Command: {" ".join(cmd)}')
+            self.logger.info(f'  Parameters: width={self.width}, iou_threshold={self.iou_threshold}')
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3000, env=env)
 
             # Log stderr if there's any error output
             if result.stderr:
-                self.logger.error(
-                    f"[OpenLaneEvaluator] Evaluation tool stderr: {result.stderr}"
-                )
+                self.logger.error(f'[OpenLaneEvaluator] Evaluation tool stderr: {result.stderr}')
 
             # Log stdout for debugging
             if result.stdout:
-                self.logger.debug(
-                    f"[OpenLaneEvaluator] Evaluation tool stdout: {result.stdout}"
-                )
+                self.logger.debug(f'[OpenLaneEvaluator] Evaluation tool stdout: {result.stdout}')
 
             if result.stdout:
-                for line in result.stdout.split("\n"):
+                for line in result.stdout.split('\n'):
                     line = line.strip()
-                    if line.startswith("F-measure"):
-                        metrics["OpenLane/F1"] = float(line.split(":")[1].strip())
-                    elif line.startswith("Precision"):
-                        metrics["OpenLane/Precision"] = float(
-                            line.split(":")[1].strip()
-                        )
-                    elif line.startswith("Recall"):
-                        metrics["OpenLane/Recall"] = float(line.split(":")[1].strip())
+                    if line.startswith('F-measure'):
+                        metrics['OpenLane/F1'] = float(line.split(':')[1].strip())
+                    elif line.startswith('Precision'):
+                        metrics['OpenLane/Precision'] = float(line.split(':')[1].strip())
+                    elif line.startswith('Recall'):
+                        metrics['OpenLane/Recall'] = float(line.split(':')[1].strip())
             else:
-                self.logger.warning(
-                    "[OpenLaneEvaluator] No stdout from evaluation tool"
-                )
+                self.logger.warning('[OpenLaneEvaluator] No stdout from evaluation tool')
         except subprocess.TimeoutExpired:
-            self.logger.error(
-                "[OpenLaneEvaluator] Evaluation tool timed out after 300 seconds"
-            )
+            self.logger.error('[OpenLaneEvaluator] Evaluation tool timed out after 300 seconds')
         except Exception as e:
-            self.logger.error(
-                f"[OpenLaneEvaluator] Failed to execute evaluate binary: {e}"
-            )
+            self.logger.error(f'[OpenLaneEvaluator] Failed to execute evaluate binary: {e}')
             import traceback
 
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error(f'Traceback: {traceback.format_exc()}')
         return metrics
 
-    def _update_internal_metrics(
-        self, pred_lanes, pred_cats, pred_attrs, gt_lanes, gt_cats, gt_attrs
-    ):
+    def _update_internal_metrics(self, pred_lanes, pred_cats, pred_attrs, gt_lanes, gt_cats, gt_attrs):
         if len(pred_lanes) == 0 or len(gt_lanes) == 0:
             return
 
@@ -706,17 +632,9 @@ class OpenLaneEvaluator(DatasetEvaluator):
                     self.attribute_correct += 1
 
     def _get_internal_metrics(self):
-        cat_acc = (
-            self.category_correct / self.category_total
-            if self.category_total > 0
-            else 0
-        )
-        attr_acc = (
-            self.attribute_correct / self.attribute_total
-            if self.attribute_total > 0
-            else 0
-        )
-        return {"Internal/Category_Acc": cat_acc, "Internal/Attribute_Acc": attr_acc}
+        cat_acc = self.category_correct / self.category_total if self.category_total > 0 else 0
+        attr_acc = self.attribute_correct / self.attribute_total if self.attribute_total > 0 else 0
+        return {'Internal/Category_Acc': cat_acc, 'Internal/Attribute_Acc': attr_acc}
 
     def decode_lanes(self, preds, img_w, img_h, ori_img_w, ori_img_h, num_points):
         """

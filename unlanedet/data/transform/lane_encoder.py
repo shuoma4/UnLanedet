@@ -1,5 +1,6 @@
-import numpy as np
 import logging
+
+import numpy as np
 
 
 class LaneEncoder(object):
@@ -10,17 +11,14 @@ class LaneEncoder(object):
         reg = [start_x, start_y, theta, length, delta_x_0, ..., delta_x_{N-1}]
 
     - start_x, start_y:
-        车道线起点像素坐标（图像坐标系）
+        结构化车道线起点像素坐标（对齐到最近采样高度）
     - theta:
-        车道线整体倾斜角（0~180°）
-        90° 表示竖直向上
-        <90° 表示向左倾斜
-        >90° 表示向右倾斜
+        车道线整体倾斜角(-90~90°), <0为左倾, >0为右倾, 0为垂直
     - length:
-        车道线在图像垂直方向上的长度（像素尺度）
+        结构化车道线在图像垂直方向上的长度（对齐到最近采样高度）
     - delta_x:
         相对于先验直线的横向残差（像素单位）
-        当采样点超出图像或者原始真值gt标注的范围时，delta_x为默认值-1e5
+        当采样点超出结构化起终点范围时, delta_x 为默认值 -1e5
     """
 
     def __init__(self, cfg):
@@ -36,63 +34,38 @@ class LaneEncoder(object):
         # -------------------------
         # 预定义采样高度模式
         # -------------------------
-        if self.sample_ys_mode == "equal_interval":
-            # 在整张图像高度范围内均匀采样
-            self.base_sample_ys = np.linspace(
-                self.img_h - 1, 0, self.n_offsets, dtype=np.float32
-            )
-        elif self.sample_ys_mode == "equal_density":
-            # 使用数据统计得到的采样分布
+        if self.sample_ys_mode == 'equal_interval':
+            self.base_sample_ys = np.linspace(self.img_h - 1, 0, self.n_offsets, dtype=np.float32)
+        elif self.sample_ys_mode == 'equal_density':
             self.base_sample_ys = np.array(cfg.sample_ys, dtype=np.float32)
-        elif self.sample_ys_mode == "lane_adaptive":
-            # 运行时根据车道线自身范围生成，均匀生成
+        elif self.sample_ys_mode == 'lane_adaptive':
             self.base_sample_ys = None
         else:
-            raise ValueError(f"Unknown sample_ys_mode: {self.sample_ys_mode}")
+            raise ValueError(f'Unknown sample_ys_mode: {self.sample_ys_mode}')
 
     # ============================================================
-    # 自适应弧长重采样（按垂直跨度确定采样密度）
+    # 自适应弧长重采样
     # ============================================================
     def resample_by_arclength_adaptive(self, xs, ys):
-        """
-        对原始车道线进行等弧长重采样，采样点数根据车道线垂直跨度自适应设置
-
-        目的：
-        - 短车道线：避免无意义过密采样
-        - 长车道线：避免欠采样导致几何精度不足
-        """
-
         pts = np.stack([xs, ys], axis=1)
-
-        # 按 y 从大到小排序（从车道起点到终点）
         order = np.argsort(pts[:, 1])[::-1]
         pts = pts[order]
-        xs = pts[:, 0]
-        ys = pts[:, 1]
 
-        # 1️⃣ 根据垂直跨度自适应设置采样点数
-        y_min = ys.min()
-        y_max = ys.max()
-        # num_sample = int(abs(y_max - y_min))
-        # num_sample = np.clip(num_sample, 10, 270)  # 下限防止过稀，上限防止过慢
-        num_sample = 270
+        if len(pts) < 2:
+            return pts[:, 0], pts[:, 1]
 
-        if len(xs) < 2 or num_sample < 2:
-            return xs, ys
-
-        # 2️⃣ 弧长参数化
         diffs = pts[1:] - pts[:-1]
         seg_lens = np.sqrt((diffs**2).sum(axis=1))
         arc_len = np.concatenate([[0.0], np.cumsum(seg_lens)])
         total_len = arc_len[-1]
 
         if total_len < 1e-6:
-            return xs, ys
+            return pts[:, 0], pts[:, 1]
 
-        # 3️⃣ 等弧长重采样（几何一致逐段插值）
+        num_sample = 270
         target_lens = np.linspace(0, total_len, num_sample)
-        sampled = []
 
+        sampled = []
         for t in target_lens:
             idx = np.searchsorted(arc_len, t) - 1
             idx = np.clip(idx, 0, len(pts) - 2)
@@ -105,92 +78,106 @@ class LaneEncoder(object):
         return sampled[:, 0], sampled[:, 1]
 
     # ============================================================
-    # 车道线采样函数（映射到 sample_ys）
+    # 车道线采样函数
     # ============================================================
     def sample_lane(self, xs, ys, sample_ys):
-        """
-        将车道线映射到给定的 sample_ys 上，得到对应的 x 坐标
-        """
-
-        if self.sample_lane_mode == "linear_interp":
-            # 直接基于原始标注线性插值
+        if self.sample_lane_mode == 'linear_interp':
             xs_out = np.interp(sample_ys, ys[::-1], xs[::-1])
-            vis = (sample_ys <= ys[0]) & (sample_ys >= ys[-1])
-            return xs_out, vis
+            return xs_out
 
-        elif self.sample_lane_mode == "arc_length":
-            # 先等弧长重采样，再插值
+        elif self.sample_lane_mode == 'arc_length':
             xs_dense, ys_dense = self.resample_by_arclength_adaptive(xs, ys)
             xs_out = np.interp(sample_ys, ys_dense[::-1], xs_dense[::-1])
-            vis = (sample_ys <= ys_dense[0]) & (sample_ys >= ys_dense[-1])
-            return xs_out, vis
+            return xs_out
 
         else:
-            raise ValueError(f"Unknown sample_lane_mode: {self.sample_lane_mode}")
+            raise ValueError(f'Unknown sample_lane_mode: {self.sample_lane_mode}')
 
     # ============================================================
     # 主入口：编码单条车道线
     # ============================================================
-    def encode_lane(self, lane_pts):
+    def encode(self, lane_pts):
         """
-        输入：
-            lane_pts: [(x0, y0), (x1, y1), ...]，已按从下到上排序
+        编码单条车道线
 
-        输出：
-            reg: [start_x, start_y, theta, length, delta_x...]
-            sample_ys: 采样高度
+        Args:
+            lane_pts (list of tuple): 车道线点集，每个点为 (x, y) 格式
+
+        Returns:
+            reg (np.ndarray): 结构化车道线编码参数，形状为 (n_offsets, 5),
+                start_y : 结构化车道线起点y像素坐标（对齐到最近采样高度）
+                start_x : 结构化车道线起点x像素坐标（对齐到最近采样高度）
+                theta : 车道线整体倾斜角(-90~90°), <0为左倾, >0为右倾, 0为垂直
+                length : 结构化车道线在图像垂直方向上的长度（对齐到最近采样高度）
+                delta_x : 采样范围内，车道线x坐标相对于先验直线的横向残差（像素单位）
+            end_pts (list of float): 结构化车道线终点像素坐标 (y, x)
+            xs_sampled (np.ndarray): 结构化车道线在采样高度上的x坐标 (n_offsets,)
+            sample_ys (np.ndarray): y轴采样点序列 (n_offsets,)
         """
-
         xs = np.asarray([p[0] for p in lane_pts], dtype=np.float32)
         ys = np.asarray([p[1] for p in lane_pts], dtype=np.float32)
 
         # -------------------------
-        # 1️⃣ 生成采样高度
+        # 1️⃣ 采样高度
         # -------------------------
-        if self.sample_ys_mode == "lane_adaptive":
+        if self.sample_ys_mode == 'lane_adaptive':
             sample_ys = np.linspace(ys[0], ys[-1], self.n_offsets, dtype=np.float32)
         else:
             sample_ys = self.base_sample_ys
 
         # -------------------------
-        # 2️⃣ 采样得到真实车道线 x
+        # 2️⃣ 采样车道线
         # -------------------------
-        xs_sampled, vis = self.sample_lane(xs, ys, sample_ys)
+        xs_sampled = self.sample_lane(xs, ys, sample_ys)
 
         # -------------------------
-        # 3️⃣ 起点参数
+        # 3️⃣ 结构化起点 & 终点（对齐到最近采样高度）
         # -------------------------
-        start_x = xs[0]
-        start_y = ys[0]
+        idx_start = int(np.argmin(np.abs(sample_ys - ys[0])))
+        idx_end = int(np.argmin(np.abs(sample_ys - ys[-1])))
+
+        start_y = sample_ys[idx_start]
+        start_x = xs_sampled[idx_start]
+        end_x = xs_sampled[idx_end]
+        end_y = sample_ys[idx_end]
 
         # -------------------------
-        # 4️⃣ 拟合整体方向角 theta（0~180°）
+        # 4️⃣ 可见性掩码（严格以结构化起终点为边界）
         # -------------------------
-        k, b = np.polyfit(ys, xs, 1)  # x = k*y + b
-        theta = 90.0 - np.degrees(np.arctan(k))
-        theta = np.clip(theta, 0.0, 180.0)
+        y_high = start_y
+        y_low = end_y
+
+        vis = (sample_ys <= y_high + 1e-3) & (sample_ys >= y_low - 1e-3)
+        # -------------------------
+        # 5️⃣ 拟合整体方向角 theta
+        # -------------------------
+        k, b = np.polyfit(ys, xs, 1)
+        theta = -np.degrees(np.arctan(k))  # 左负右正（你也可以去掉负号换定义）
+        theta = np.clip(theta, -90.0, 90.0)
 
         # -------------------------
-        # 5️⃣ 车道线垂直长度
+        # 6️⃣ 结构化长度（对齐到采样坐标）
         # -------------------------
-        length = float(ys[0] - ys[-1])
+        length = float(start_y - end_y)
 
         # -------------------------
-        # 6️⃣ 构造先验直线并计算残差
+        # 7️⃣ 构造先验直线并计算残差
         # -------------------------
-        theta_rad = np.deg2rad(theta)
-        x_prior = start_x + (start_y - sample_ys) / (np.tan(theta_rad) + 1e-6)
-        delta_x = xs_sampled - x_prior
+        tan_theta = np.tan(np.deg2rad(theta))
+        tan_theta = np.clip(tan_theta, -1e3, 1e3)  # 防止接近水平的车道线产生数值爆炸
+        x_prior = start_x + (start_y - sample_ys) * tan_theta
+
+        delta_x = xs_sampled - x_prior  # 固定Y采样点下，X坐标的偏移
+        xs_sampled[~vis] = -1e5
         delta_x[~vis] = -1e5
-
         # -------------------------
-        # 7️⃣ 拼接回归向量
+        # 8️⃣ 拼接回归向量
         # -------------------------
         reg = np.concatenate(
             [
-                np.array([start_x, start_y, theta, length], dtype=np.float32),
+                np.array([start_y, start_x, theta, length], dtype=np.float32),
                 delta_x.astype(np.float32),
             ]
         )
 
-        return reg, sample_ys
+        return reg, [end_y, end_x], xs_sampled, sample_ys

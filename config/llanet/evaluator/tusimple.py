@@ -1,27 +1,23 @@
 import os
-import sys
 
-from unlanedet import config
-from unlanedet.model.LLANet import prior
+# ruff: noqa: E402
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['OPENCV_NUM_THREADS'] = '0'
+os.environ['CV_NUM_THREADS'] = '0'
 
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OPENCV_NUM_THREADS"] = "0"
-os.environ["CV_NUM_THREADS"] = "0"
+import numpy as np
+from omegaconf import OmegaConf
+
+from unlanedet.config import LazyCall as L
+from unlanedet.data.transform.generate_lane_line import GenerateLaneLine
+from unlanedet.data.transform.transforms import ToTensor
 
 from ..modelzoo import get_config
-from omegaconf import OmegaConf
-from unlanedet.config import LazyCall as L
-from unlanedet.data.transform import *
-from unlanedet.data.transform.generate_lane_line import GenerateLaneLine
-from unlanedet.data.culane import CULane
-from unlanedet.evaluation import CULaneEvaluator
-
 from .model_factory import create_llanet_model
-import numpy as np
 
 sample_ys = np.array(
     [
@@ -109,7 +105,7 @@ seg_loss_weight = 1.0
 category_loss_weight = 1.0
 attribute_loss_weight = 2.0
 
-assign_method_name = "CLRNet"
+assign_method_name = 'CLRNet'
 w_cls = 2.0
 w_geom = 4.0
 w_iou = 2.0
@@ -128,33 +124,34 @@ num_lr_attributes = 4
 sample_y = sample_ys
 test_parameters = dict(conf_threshold=0.2, nms_thres=0.5, nms_topk=max_lanes)
 
-# CULane Original Dims
-ori_img_w = 1640
-ori_img_h = 590
+# TuSimple Original Dims
+ori_img_w = 1280
+ori_img_h = 720
 # Model Input Dims (OpenLane)
 img_w = 800
 img_h = 320
-cut_height = 270  # CULane standard
+cut_height = 160  # TuSimple standard in config
 
 img_norm = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 64
 num_classes = 4 + 1
-data_root = "/data0/lxy_data/mslanedet/CULane/"
+data_root = '/home/dataset/tusimple'
 
-use_preprocessed = False  # CULane usually not preprocessed like OpenLane
+use_preprocessed = False
 enable_3d = False
 
 param_config = OmegaConf.create()
-param_config.dataset_statistics = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"  # Use OpenLane stats for model
+param_config.dataset_statistics = (
+    '/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz'
+)
 param_config.use_preprocessed = use_preprocessed
 param_config.enable_3d = enable_3d
 param_config.use_pretrained_backbone = True
 param_config.iou_loss_weight = iou_loss_weight
 param_config.cls_loss_weight = cls_loss_weight
 param_config.sample_y = sample_ys.tolist()
-param_config.img_w = img_w  # Use OpenLane sample_y for model head
 param_config.img_w = img_w
 param_config.img_h = img_h
 param_config.ori_img_w = ori_img_w
@@ -186,31 +183,25 @@ param_config.num_priors = num_priors
 
 # Model Config
 param_config.fc_hidden_dim = 64
-param_config.epoch_per_iter = 1000  # Dummy
+param_config.epoch_per_iter = 1000
 param_config.assign_method = assign_method_name
-param_config.pretrained_model_name = "mobilenetv4_conv_small"
+param_config.pretrained_model_name = 'mobilenetv4_conv_small'
 param_config.enable_category = True
 param_config.enable_attribute = True
 param_config.scale_factor = 20.0
-param_config.output_dir = "output/llanet/culane"  # Override later
-param_config.detailed_loss_logger_config = dict(
-    output_dir=param_config.output_dir, filename="detailed_metrics.json"
-)
+param_config.output_dir = 'output/llanet/tusimple'
+param_config.detailed_loss_logger_config = dict(output_dir=param_config.output_dir, filename='detailed_metrics.json')
 
 # === Create Model ===
 model = create_llanet_model(param_config)
 
-# === Train Config (for checkpointer) ===
-train = get_config("config/common/train.py").train
-train.init_checkpoint = (
-    "output/llanet/mobilenetv4_small_gsafpn_openlane_0131/model_final.pth"
-)
-train.output_dir = "output/llanet/culane"
+# === Train Config ===
+train = get_config('config/common/train.py').train
+train.init_checkpoint = 'output/llanet/mobilenetv4_small_gsafpn_openlane_0131/model_final.pth'
+train.output_dir = 'output/llanet/tusimple'
 
 # === Transforms ===
-base_transforms = [
-    dict(name="Resize", parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0)
-]
+base_transforms = [dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0)]
 
 val_transforms = base_transforms
 val_process = [
@@ -219,11 +210,11 @@ val_process = [
         training=False,
         cfg=param_config,
     ),
-    L(ToTensor)(keys=["img"], collect_keys=["img_name", "img_path"]),
+    L(ToTensor)(keys=['img'], collect_keys=['img_name', 'img_path']),
 ]
 
 # === Dataloader ===
-dataloader = get_config("config/common/culane.py").dataloader
+dataloader = get_config('config/common/tusimple.py').dataloader
 
 # Override Test Dataloader
 dataloader.test.dataset.processes = val_process
@@ -237,10 +228,4 @@ dataloader.test.num_workers = 4
 dataloader.evaluator.output_basedir = train.output_dir
 dataloader.evaluator.ori_img_h = ori_img_h
 dataloader.evaluator.ori_img_w = ori_img_w
-
-# Create specific config for evaluator with CULane sample_y
-# CULane requires sampling across the image height (590 to 270)
-eval_config = param_config.copy()
-eval_config.sample_y = list(range(590, 270, -10))
-dataloader.evaluator.cfg = eval_config
-dataloader.evaluator.data_root = data_root
+dataloader.evaluator.cfg = param_config

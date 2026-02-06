@@ -1,4 +1,5 @@
 import torch
+
 from .line_iou import line_iou
 
 
@@ -14,9 +15,7 @@ def distance_cost(predictions, targets, img_w):
         ..., 6:
     ]  # repeat_interleave'ing [a, b] 2 times gives [a, a, b, b] ((np + nt) * 78)
 
-    targets = torch.cat(num_priors * [targets])[
-        ..., 6:
-    ]  # applying this 2 times on [c, d] gives [c, d, c, d]
+    targets = torch.cat(num_priors * [targets])[..., 6:]  # applying this 2 times on [c, d] gives [c, d, c, d]
 
     invalid_masks = (targets < 0) | (targets >= img_w)
     lengths = (~invalid_masks).sum(dim=1)
@@ -65,9 +64,7 @@ def dynamic_k_assign(cost, pair_wise_ious):
     dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)
     num_gt = cost.shape[1]
     for gt_idx in range(num_gt):
-        _, pos_idx = torch.topk(
-            cost[:, gt_idx], k=dynamic_ks[gt_idx].item(), largest=False
-        )
+        _, pos_idx = torch.topk(cost[:, gt_idx], k=dynamic_ks[gt_idx].item(), largest=False)
         matching_matrix[pos_idx, gt_idx] = 1.0
     del topk_ious, dynamic_ks, pos_idx
 
@@ -106,9 +103,7 @@ def assign(
 
     # distances cost
     distances_score = distance_cost(predictions, targets, img_w)
-    distances_score = (
-        1 - (distances_score / torch.max(distances_score)) + 1e-2
-    )  # normalize the distance
+    distances_score = 1 - (distances_score / torch.max(distances_score)) + 1e-2  # normalize the distance
 
     # classification cost
     cls_score = focal_cost(predictions[:, :2], targets[:, 1].long())
@@ -120,23 +115,17 @@ def assign(
     prediction_start_xys = predictions[:, 2:4]
     prediction_start_xys[..., 0] *= img_h - 1
 
-    start_xys_score = torch.cdist(prediction_start_xys, target_start_xys, p=2).reshape(
-        num_priors, num_targets
-    )
+    start_xys_score = torch.cdist(prediction_start_xys, target_start_xys, p=2).reshape(num_priors, num_targets)
     start_xys_score = (1 - start_xys_score / torch.max(start_xys_score)) + 1e-2
 
     target_thetas = targets[:, 4].unsqueeze(-1)
     theta_score = (
-        torch.cdist(predictions[:, 4].unsqueeze(-1), target_thetas, p=1).reshape(
-            num_priors, num_targets
-        )
-        * 180
+        torch.cdist(predictions[:, 4].unsqueeze(-1), target_thetas, p=1).reshape(num_priors, num_targets) * 180
     )
     theta_score = (1 - theta_score / torch.max(theta_score)) + 1e-2
 
     cost = (
-        -((distances_score * start_xys_score * theta_score) ** 2) * distance_cost_weight
-        + cls_score * cls_cost_weight
+        -((distances_score * start_xys_score * theta_score) ** 2) * distance_cost_weight + cls_score * cls_cost_weight
     )
 
     iou = line_iou(predictions[..., 6:], targets[..., 6:], img_w, aligned=False)

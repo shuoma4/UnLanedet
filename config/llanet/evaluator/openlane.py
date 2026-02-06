@@ -1,18 +1,19 @@
 import os
 import sys
 
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OPENCV_NUM_THREADS"] = "0"
-os.environ["CV_NUM_THREADS"] = "0"
+# ruff: noqa: E402
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['OPENCV_NUM_THREADS'] = '0'
+os.environ['CV_NUM_THREADS'] = '0'
 
 runtime_num_gpus = 1
-if "--num-gpus" in sys.argv:
+if '--num-gpus' in sys.argv:
     try:
-        idx = sys.argv.index("--num-gpus")
+        idx = sys.argv.index('--num-gpus')
         if idx + 1 < len(sys.argv):
             runtime_num_gpus = int(sys.argv[idx + 1])
     except (ValueError, IndexError):
@@ -25,22 +26,22 @@ TARGET_BATCH_PER_GPU = 40
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
 
-from ..modelzoo import get_config
-from omegaconf import OmegaConf
-from unlanedet.config import LazyCall as L
-from unlanedet.data.transform import *
-from unlanedet.data.transform.res_lane_encoder import (
-    ResLaneEncoder,
-)
 from fvcore.common.param_scheduler import (
-    CosineParamScheduler,
     CompositeParamScheduler,
+    CosineParamScheduler,
     LinearParamScheduler,
 )
-from ..modelzoo import get_config
+from omegaconf import OmegaConf
+
+from unlanedet.config import LazyCall as L
+from unlanedet.data.transform.openlane_generate import (
+    OpenLaneGenerate,
+)
+from unlanedet.data.transform.transforms import ToTensor
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
+
+from ..modelzoo import get_config
 from .model_factory import create_llanet_model
-from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
 
 iou_loss_weight = 2.0
 cls_loss_weight = 2.0
@@ -50,7 +51,7 @@ category_loss_weight = 1.0
 attribute_loss_weight = 0.5
 
 # dynamic assignment weights (Geometry-Aware)
-assign_method_name = "CLRNet"  # Ooptions : GeometryAware or CLRNet
+assign_method_name = 'CLRNet'  # Ooptions : GeometryAware or CLRNet
 w_cls = 2.0
 w_geom = 4.0
 w_iou = 2.0
@@ -81,10 +82,12 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 64
 num_classes = 4 + 1
-data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/"  # openlane 数据集根目录
-lane_anno_dir = "lane3d_300/"  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
-opencv_path = "/home/lixiyang/anaconda3/envs/dataset-manger/lib"  # OpenLane 2d 评估可执行程序链接的opencv库
-dataset_statistics = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"
+data_root = '/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/'  # openlane 数据集根目录
+lane_anno_dir = 'lane3d_300/'  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
+opencv_path = '/home/lixiyang/anaconda3/envs/dataset-manger/lib'  # OpenLane 2d 评估可执行程序链接的opencv库
+dataset_statistics = (
+    '/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz'
+)
 
 use_preprocessed = True  #  是否采取预处理方式
 enable_3d = False  #  是否读取3D数据
@@ -134,7 +137,7 @@ param_config.num_lr_attributes = num_lr_attributes
 param_config.num_priors = num_priors
 
 # Training Config
-train = get_config("config/common/train.py").train
+train = get_config('config/common/train.py').train
 epochs = 30
 train_samples = 45903  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
 batch_size = dynamic_total_batch_size
@@ -143,7 +146,7 @@ total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter * 16
-train.output_dir = "./output/llanet/eval/"
+train.output_dir = './output/llanet/openlane/'
 
 # Model Config
 param_config.featuremap_out_channel = 64  # neck 层输出通道数目
@@ -151,17 +154,15 @@ param_config.fc_hidden_dim = 64  # head层 全连接层隐藏层维度
 param_config.output_dir = train.output_dir  # 输出目录，用于保存模型和日志
 param_config.epoch_per_iter = epoch_per_iter  # 每个epoch的迭代次数
 param_config.assign_method = assign_method_name
-param_config.pretrained_model_name = "mobilenetv4_conv_small"  # 预训练模型名称
+param_config.pretrained_model_name = 'mobilenetv4_conv_small'  # 预训练模型名称
 param_config.enable_category = True
 param_config.enable_attribute = True
 param_config.scale_factor = 20.0
-param_config.detailed_loss_logger_config = dict(
-    output_dir=param_config.output_dir, filename="detailed_metrics.json"
-)
+param_config.detailed_loss_logger_config = dict(output_dir=param_config.output_dir, filename='detailed_metrics.json')
 model = create_llanet_model(param_config)
 
 # Optimizer Config
-optimizer = get_config("config/common/optim.py").AdamW
+optimizer = get_config('config/common/optim.py').AdamW
 optimizer.lr = 3e-4
 optimizer.weight_decay = 1e-3
 lr_multiplier = L(CompositeParamScheduler)(
@@ -170,7 +171,7 @@ lr_multiplier = L(CompositeParamScheduler)(
         L(CosineParamScheduler)(start_value=1.0, end_value=0.1),
     ],
     lengths=[0.3, 0.7],
-    interval_scaling=["rescaled", "rescaled"],
+    interval_scaling=['rescaled', 'rescaled'],
 )
 
 # Transform Config
@@ -178,25 +179,21 @@ lr_multiplier = L(CompositeParamScheduler)(
 if param_config.use_preprocessed:
     base_transforms = []
 else:
-    base_transforms = [
-        dict(
-            name="Resize", parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0
-        )
-    ]
+    base_transforms = [dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0)]
 
 train_transforms = base_transforms + [
-    dict(name="HorizontalFlip", parameters=dict(p=1.0), p=0.5),
-    dict(name="ChannelShuffle", parameters=dict(p=1.0), p=0.1),
+    dict(name='HorizontalFlip', parameters=dict(p=1.0), p=0.5),
+    dict(name='ChannelShuffle', parameters=dict(p=1.0), p=0.1),
     dict(
-        name="MultiplyAndAddToBrightness",
+        name='MultiplyAndAddToBrightness',
         parameters=dict(mul=(0.85, 1.15), add=(-10, 10)),
         p=0.6,
     ),
-    dict(name="AddToHueAndSaturation", parameters=dict(value=(-10, 10)), p=0.7),
+    dict(name='AddToHueAndSaturation', parameters=dict(value=(-10, 10)), p=0.7),
     # === REMOVED SLOW BLURS ===
     # dict(name="OneOf", transforms=[...], p=0.2),
     dict(
-        name="Affine",
+        name='Affine',
         parameters=dict(
             translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)),
             rotate=(-10, 10),
@@ -204,30 +201,30 @@ train_transforms = base_transforms + [
         ),
         p=0.7,
     ),
-    dict(name="Resize", parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
+    dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
 ]
 
 train_process = [
-    L(ResLaneEncoder)(transforms=train_transforms, cfg=param_config, training=True),
+    L(OpenLaneGenerate)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
-        keys=["img", "lane_line", "seg"],
-        collect_keys=["lane_categories", "lane_attributes"],
+        keys=['img', 'lane_line', 'seg'],
+        collect_keys=['lane_categories', 'lane_attributes'],
     ),
 ]
 
 # 验证时的处理
 val_transforms = base_transforms
 val_process = [
-    L(ResLaneEncoder)(
+    L(OpenLaneGenerate)(
         transforms=val_transforms,
         training=False,
         cfg=param_config,
     ),
-    L(ToTensor)(keys=["img"], collect_keys=["img_name", "img_path"]),
+    L(ToTensor)(keys=['img'], collect_keys=['img_name', 'img_path']),
 ]
 
 # Dataloader
-dataloader = get_config("config/common/openlane.py").dataloader
+dataloader = get_config('config/common/openlane.py').dataloader
 dataloader.train.dataset.processes = train_process
 dataloader.train.dataset.data_root = data_root
 dataloader.train.dataset.cut_height = cut_height
@@ -248,15 +245,15 @@ dataloader.test.dataset.cfg = param_config
 dataloader.test.total_batch_size = int(dynamic_total_batch_size / 2)
 dataloader.test.num_workers = safe_workers_per_gpu
 
-param_config.parse_evaluate_result_script = "tools/read_open2d_csv_results.py"
+param_config.parse_evaluate_result_script = 'tools/read_open2d_csv_results.py'
 param_config.generate_visualization = True  # 开启可视化
 dataloader.evaluator = L(OpenLaneEvaluator)(
     cfg=param_config,
-    evaluate_bin_path="/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate",
-    output_dir="/data1/lxy_log/workspace/ms/UnLanedet/output/llanet/eval/eval_results/",
+    evaluate_bin_path='/data1/lxy_log/workspace/ms/UnLanedet/tools/exe/openlane_2d_evaluate',
+    output_dir=f'{train.output_dir}/eval_results/',
     iou_threshold=0.5,
     width=30,
-    metric="OpenLane/F1",
+    metric='OpenLane/F1',
 )
 
 # DDP & AMP

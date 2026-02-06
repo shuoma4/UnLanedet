@@ -1,11 +1,10 @@
 import warnings
 from collections import abc
+
 from .transforms import Preprocess
 
 
-def is_seq_of(seq,
-              expected_type,
-              seq_type = None) -> bool:
+def is_seq_of(seq, expected_type, seq_type=None) -> bool:
     """Check whether it is a sequence of some type.
 
     Args:
@@ -43,6 +42,7 @@ def is_list_of(seq, expected_type):
     A partial method of :func:`is_seq_of`.
     """
     return is_seq_of(seq, expected_type, seq_type=list)
+
 
 class MultiScaleFlipAug:
     """Test-time augmentation with multiple scales and flipping.
@@ -87,36 +87,24 @@ class MultiScaleFlipAug:
             "horizontal".
     """
 
-    def __init__(self,
-                 transforms,
-                 img_scale=None,
-                 scale_factor=None,
-                 flip=False,
-                 flip_direction='horizontal'):
+    def __init__(self, transforms, img_scale=None, scale_factor=None, flip=False, flip_direction='horizontal'):
         self.transforms = Preprocess(transforms)
-        assert (img_scale is None) ^ (scale_factor is None), (
-            'Must have but only one variable can be set')
+        assert (img_scale is None) ^ (scale_factor is None), 'Must have but only one variable can be set'
         if img_scale is not None:
-            self.img_scale = img_scale if isinstance(img_scale,
-                                                     list) else [img_scale]
+            self.img_scale = img_scale if isinstance(img_scale, list) else [img_scale]
             self.scale_key = 'scale'
             assert is_list_of(self.img_scale, tuple)
         else:
-            self.img_scale = scale_factor if isinstance(
-                scale_factor, list) else [scale_factor]
+            self.img_scale = scale_factor if isinstance(scale_factor, list) else [scale_factor]
             self.scale_key = 'scale_factor'
 
         self.flip = flip
-        self.flip_direction = flip_direction if isinstance(
-            flip_direction, list) else [flip_direction]
+        self.flip_direction = flip_direction if isinstance(flip_direction, list) else [flip_direction]
         assert is_list_of(self.flip_direction, str)
         if not self.flip and self.flip_direction != ['horizontal']:
-            warnings.warn(
-                'flip_direction has no effect when flip is set to False')
-        if (self.flip
-                and not any([t['type'] == 'RandomFlip' for t in transforms])):
-            warnings.warn(
-                'flip has no effect when RandomFlip is not in transforms')
+            warnings.warn('flip_direction has no effect when flip is set to False')
+        if self.flip and not any([t['type'] == 'RandomFlip' for t in transforms]):
+            warnings.warn('flip has no effect when RandomFlip is not in transforms')
 
     def __call__(self, results):
         """Call function to apply test time augment transforms on results.
@@ -132,8 +120,7 @@ class MultiScaleFlipAug:
         aug_data = []
         flip_args = [(False, None)]
         if self.flip:
-            flip_args += [(True, direction)
-                          for direction in self.flip_direction]
+            flip_args += [(True, direction) for direction in self.flip_direction]
         for scale in self.img_scale:
             for flip, direction in flip_args:
                 _results = results.copy()

@@ -10,8 +10,8 @@ from unlanedet.model import ResNetWrapper, FPN
 
 # import dataset and transform
 from unlanedet.data.transform import *
-from unlanedet.data.transform.res_lane_encoder import (
-    ResLaneEncoder,
+from unlanedet.data.transform.openlane_generate import (
+    OpenLaneGenerate,
 )
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
 
@@ -149,7 +149,7 @@ train_transforms = [
 ]
 
 train_process = [
-    L(ResLaneEncoder)(transforms=train_transforms, cfg=param_config, training=True),
+    L(OpenLaneGenerate)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
         keys=["img", "lane_line", "seg"],
         collect_keys=["lane_categories", "lane_attributes"],
@@ -158,7 +158,7 @@ train_process = [
 
 val_transforms = base_transforms
 val_process = [
-    L(ResLaneEncoder)(
+    L(OpenLaneGenerate)(
         transforms=val_transforms,
         training=False,
         cfg=param_config,
