@@ -29,6 +29,9 @@ def init_cv():
 
 
 init_cv()
+# debug
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# torch.autograd.set_detect_anomaly(True)  # 开启自动梯度检测，用于调试
 
 
 def do_test(cfg, model):

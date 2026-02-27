@@ -38,17 +38,11 @@ class LaneDecoder(nn.Module):
         """
         device = reg.device
 
-        reg[..., 2] *= self.img_h - 1
-        reg[..., 3] *= self.img_w - 1
-        reg[..., 4] *= 90
-        reg[..., 5] *= self.img_h
-        reg[..., 6:] *= self.img_w - 1
-
-        start_y = reg[..., 2]
-        start_x = reg[..., 3]
-        theta = reg[..., 4]
-        length = reg[..., 5]
-        delta_x = reg[..., 6:]
+        start_y = reg[..., 2] * (self.img_h - 1)
+        start_x = reg[..., 3] * (self.img_w - 1)
+        theta = reg[..., 4] * 90
+        length = reg[..., 5] * (self.img_h - 1)
+        delta_x = reg[..., 6:] * (self.img_w - 1)
 
         if sample_ys is None:
             t = torch.linspace(0, 1, self.num_points, device=device)
@@ -56,6 +50,7 @@ class LaneDecoder(nn.Module):
         else:
             sample_ys = sample_ys.to(device).view(1, 1, -1)
 
+        theta = torch.clamp(theta, -85.0, 85.0)
         tan_theta = torch.tan(torch.deg2rad(theta))
         tan_theta = torch.clamp(tan_theta, -1e3, 1e3)
 

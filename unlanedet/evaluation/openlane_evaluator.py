@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from ..model.LLANet.line_iou import line_iou
+from ..model.LLANet.line_iou import aligned_line_iou
 from .evaluator import DatasetEvaluator
 
 
@@ -40,7 +40,7 @@ def lane_nms(predictions, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920)
         rest_lanes = lane_points[sorted_indices]
 
         # 计算 IoU
-        ious = line_iou(curr_lane, rest_lanes, img_w=img_w, length=30)
+        ious = aligned_line_iou(curr_lane, rest_lanes, img_w, length=30)
 
         # NMS 过滤
         mask = ious < nms_overlap_thresh

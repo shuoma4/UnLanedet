@@ -15,7 +15,7 @@ from .generate_lane_line import (
     GenerateLanePts,
     GenerateSRLaneLine,
 )
-from .generate_seg_label import generate_lane_mask
+from .generate_seg_label import generate_lane_mask, generate_lane_mask_binary
 from .lane_decoder import LaneDecoder
 from .lane_encoder import LaneEncoder
 from .test_time_aug import MultiScaleFlipAug

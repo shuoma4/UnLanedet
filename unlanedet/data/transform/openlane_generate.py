@@ -111,6 +111,8 @@ class OpenLaneGenerate(object):
         for i, lane_pts in enumerate(old_lanes):
             if i >= self.max_lanes:
                 break
+            if len(lane_pts) < 4:
+                continue
             try:
                 reg, end_pt, xs, ys = self.encoder.encode(lane_pts)
             except Exception as e:

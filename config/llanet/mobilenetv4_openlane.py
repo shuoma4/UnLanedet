@@ -23,7 +23,7 @@ if '--num-gpus' in sys.argv:
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 40
+TARGET_BATCH_PER_GPU = 64
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
@@ -66,8 +66,8 @@ sample_y = SAMPLE_YS_EQUIDISTANT
 num_points = int(len(sample_y))  # 偏移采样点
 max_lanes = 24  # 最大车道数
 num_priors = 96  # 车道线候选框数目
-num_lane_categories = 15  # 车道线类别数目
-num_lr_attributes = 4  # 车道线左右属性数目
+num_lane_categories = 14 + 1  # 车道线类别数目
+num_lr_attributes = 4 + 1  # 车道线左右属性数目
 test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
 
 ori_img_w = 1920
@@ -142,7 +142,7 @@ param_config.decoder = L(LaneDecoder)(cfg=param_config)
 # Training Config
 train = get_config('config/common/train.py').train
 epochs = 30
-train_samples = 45903  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
+train_samples = 142226  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
 batch_size = dynamic_total_batch_size
 epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs
@@ -265,7 +265,7 @@ train.ddp = dict(
     find_unused_parameters=True,
     fp16_compression=False,
 )
-train.amp = dict(enabled=False)
+train.amp = dict(enabled=True)
 
 # 增加梯度裁剪 (防止 Loss 突变)
 train.clip_grad = dict(max_norm=10.0, norm_type=2)

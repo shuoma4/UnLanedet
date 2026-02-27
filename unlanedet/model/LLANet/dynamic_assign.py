@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .line_iou import line_iou
+from .line_iou import pairwise_line_iou
 
 
 def focal_cost(cls_pred, gt_labels, alpha=0.25, gamma=2, eps=1e-12):
@@ -86,32 +86,68 @@ class GeometryAwareAssign(nn.Module):
                 (batch_size, num_priors), -1, dtype=torch.long, device=device
             )
 
-        pred_logits = preds[..., :2]
-        pred_scores = F.softmax(pred_logits, dim=-1)[..., 1]
         pred_start_y = preds[..., 2]
         pred_start_x = preds[..., 3]
         pred_theta = preds[..., 4]
+        pred_delta_x = preds[..., 6:]
+
+        if sample_ys is None:
+            sample_ys = torch.linspace(0, 1, steps=pred_delta_x.shape[-1], device=device)
+            sample_ys = sample_ys.view(1, 1, -1) * (img_h - 1)
+        else:
+            sample_ys = sample_ys.to(device).view(1, 1, -1)
+
+        pred_tan_theta = torch.tan(torch.deg2rad(pred_theta))
+        pred_tan_theta = torch.clamp(pred_tan_theta, -1e3, 1e3)
+        pred_x_prior = pred_start_x.unsqueeze(-1) + (pred_start_y.unsqueeze(-1) - sample_ys) * pred_tan_theta.unsqueeze(
+            -1
+        )
+        pred_xs_abs = pred_x_prior + pred_delta_x
+
         gt_start_y = targets[..., 2]
         gt_start_x = targets[..., 3]
         gt_theta = targets[..., 4]
-        pred_start_x_pixel = pred_start_x * (img_w - 1)
-        gt_start_x_pixel = gt_start_x * (img_w - 1)
-        delta_x = pred_start_x_pixel.unsqueeze(2) - gt_start_x_pixel.unsqueeze(1)
-        delta_y = (pred_start_y.unsqueeze(2) - gt_start_y.unsqueeze(1)) * (img_h - 1)
+        gt_delta_x = targets[..., 6:]
+
+        gt_tan_theta = torch.tan(torch.deg2rad(gt_theta))
+        gt_tan_theta = torch.clamp(gt_tan_theta, -1e3, 1e3)
+        gt_x_prior = gt_start_x.unsqueeze(-1) + (gt_start_y.unsqueeze(-1) - sample_ys) * gt_tan_theta.unsqueeze(-1)
+        gt_xs_abs = gt_x_prior + gt_delta_x  # Absolute Pixel Coordinates
+
+        invalid_mask = gt_delta_x < -1e4
+        gt_xs_abs[invalid_mask] = -1e5
+
+        pred_logits = preds[..., :2]
+        pred_scores = F.softmax(pred_logits, dim=-1)[..., 1]
+
+        gt_start_y_norm = gt_start_y / (img_h - 1)
+        gt_start_x_norm = gt_start_x / (img_w - 1)
+
+        pred_start_y_norm = preds[..., 2] / (img_h - 1)
+        pred_start_x_norm = preds[..., 3] / (img_w - 1)
+
+        delta_x = pred_start_x_norm.unsqueeze(2) - gt_start_x_norm.unsqueeze(1)
+        delta_y = pred_start_y_norm.unsqueeze(2) - gt_start_y_norm.unsqueeze(1)
         dist_cost = torch.sqrt(delta_x.pow(2) + delta_y.pow(2) + 1e-8)
-        dist_cost = dist_cost / (img_w - 1)  # Normalize to 0-1 scale
-        theta_cost = torch.abs(pred_theta.unsqueeze(2) - gt_theta.unsqueeze(1))
+
+        gt_theta_norm = gt_theta / 90.0
+        pred_theta_norm = preds[..., 4] / 90.0
+        theta_cost = torch.abs(pred_theta_norm.unsqueeze(2) - gt_theta_norm.unsqueeze(1))
+
         geom_cost = self.w_dist * dist_cost + self.w_theta * theta_cost
         cls_cost = -torch.log(pred_scores.unsqueeze(2).clamp(min=1e-8))
-        pred_lines = preds[..., 6:] * (img_w - 1)
-        gt_lines = targets[..., 6:] * (img_w - 1)
+
+        # 4. IoU Cost (Pixel Space)
         n_offsets = preds.shape[-1] - 6
         offset_index = torch.arange(n_offsets, device=device).view(1, 1, -1)
-        pred_start_idx = (1.0 - pred_start_y) * (n_offsets - 1)
-        pred_len_idx = preds[..., 5] * (n_offsets - 1)
+        # approximate index from physical start_y
+        pred_start_idx = (1.0 - (preds[..., 2] / (img_h - 1))) * (n_offsets - 1)
+        # approximate length in indices from physical length
+        pred_len_idx = (preds[..., 5] / img_h) * (n_offsets - 1)
         pred_mask = (offset_index >= pred_start_idx.unsqueeze(-1)) & (
             offset_index <= (pred_start_idx + pred_len_idx).unsqueeze(-1)
         )
+
         ious_list = []
         for i in range(batch_size):
             valid_gt_mask = masks[i].bool()
@@ -119,19 +155,18 @@ class GeometryAwareAssign(nn.Module):
             if num_valid == 0:
                 ious_list.append(torch.zeros(num_priors, max_targets, device=device))
                 continue
-            cur_pred = pred_lines[i]
-            cur_gt = gt_lines[i, :num_valid]
-            l_iou = line_iou(
-                cur_pred,
-                cur_gt,
-                img_w,
-                length=15,
-                aligned=False,
-                pred_mask=pred_mask[i],
-            )
+
+            cur_pred = pred_xs_abs[i].clone()
+            cur_pred[~pred_mask[i]] = -1e5
+
+            # Fix: Select valid targets using mask, not slicing (handles non-contiguous valid targets)
+            cur_gt = gt_xs_abs[i][valid_gt_mask]
+
+            l_iou = pairwise_line_iou(cur_pred, cur_gt, length=15, invalid_value=-1e5)
             l_iou = torch.nan_to_num(l_iou, nan=0.0)
             padded_iou = torch.zeros(num_priors, max_targets, device=device)
-            padded_iou[:, :num_valid] = l_iou
+            # Fix: Place IoUs back to correct positions
+            padded_iou[:, valid_gt_mask] = l_iou
             ious_list.append(padded_iou)
         pair_wise_ious = torch.stack(ious_list)
         iou_cost = 1.0 - pair_wise_ious
@@ -148,15 +183,20 @@ class GeometryAwareAssign(nn.Module):
         matched_targets_matrix = torch.full((batch_size, num_priors), -1, dtype=torch.long, device=device)
         matched_min_costs = torch.full((batch_size, num_priors), 1e8, dtype=torch.float32, device=device)
         for b in range(batch_size):
-            num_gt = int(masks[b].sum())
+            valid_gt_idxs = torch.where(masks[b])[0]
+            num_gt = len(valid_gt_idxs)
             if num_gt == 0:
                 continue
-            cost_b = total_cost[b, :, :num_gt]
-            k_b = dynamic_ks[b, :num_gt]
-            for gt_idx in range(num_gt):
-                k = k_b[gt_idx].item()
+
+            # Fix: Use valid indices to slice cost and k
+            cost_b = total_cost[b][:, valid_gt_idxs]
+            k_b = dynamic_ks[b][valid_gt_idxs]
+
+            for i, gt_idx in enumerate(valid_gt_idxs):
+                gt_idx = gt_idx.item()
+                k = k_b[i].item()
                 k = max(1, min(k, num_priors))
-                current_costs = cost_b[:, gt_idx]
+                current_costs = cost_b[:, i]
                 topk_costs, pos_idx = torch.topk(current_costs, k, largest=False)
                 current_min_costs = matched_min_costs[b, pos_idx]
                 update_mask = topk_costs < current_min_costs
@@ -170,22 +210,16 @@ class GeometryAwareAssign(nn.Module):
 
 
 class CLRNetAssign(nn.Module):
-    """
-    [方案 B] CLRNet 风格的动态分配器 (Similarity-based SimOTA) - 乘法 Cost 模型
-    特点：Cost = -(Dist_Score * XY_Score * Theta_Score)^2 * w_reg + w_cls * Cls
-    优化点：适配 Batch 处理，优化内存，增加动态权重
-    """
-
     def __init__(self, cfg=None):
-        super(CLRNetAssign, self).__init__()
-        self.simota_q = 10
+        super().__init__()
         self.w_reg = 3.0
-        self.target_w_cls = 1.0
+        self.w_cls = 1.0
+        self.simota_q = 4
 
     def forward(
         self,
-        preds,  # [B, N, C]
-        targets,  # [B, M, C]
+        preds,  # [B, N, C] 真实坐标
+        targets,  # [B, M, C] 真实坐标
         masks,  # [B, M]
         img_w,
         img_h,
@@ -193,81 +227,83 @@ class CLRNetAssign(nn.Module):
         sample_ys=None,
     ):
         device = preds.device
-        batch_size, num_priors = preds.shape[0], preds.shape[1]
-        num_targets = targets.shape[1]  # M
-        if num_targets == 0:
-            return (
-                torch.zeros((batch_size, num_priors), device=device, dtype=torch.bool),
-                torch.zeros((batch_size, num_priors), device=device, dtype=torch.long),
+        B, N, _ = preds.shape
+
+        assigned_mask = torch.zeros((B, N), dtype=torch.bool, device=device)
+        matched_targets_matrix = torch.full((B, N), -1, dtype=torch.long, device=device)
+
+        for b in range(B):
+            valid_mask = masks[b].bool()
+            if valid_mask.sum() == 0:
+                continue
+
+            pred = preds[b].detach()  # [N, C]
+            tgt = targets[b][valid_mask].detach()  # [M, C]
+            num_priors = pred.shape[0]
+            num_targets = tgt.shape[0]
+
+            # ===== Distance cost (offset 序列距离)=====
+            distances = torch.abs(pred[:, None, 6:] - tgt[None, :, 6:])  # [N, M, L]
+            invalid_mask = (tgt[None, :, 6:] < 0) | (tgt[None, :, 6:] >= img_w)  # [1, M, L]
+            valid_len = (~invalid_mask).sum(dim=-1).clamp(min=1)
+            distances = distances.masked_fill(invalid_mask, 0.0)
+            distances = distances.sum(dim=-1) / (valid_len.float() + 1e-6)
+
+            distances_score = 1 - distances / distances.max().clamp(min=1e-6) + 1e-2
+
+            # ===== 分类 cost =====
+            cls_cost = focal_cost(pred[:, :2], tgt[:, 1].long())  # [N, M]
+
+            # ===== 起点坐标 cost =====
+            start_dists = torch.cdist(pred[:, 2:4], tgt[:, 2:4], p=2)
+            start_xys_score = 1 - start_dists / start_dists.max().clamp(min=1e-6) + 1e-2
+
+            # ===== 角度 cost =====
+            theta_dists = torch.cdist(pred[:, 4].unsqueeze(-1), tgt[:, 4].unsqueeze(-1), p=1)
+            theta_score = 1 - theta_dists / theta_dists.max().clamp(min=1e-6) + 1e-2
+
+            # ===== 总 cost =====
+            cost = -((distances_score * start_xys_score * theta_score) ** 2) * self.w_reg + cls_cost * self.w_cls
+
+            # ===== IoU =====
+            iou = pairwise_line_iou(pred[:, 6:], tgt[:, 6:], img_w, length=15)  # [N, M]
+
+            # ===== dynamic-k（向量化）=====
+            iou_matrix = iou.clamp(min=0.0)
+            topk_ious, _ = torch.topk(iou_matrix, k=min(self.simota_q, num_priors), dim=0)
+            dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)
+
+            max_k = dynamic_ks.max().item()
+            cost_t = cost.t()  # [M, N]
+            _, topk_indices = torch.topk(cost_t, k=max_k, dim=1, largest=False)
+
+            grid = torch.arange(max_k, device=device).view(1, -1)
+            select_mask = grid < dynamic_ks.view(-1, 1)
+
+            matching_matrix = torch.zeros_like(cost)
+            matching_matrix.scatter_(
+                0,
+                topk_indices.t(),
+                select_mask.t().float(),
             )
-        matched_targets_matrix = torch.full((batch_size, num_priors), -1, dtype=torch.long, device=device)
-        preds_abs = preds.clone()
-        preds_abs[..., 3] *= img_w - 1
-        preds_abs[..., 6:] *= img_w - 1
-        targets_abs = targets.clone()
-        targets_abs[..., 3] *= img_w - 1
-        targets_abs[..., 6:] *= img_w - 1
-        target_valid_mask = (targets_abs[..., 6:] >= 0) & (targets_abs[..., 6:] < img_w)
-        combined_mask = target_valid_mask.unsqueeze(1)
-        combined_len = combined_mask.sum(dim=3).float().clamp(min=1.0)  # [B, 1, M]
-        diff = torch.abs(preds_abs[..., 6:].unsqueeze(2) - targets_abs[..., 6:].unsqueeze(1))
-        diff = diff * combined_mask
-        distances = diff.sum(dim=3) / combined_len  # [B, N, M]
-        dist_max = distances.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
-        distances_score = 1 - (distances / dist_max) + 1e-2
-        cur_pred_start = preds_abs[..., 2:4].clone()
-        cur_pred_start[..., 0] *= img_h - 1
-        cur_target_start = targets_abs[..., 2:4].clone()
-        cur_target_start[..., 0] *= img_h - 1
-        start_dists = torch.cdist(cur_pred_start, cur_target_start, p=2)
-        start_max = start_dists.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
-        start_xys_score = 1 - (start_dists / start_max) + 1e-2
-        cur_pred_theta = preds_abs[..., 4].unsqueeze(2)  # [B, N, 1]
-        cur_target_theta = targets_abs[..., 4].unsqueeze(1)  # [B, 1, M]
-        theta_dists = torch.abs(cur_pred_theta - cur_target_theta) * 180
-        theta_max = theta_dists.amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
-        theta_score = 1 - (theta_dists / theta_max) + 1e-2
-        gt_labels = targets_abs[..., 1].long()  # [B, M]
-        cls_cost = focal_cost(preds_abs[..., :2], gt_labels)  # [B, N, M]
-        reg_score = distances_score.clamp(min=1e-3) * start_xys_score.clamp(min=1e-3) * theta_score.clamp(min=1e-3)
-        total_cost = -(reg_score**2) * self.w_reg + cls_cost * 1.0
-        valid_targets_mask = masks.unsqueeze(1).expand(-1, num_priors, -1).bool()
-        total_cost[~valid_targets_mask] = 1e8  # Assign high cost to invalid targets
 
-        l_iou = line_iou(
-            preds_abs[..., 6:],
-            targets_abs[..., 6:],
-            img_w,
-            length=15,
-            aligned=False,
-        )
-        l_iou = torch.nan_to_num(l_iou, nan=0.0)
-        l_iou[~valid_targets_mask] = 0.0
+            matched_gt = matching_matrix.sum(1)
+            conflict = matched_gt > 1
+            if conflict.any():
+                min_cost_idx = cost[conflict].argmin(dim=1)
+                matching_matrix[conflict] *= 0.0
+                matching_matrix[conflict, min_cost_idx] = 1.0
 
-        n_candidate_k = min(4, num_priors)
-        topk_ious, _ = torch.topk(l_iou, n_candidate_k, dim=1)  # [B, K, M]
-        dynamic_ks = torch.clamp(topk_ious.sum(1).int(), min=1)  # [B, M]
-        dynamic_ks[~masks.bool()] = 0
-        max_k = n_candidate_k
+            prior_idx = matching_matrix.sum(1).nonzero().flatten()
+            gt_idx_relative = matching_matrix[prior_idx].argmax(dim=1)
 
-        if max_k > 0:
-            _, topk_indices = torch.topk(total_cost, k=max_k, dim=1, largest=False)
-            grid = torch.arange(max_k, device=device).view(1, -1, 1)
-            selection_mask = grid < dynamic_ks.unsqueeze(1)
-            matching_matrix = torch.zeros((batch_size, num_priors, num_targets), device=device)
-            matching_matrix.scatter_(1, topk_indices, selection_mask.float())
-            matched_counts = matching_matrix.sum(dim=2)  # [B, N]
-            conflict_mask = matched_counts > 1  # [B, N]
-            if conflict_mask.any():
-                masked_cost = total_cost.clone()
-                masked_cost[matching_matrix == 0] = float('inf')
-                best_target_idx = masked_cost.argmin(dim=2)  # [B, N]
-                new_matches = F.one_hot(best_target_idx, num_classes=num_targets).float()
-                matching_matrix[conflict_mask] = new_matches[conflict_mask]
-            has_match = matching_matrix.sum(dim=2) > 0.5
-            target_indices = matching_matrix.argmax(dim=2)
-            matched_targets_matrix[has_match] = target_indices[has_match]
-        assigned_mask = matched_targets_matrix >= 0
+            # Map back to original indices
+            valid_gt_idxs = torch.where(valid_mask)[0]
+            gt_idx_original = valid_gt_idxs[gt_idx_relative]
+
+            assigned_mask[b, prior_idx] = True
+            matched_targets_matrix[b, prior_idx] = gt_idx_original
+
         return assigned_mask, matched_targets_matrix
 
 
@@ -277,18 +313,18 @@ def assign(preds, targets, masks, img_w, img_h, cfg=None, current_iter=0, sample
         preds (Tensor): 网络输出预测张量
             [B, N, C]，其中：
             - C 前 2 维：分类 logits(0-背景logits, 1-车道线logits)
-            - C 第 2 维：起点 y, 归一化到[0, 1]
-            - C 第 3 维：起点 x, 归一化到[0, 1]
-            - C 第 4 维：车道线角度 归一化到[-1, 1]
-            - C 第 5 维：车道线长度 归一化到[0, 1]
-            - C 第 6:  : 各条 strip 上的横向坐标偏移，归一化到[-1, 1]
+            - C 第 2 维：起点 y, pts
+            - C 第 3 维：起点 x, pts
+            - C 第 4 维：车道线角度 theta(-90~90°)
+            - C 第 5 维：车道线长度, 归一化到, pts
+            - C 第 6:  : 各条 strip 上的横向坐标偏移, pts
 
         targets (Tensor): GT 车道线参数
             [B, M, C]，其中：
             - C 前 2 维：分类 logits(0-背景logits, 1-车道线logits)
             - C 第 2 维：起点 y, pts
             - C 第 3 维：起点 x, pts
-            - C 第 4 维：车道线角度 theta(-90~90°), <0为左倾, >0为右倾, 0为垂直
+            - C 第 4 维：车道线角度 theta(-90~90°)
             - C 第 5 维：车道线长度, pts
             - C 第 6:  : 各条 strip 上的横向坐标偏移, pts
 

@@ -1,31 +1,33 @@
-import os.path as osp
-import json
-import numpy as np
-import cv2
 import glob
-import pickle
-from tqdm import tqdm
-from .base_dataset import BaseDataset
+import json
 import logging
-from .transform import generate_lane_mask
+import os.path as osp
+import pickle
+
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+from .base_dataset import BaseDataset
+from .transform import generate_lane_mask_binary
 
 # OpenLane 官方类别映射
 LANE_CATEGORIES = {
-    0: "unknown",  # 未知
-    1: "white-dash",  # 白色虚线
-    2: "white-solid",  # 白色实线
-    3: "double-white-dash",  # 双白虚线
-    4: "double-white-solid",  # 双白实线
-    5: "white-ldash-rsolid",  # 左白虚右白实
-    6: "white-lsolid-rdash",  # 左白实右白虚
-    7: "yellow-dash",  # 黄色虚线
-    8: "yellow-solid",  # 黄色实线
-    9: "double-yellow-dash",  # 双黄虚线
-    10: "double-yellow-solid",  # 双黄实线
-    11: "yellow-ldash-rsolid",  # 左黄虚右黄实
-    12: "yellow-lsolid-rdash",  # 左黄实右黄虚
-    13: "left-curbside",  # 左侧路缘
-    14: "right-curbside",  # 右侧路缘
+    0: 'unknown',  # 未知
+    1: 'white-dash',  # 白色虚线
+    2: 'white-solid',  # 白色实线
+    3: 'double-white-dash',  # 双白虚线
+    4: 'double-white-solid',  # 双白实线
+    5: 'white-ldash-rsolid',  # 左白虚右白实
+    6: 'white-lsolid-rdash',  # 左白实右白虚
+    7: 'yellow-dash',  # 黄色虚线
+    8: 'yellow-solid',  # 黄色实线
+    9: 'double-yellow-dash',  # 双黄虚线
+    10: 'double-yellow-solid',  # 双黄实线
+    11: 'yellow-ldash-rsolid',  # 左黄虚右黄实
+    12: 'yellow-lsolid-rdash',  # 左黄实右黄虚
+    13: 'left-curbside',  # 左侧路缘
+    14: 'right-curbside',  # 右侧路缘
 }
 
 VALID_LANE_CATEGORIES = {
@@ -47,11 +49,11 @@ VALID_LANE_CATEGORIES = {
 }
 
 LANE_ATTRIBUTES = {
-    0: "unknown",  # 未知
-    1: "left-left",  # 左2车道
-    2: "left",  # 左1车道
-    3: "right",  # 右1车道
-    4: "right-right",  # 左2车道
+    0: 'unknown',  # 未知
+    1: 'left-left',  # 左2车道
+    2: 'left',  # 左1车道
+    3: 'right',  # 右1车道
+    4: 'right-right',  # 左2车道
 }
 
 
@@ -94,11 +96,11 @@ class OpenLane(BaseDataset):
         super().__init__(data_root, split, cut_height, processes=processes, cfg=cfg)
         self.cfg = cfg if cfg is not None else {}
         # 基本参数
-        self.use_preprocessed = self.cfg.get("use_preprocessed", False)
-        self.img_w = self.cfg.get("img_w", 800)
-        self.img_h = self.cfg.get("img_h", 320)
-        self.max_lanes = self.cfg.get("max_lanes", 24)
-        self.enable_3d = self.cfg.get("enable_3d", True)
+        self.use_preprocessed = self.cfg.get('use_preprocessed', False)
+        self.img_w = self.cfg.get('img_w', 800)
+        self.img_h = self.cfg.get('img_h', 320)
+        self.max_lanes = self.cfg.get('max_lanes', 24)
+        self.enable_3d = self.cfg.get('enable_3d', True)
         # 图像尺寸
         self.ori_w, self.ori_h = 1920, 1280
         self.cut_height = cut_height
@@ -107,64 +109,64 @@ class OpenLane(BaseDataset):
         self.h_scale = self.img_h / self.valid_ori_h
         self.w_scale = self.img_w / self.ori_w
         # 缓存文件路径
-        lane_anno_dir = self.cfg.get("lane_anno_dir", "lane3d_300/")
-        if "300" in lane_anno_dir:
-            name_part = "lane3d_300"
-        elif "1000" in lane_anno_dir:
-            name_part = "lane3d_1000"
+        lane_anno_dir = self.cfg.get('lane_anno_dir', 'lane3d_300/')
+        if '300' in lane_anno_dir:
+            name_part = 'lane3d_300'
+        elif '1000' in lane_anno_dir:
+            name_part = 'lane3d_1000'
         else:
-            name_part = "unknown"
+            name_part = 'unknown'
         self.cache_path = osp.join(
             data_root,
-            f"openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v1.pkl",
+            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v1.pkl',
         )
         self.data_infos = self.load_annotations(split)
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"加载 {split} 数据集完成: {len(self.data_infos)} 个样本")
+        self.logger.info(f'加载 {split} 数据集完成: {len(self.data_infos)} 个样本')
 
     def load_annotations(self, split):
         """加载数据标注"""
         if osp.exists(self.cache_path):
-            self.logger.info(f"从缓存加载: {self.cache_path}")
-            with open(self.cache_path, "rb") as f:
+            self.logger.info(f'从缓存加载: {self.cache_path}')
+            with open(self.cache_path, 'rb') as f:
                 data_infos = pickle.load(f)
             return data_infos
-        self.logger.info(f"生成新的缓存: {split}")
+        self.logger.info(f'生成新的缓存: {split}')
         data_infos = self._generate_cache(split)
-        with open(self.cache_path, "wb") as f:
+        with open(self.cache_path, 'wb') as f:
             pickle.dump(data_infos, f)
-        self.logger.info(f"缓存已保存: {self.cache_path}")
+        self.logger.info(f'缓存已保存: {self.cache_path}')
         return data_infos
 
     def _generate_cache(self, split):
-        lane_anno_dir = self.cfg.get("lane_anno_dir", "lane3d_300/")
-        sub_dir = "training" if split == "train" else "validation"
+        lane_anno_dir = self.cfg.get('lane_anno_dir', 'lane3d_300/')
+        sub_dir = 'training' if split == 'train' else 'validation'
         anno_dir = osp.join(self.data_root, lane_anno_dir, sub_dir)
         # 查找所有JSON文件
-        json_files = glob.glob(osp.join(anno_dir, "**/*.json"), recursive=True)
-        self.logger.info(f"找到 {len(json_files)} 个JSON文件")
+        json_files = glob.glob(osp.join(anno_dir, '**/*.json'), recursive=True)
+        self.logger.info(f'找到 {len(json_files)} 个JSON文件')
         data_infos = []
         processed_count = 0
         img_invalid_count = 0
         no_lanes_count = 0
         error_count = 0
-        for json_path in tqdm(json_files, desc=f"处理 {split} 数据"):
+        for json_path in tqdm(json_files, desc=f'处理 {split} 数据'):
             try:
-                with open(json_path, "r") as f:
+                with open(json_path, 'r') as f:
                     anno = json.load(f)
                 # 获取文件路径
-                rel_file_path = anno.get("file_path", "")
+                rel_file_path = anno.get('file_path', '')
                 if not rel_file_path:
                     continue
                 # 构建图像路径
                 if self.use_preprocessed:
-                    parts = rel_file_path.split("/")
+                    parts = rel_file_path.split('/')
                     if len(parts) >= 2:
                         split_name = parts[0]  # training 或 validation
-                        rest_path = "/".join(parts[1:])
+                        rest_path = '/'.join(parts[1:])
                         img_path = osp.join(
                             self.data_root,
-                            f"{split_name}_resized_{self.img_w}_{self.img_h}",
+                            f'{split_name}_resized_{self.img_w}_{self.img_h}',
                             rest_path,
                         )
                     else:
@@ -182,27 +184,26 @@ class OpenLane(BaseDataset):
                 categories = []
                 attributes = []
                 track_ids = []
-                for lane_info in anno.get("lane_lines", []):
-                    uv = lane_info.get("uv", [])
+                for lane_info in anno.get('lane_lines', []):
+                    uv = lane_info.get('uv', [])
                     if len(uv) != 2 or len(uv[0]) == 0:
                         continue
                     # 处理2D车道线点
-                    lane_points, visibility = self.process_lane_points(
-                        uv[0], uv[1], lane_info.get("visibility")
-                    )
+                    lane_points, visibility = self.process_lane_points(uv[0], uv[1], lane_info.get('visibility'))
                     if lane_points is not None and len(lane_points) >= 2:
                         lanes.append(lane_points)
                         visibilities.append(visibility)
-                        categories.append(
-                            VALID_LANE_CATEGORIES.get(lane_info.get("category", 0), 0)
-                        )
-                        attributes.append(lane_info.get("attribute", 0))
-                        track_ids.append(lane_info.get("track_id", -1))
+                        categories.append(VALID_LANE_CATEGORIES.get(lane_info.get('category', 0), 0))
+                        attributes.append(lane_info.get('attribute', 0))
+                        track_ids.append(lane_info.get('track_id', -1))
 
-                        xyz = lane_info.get("xyz", [])
+                        xyz = lane_info.get('xyz', [])
                         if len(xyz) == 3 and len(xyz[0]) > 0:
                             lane_3d_points = self.process_3d_points(
-                                xyz[0], xyz[1], xyz[2], uv[1]  # 使用2D的v坐标过滤
+                                xyz[0],
+                                xyz[1],
+                                xyz[2],
+                                uv[1],  # 使用2D的v坐标过滤
                             )
                             lanes_3d.append(lane_3d_points)
                         else:
@@ -214,50 +215,46 @@ class OpenLane(BaseDataset):
 
                 # 构建样本
                 sample = {
-                    "img_path": img_path,  # 用于训练的图片完整路径(无论是否经过预处理)
-                    "origin_img_path": osp.join(
-                        self.data_root, rel_file_path
-                    ),  # 原图路径(相对于data_root)
-                    "lanes": lanes,  # 2D车道线坐标
-                    "lanes_3d": lanes_3d,  # 3D车道线坐标
-                    "lane_vis": visibilities,  # 可见性信息
-                    "lane_categories": categories,  # 车道线类别
-                    "lane_attributes": attributes,  # 车道线属性
-                    "lane_track_ids": track_ids,  # 时序tracking ID
-                    "json_path": json_path,  # 标注文件路径
+                    'img_path': img_path,  # 用于训练的图片完整路径(无论是否经过预处理)
+                    'origin_img_path': osp.join(self.data_root, rel_file_path),  # 原图路径(相对于data_root)
+                    'lanes': lanes,  # 2D车道线坐标
+                    'lanes_3d': lanes_3d,  # 3D车道线坐标
+                    'lane_vis': visibilities,  # 可见性信息
+                    'lane_categories': categories,  # 车道线类别
+                    'lane_attributes': attributes,  # 车道线属性
+                    'lane_track_ids': track_ids,  # 时序tracking ID
+                    'json_path': json_path,  # 标注文件路径
                 }
 
                 # 添加相机参数
-                intrinsic = anno.get("intrinsic")
-                extrinsic = anno.get("extrinsic")
+                intrinsic = anno.get('intrinsic')
+                extrinsic = anno.get('extrinsic')
                 if intrinsic is not None:
-                    sample["intrinsic"] = np.array(intrinsic, dtype=np.float32)
+                    sample['intrinsic'] = np.array(intrinsic, dtype=np.float32)
                 else:
-                    sample["intrinsic"] = None
+                    sample['intrinsic'] = None
                 if extrinsic is not None:
-                    sample["extrinsic"] = np.array(extrinsic, dtype=np.float32)
+                    sample['extrinsic'] = np.array(extrinsic, dtype=np.float32)
                 else:
-                    sample["extrinsic"] = None
+                    sample['extrinsic'] = None
                 # 添加位姿
-                pose = anno.get("pose")
+                pose = anno.get('pose')
                 if pose is not None:
-                    sample["pose"] = np.array(pose, dtype=np.float32)
+                    sample['pose'] = np.array(pose, dtype=np.float32)
                 else:
-                    sample["pose"] = None
+                    sample['pose'] = None
                 data_infos.append(sample)
                 processed_count += 1
 
             except Exception as e:
                 error_count += 1
                 if error_count <= 10:  # 只打印前10个错误
-                    self.logger.info(f"处理 {json_path} 时出错: {str(e)[:200]}")
+                    self.logger.info(f'处理 {json_path} 时出错: {str(e)[:200]}')
                 continue
 
-        self.logger.info(f"成功处理 {processed_count} 个样本, 错误 {error_count} 个")
-        self.logger.info(f"{img_invalid_count} 个图像无效样本")
-        self.logger.info(
-            f"{no_lanes_count} 个无车道线或者无有效车道线样本(车道线点数目少于两个)"
-        )
+        self.logger.info(f'成功处理 {processed_count} 个样本, 错误 {error_count} 个')
+        self.logger.info(f'{img_invalid_count} 个图像无效样本')
+        self.logger.info(f'{no_lanes_count} 个无车道线或者无有效车道线样本(车道线点数目少于两个)')
         return data_infos
 
     def process_lane_points(self, u_coords, v_coords, visibility=None):
@@ -270,11 +267,7 @@ class OpenLane(BaseDataset):
         u = np.array(u_coords, dtype=np.float32)
         v = np.array(v_coords, dtype=np.float32)
         # 处理可见性
-        if (
-            visibility is None
-            or not isinstance(visibility, list)
-            or len(visibility) != len(u)
-        ):
+        if visibility is None or not isinstance(visibility, list) or len(visibility) != len(u):
             vis = np.ones_like(u, dtype=np.float32)
         else:
             # 确保可见性数组长度与坐标一致
@@ -335,40 +328,38 @@ class OpenLane(BaseDataset):
         if idx >= len(self.data_infos):
             idx = idx % len(self.data_infos)
         data_info = self.data_infos[idx]
-        img = cv2.imread(data_info["img_path"])
+        img = cv2.imread(data_info['img_path'])
         # 裁剪天空区域（如果是原始图像），此处无需再resize
         if not self.use_preprocessed:
             img = img[self.cut_height :, :, :]
         # 调整图像尺寸（如果是原始图像）
-        if not self.use_preprocessed and (
-            img.shape[0] != self.img_h or img.shape[1] != self.img_w
-        ):
+        if not self.use_preprocessed and (img.shape[0] != self.img_h or img.shape[1] != self.img_w):
             img = cv2.resize(img, (self.img_w, self.img_h))
         # 生成分割掩码
-        mask = generate_lane_mask(img, data_info["lanes"], data_info["lane_categories"])
+        mask = generate_lane_mask_binary(img, data_info['lanes'])
         # 构建样本
         sample = {
-            "img": img,
-            "lanes": data_info["lanes"],  # 2D车道线坐标
-            "mask": mask,  # 车道线分割掩码
-            "lane_vis": data_info["lane_vis"],  # 可见性信息
-            "lane_categories": data_info["lane_categories"],  # 车道线类别
-            "lane_attributes": data_info["lane_attributes"],  # 车道线属性
-            "lane_track_ids": data_info["lane_track_ids"],  # 时序tracking ID
-            "img_path": data_info["img_path"],  # 图片完整路径(无论是否经过预处理)
-            "origin_img_path": data_info["origin_img_path"],
-            "intrinsic": data_info["intrinsic"],  # 相机内参
-            "extrinsic": data_info["extrinsic"],  # 相机外参
-            "pose": data_info["pose"],  # 相机位姿
+            'img': img,
+            'lanes': data_info['lanes'],  # 2D车道线坐标
+            'mask': mask,  # 车道线分割掩码
+            'lane_vis': data_info['lane_vis'],  # 可见性信息
+            'lane_categories': data_info['lane_categories'],  # 车道线类别
+            'lane_attributes': data_info['lane_attributes'],  # 车道线属性
+            'lane_track_ids': data_info['lane_track_ids'],  # 时序tracking ID
+            'img_path': data_info['img_path'],  # 图片完整路径(无论是否经过预处理)
+            'origin_img_path': data_info['origin_img_path'],
+            'intrinsic': data_info['intrinsic'],  # 相机内参
+            'extrinsic': data_info['extrinsic'],  # 相机外参
+            'pose': data_info['pose'],  # 相机位姿
         }
         # 添加3D车道线（如果存在）
-        if self.enable_3d and "lanes_3d" in data_info:
-            sample["lanes_3d"] = data_info["lanes_3d"]
+        if self.enable_3d and 'lanes_3d' in data_info:
+            sample['lanes_3d'] = data_info['lanes_3d']
         # 添加segment信息（时序部分有用）
-        img_name = data_info["origin_img_path"]
-        parts = img_name.split("/")
+        img_name = data_info['origin_img_path']
+        parts = img_name.split('/')
         if len(parts) >= 2:
-            sample["segment_name"] = parts[1]
+            sample['segment_name'] = parts[1]
         # 应用数据增强/预处理
         if self.processes is not None:
             sample = self.processes(sample)

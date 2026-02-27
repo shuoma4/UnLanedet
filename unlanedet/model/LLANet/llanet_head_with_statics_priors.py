@@ -15,7 +15,7 @@ from unlanedet.utils.detailed_loss_logger import DetailedLossLogger
 from ..module.head.plaindecoder import PlainDecoder
 from ..module.losses.focal_loss import FocalLoss
 from .dynamic_assign import assign
-from .line_iou import line_iou
+from .line_iou import aligned_line_iou
 from .prior import init_prior_embeddings_with_stats
 from .roi_gather import LinearModule, ROIGather
 
@@ -577,9 +577,6 @@ class LLANetHeadWithStaticsPriors(nn.Module):
             nms_predictions[..., 4] = nms_predictions[..., 4] * self.n_strips
             nms_predictions[..., 5:] = nms_predictions[..., 5:] * (self.img_w - 1)
 
-            # Use lane_nms (Python implementation) instead of generic box NMS
-            # Generic NMS expects boxes (x1, y1, x2, y2), but we have (score, score, y, x...)
-            # lane_nms uses line_iou which is correct for lanes
             keep = lane_nms(
                 nms_predictions[..., 5:],  # Pass points only
                 scores,
@@ -787,12 +784,11 @@ class LLANetHeadWithStaticsPriors(nn.Module):
                     # Clamp to avoid crash
                     line_pred = torch.clamp(line_pred, min=-1000, max=5000)
 
-                ious = line_iou(
+                ious = aligned_line_iou(
                     line_pred,
                     line_target,
-                    self.img_w,
-                    length=30,
-                    aligned=True,
+                    img_w=self.img_w,
+                    length=15,
                 )
 
                 # DEBUG: Check for NaNs in ious
@@ -801,12 +797,11 @@ class LLANetHeadWithStaticsPriors(nn.Module):
                     ious = torch.nan_to_num(ious, nan=0.0)
 
                 total_iou_loss += (1 - ious).mean()
-                ious_raw = line_iou(
+                ious_raw = aligned_line_iou(
                     line_pred,
                     line_target,
-                    self.img_w,
+                    img_w=self.img_w,
                     length=15,
-                    aligned=True,
                 )
 
                 # ================== 【增强版可视化】 ==================
