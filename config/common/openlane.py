@@ -1,7 +1,8 @@
 from omegaconf import OmegaConf
-from unlanedet.data.openlane import OpenLane
+
 from unlanedet.config import LazyCall as L
 from unlanedet.data.build import build_batch_data_loader
+from unlanedet.data.openlane import OpenLane
 from unlanedet.evaluation import OpenLaneEvaluator
 
 ori_img_h = 1280
@@ -14,8 +15,8 @@ dataloader = OmegaConf.create()
 
 dataloader.train = L(build_batch_data_loader)(
     dataset=L(OpenLane)(
-        data_root="/data1/lxy_log/workspace/ms/OpenLane/dataset/raw",
-        split="train",
+        data_root='/data1/lxy_log/workspace/ms/OpenLane/dataset/raw',
+        split='train',
         cut_height=cut_height,
         processes=None,
     ),
@@ -26,8 +27,8 @@ dataloader.train = L(build_batch_data_loader)(
 
 dataloader.test = L(build_batch_data_loader)(
     dataset=L(OpenLane)(
-        data_root="/data1/lxy_log/workspace/ms/OpenLane/dataset/raw",
-        split="val",
+        data_root='/data1/lxy_log/workspace/ms/OpenLane/dataset/raw',
+        split='val',
         cut_height=cut_height,
         processes=None,
     ),
@@ -37,6 +38,4 @@ dataloader.test = L(build_batch_data_loader)(
     shuffle=False,
 )
 
-dataloader.evaluator = L(OpenLaneEvaluator)(
-    iou_threshold=0.5, width=30, metric="detection/f1"
-)
+dataloader.evaluator = L(OpenLaneEvaluator)(iou_threshold=0.5, width=30, metric='F1')

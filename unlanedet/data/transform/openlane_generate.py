@@ -115,8 +115,8 @@ class OpenLaneGenerate(object):
                 continue
             try:
                 reg, end_pt, xs, ys = self.encoder.encode(lane_pts)
-            except Exception as e:
-                self.logger.warning(f'Encode lane failed: {e}')
+            except Exception:
+                # self.logger.debug(f'Encode lane failed: {e}')
                 continue
             lanes[i, 0] = 0
             lanes[i, 1] = 1
@@ -176,7 +176,8 @@ class OpenLaneGenerate(object):
 
                 annos = self.transform_annotation(new_anno_input)
                 break
-            except Exception:
+            except Exception as e:
+                print(f'Augmentation error: {e}')
                 pass
 
         img = img.astype(np.float32) / 255.0

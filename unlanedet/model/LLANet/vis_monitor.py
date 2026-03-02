@@ -78,22 +78,41 @@ def visualize_training_progress(
     )
 
     # 2. 绘制 GT (绿色)
+    # 优先使用 batch['sample_xs'] (Absolute Pixel Coordinates) 如果可用
+    gt_xs_pixel = None
+    if 'sample_xs' in batch:
+        gt_xs_pixel = batch['sample_xs'][0]  # (max_lanes, N_points)
+
     if len(targets_list) > 0:
         gt_lanes = targets_list[0]
         gt_cats = batch_lane_categories[0] if batch_lane_categories is not None else None
         gt_attrs = batch_lane_attributes[0] if batch_lane_attributes is not None else None
 
         for i_gt, lane in enumerate(gt_lanes):
-            if lane[1] == 1:
-                pts_x = lane[6:]
+            if lane[1] == 1:  # Valid lane
                 points = []
-                for idx_pt, x in enumerate(pts_x):
-                    if x > 0 and x < 1:
-                        # Use prior_ys for visualization to match physical coordinates
-                        y_norm = prior_ys[idx_pt].item()
-                        y = int(img_h * y_norm) + pad
-                        x_pixel = int(x * img_w) + pad
-                        points.append((x_pixel, y))
+
+                # 如果有 sample_xs (绝对坐标)，直接使用
+                if gt_xs_pixel is not None and i_gt < len(gt_xs_pixel):
+                    pts_x = gt_xs_pixel[i_gt]
+
+                    # 额外过滤无效值: OpenLane 可能使用 -1e5 或 -1 作为无效值
+                    # 同时需要过滤掉 x <= 0 的点 (图像左边界外)
+                    # 以及 x >= img_w 的点 (图像右边界外)
+
+                    for idx_pt, x in enumerate(pts_x):
+                        # x is absolute pixel coordinate
+                        # Invalid values are typically negative or very large negative
+                        if x > 0 and x < img_w:
+                            x_pixel = int(x) + pad
+                            y_norm = prior_ys[idx_pt].item()
+                            y = int((img_h - 1) * y_norm) + pad
+                            points.append((x_pixel, y))
+                else:
+                    # Fallback: Try to use lane[6:] (Offsets or Normalized X) - Unreliable if offsets
+                    # Assuming lane[6:] are normalized X for fallback (which they are NOT in LLANet)
+                    pass
+
                 if len(points) > 1:
                     cv2.polylines(
                         img_vis,
@@ -155,14 +174,42 @@ def visualize_training_progress(
                 )
 
                 points_x = lane[6:]
+
+                # Reconstruct Prediction using Prior + Delta
+                start_y = lane[2].item()
+                start_x = lane[3].item()
+                theta = lane[4].item()
+                # length = lane[5].item()
+                deltas = lane[6:]
+
+                # Denormalize Prior
+                start_y_pixel = start_y * (img_h - 1)
+                start_x_pixel = start_x * (img_w - 1)
+
+                # Theta: [-1, 1] -> [-90, 90] deg -> rad
+                theta_deg = theta * 90
+                theta_rad = np.deg2rad(theta_deg)
+
                 points = []
-                for idx_pt, x in enumerate(points_x):
-                    if x > 0 and x < 1:
-                        # Use prior_ys for visualization to match physical coordinates
-                        y_norm = prior_ys[idx_pt].item()
-                        y = int(img_h * y_norm) + pad
-                        x_pixel = int(x * img_w) + pad
-                        points.append((x_pixel, y))
+                for idx_pt, delta_norm in enumerate(deltas):
+                    y_norm = prior_ys[idx_pt].item()
+                    y_pixel = y_norm * (img_h - 1)
+
+                    # Prior X
+                    prior_x = start_x_pixel + (start_y_pixel - y_pixel) * np.tan(theta_rad)
+
+                    # Delta X
+                    delta_pixel = delta_norm.item() * (img_w - 1)
+
+                    x_final = prior_x + delta_pixel
+
+                    # Filter invalid points for PREDICTION as well
+                    if x_final > 0 and x_final < img_w:
+                        # Additionally check if y is within reasonable bounds (0, H)
+                        if y_pixel >= 0 and y_pixel < img_h:
+                            x_vis = int(x_final) + pad
+                            y_vis = int(y_pixel) + pad
+                            points.append((x_vis, y_vis))
 
                 if len(points) > 1:
                     cv2.polylines(img_vis, [np.array(points)], False, color, 2)

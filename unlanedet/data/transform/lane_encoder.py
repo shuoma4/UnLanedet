@@ -5,20 +5,28 @@ import numpy as np
 
 class LaneEncoder(object):
     """
-    结构化车道线编码器（非归一化版本）
+    结构化车道线编码器（归一化版本）
 
     编码参数含义：
-        reg = [start_x, start_y, theta, length, delta_x_0, ..., delta_x_{N-1}]
+        reg =[start_y_norm, start_x_norm, theta_far, length_norm, delta_x_0, ..., delta_x_{N-1}]
 
-    - start_x, start_y:
-        结构化车道线起点像素坐标（对齐到最近采样高度）
-    - theta:
-        车道线整体倾斜角(-90~90°), <0为左倾, >0为右倾, 0为垂直
-    - length:
-        结构化车道线在图像垂直方向上的长度（对齐到最近采样高度）
+    - start_y_norm, start_x_norm:
+        结构化车道线起点归一化坐标 (y_norm, x_norm)，取值范围[0,1]
+        y_norm = start_y / (img_h - 1)
+        x_norm = start_x / (img_w - 1)
+    - theta_far:
+        归一化后的整体倾斜角，取值范围[-1,1]。
+        计算逻辑：计算所有有效采样点相对于起点的角度并取平均值。
+        theta_i = arctan(-dx_i/dy_i) / (π/2)
+        theta_far = mean(theta_i)
+    - length_norm:
+        结构化车道线在图像垂直方向上的归一化长度
+        length_norm = (start_y - end_y) / (img_h - 1)
     - delta_x:
-        相对于先验直线的横向残差（像素单位）
-        当采样点超出结构化起终点范围时, delta_x 为默认值 -1e5
+        相对于先验直线的归一化横向残差。
+        当采样点超出结构化起终点范围时，delta_x 为默认值 -1e5。
+        有效采样点: delta_x = (xs_sampled - prior_xs) / (img_w - 1)
+        注：构建先验直线 prior_xs 时，theta_far 对应的物理角度会被强制截断限制在[-85°, 85°] 之间。
     """
 
     def __init__(self, cfg):
@@ -62,6 +70,8 @@ class LaneEncoder(object):
         if total_len < 1e-6:
             return pts[:, 0], pts[:, 1]
 
+        # 注释说明: 此处的 270 是硬编码的内部高密度插值点数，
+        # 用于在弧长积分前生成平滑的密集点集，与外部的 cfg.num_points (n_offsets) 无关。
         num_sample = 270
         target_lens = np.linspace(0, total_len, num_sample)
 
@@ -101,21 +111,25 @@ class LaneEncoder(object):
         编码单条车道线
 
         Args:
-            lane_pts (list of tuple): 车道线点集，每个点为 (x, y) 格式
+            lane_pts (list of tuple): 车道线点集，每个点为 (x, y) 像素坐标
 
         Returns:
-            reg (np.ndarray): 结构化车道线编码参数，形状为 (n_offsets, 5),
-                start_y : 结构化车道线起点y像素坐标（对齐到最近采样高度）
-                start_x : 结构化车道线起点x像素坐标（对齐到最近采样高度）
-                theta : 车道线整体倾斜角(-90~90°), <0为左倾, >0为右倾, 0为垂直
-                length : 结构化车道线在图像垂直方向上的长度（对齐到最近采样高度）
-                delta_x : 采样范围内，车道线x坐标相对于先验直线的横向残差（像素单位）
+            reg (np.ndarray): 结构化车道线归一化编码参数，形状为 (n_offsets + 4,)
+                前4个元素:[start_y_norm, start_x_norm, theta_far, length_norm]
+                后续n_offsets个元素: delta_x 归一化残差
             end_pts (list of float): 结构化车道线终点像素坐标 (y, x)
-            xs_sampled (np.ndarray): 结构化车道线在采样高度上的x坐标 (n_offsets,)
-            sample_ys (np.ndarray): y轴采样点序列 (n_offsets,)
+            xs_sampled (np.ndarray): 结构化车道线在采样高度上的x像素坐标 (n_offsets,)
+            sample_ys (np.ndarray): y轴采样点像素坐标序列 (n_offsets,)
         """
         xs = np.asarray([p[0] for p in lane_pts], dtype=np.float32)
         ys = np.asarray([p[1] for p in lane_pts], dtype=np.float32)
+        order = np.argsort(ys)[::-1]
+        xs = xs[order]
+        ys = ys[order]
+        if len(ys) > 1:
+            uniq_mask = np.concatenate(([True], ys[1:] != ys[:-1]))
+            xs = xs[uniq_mask]
+            ys = ys[uniq_mask]
 
         # -------------------------
         # 1️⃣ 采样高度
@@ -130,52 +144,57 @@ class LaneEncoder(object):
         # -------------------------
         xs_sampled = self.sample_lane(xs, ys, sample_ys)
 
-        # -------------------------
-        # 3️⃣ 结构化起点 & 终点（对齐到最近采样高度）
-        # -------------------------
-        idx_start = int(np.argmin(np.abs(sample_ys - ys[0])))
-        idx_end = int(np.argmin(np.abs(sample_ys - ys[-1])))
+        # 过滤掉超出真实 y 范围的采样点 (防止 np.interp 的常量外推导致竖直线)
+        # 允许一定的容差 (例如 1 像素)
+        y_min, y_max = ys.min(), ys.max()
+        valid_y_mask = (sample_ys >= y_min - 1e-3) & (sample_ys <= y_max + 1e-3)
+        xs_sampled[~valid_y_mask] = -1e5
 
-        start_y = sample_ys[idx_start]
-        start_x = xs_sampled[idx_start]
-        end_x = xs_sampled[idx_end]
-        end_y = sample_ys[idx_end]
+        inside_mask = (xs_sampled >= 0) & (xs_sampled < self.img_w)
+        if inside_mask.sum() < 2:
+            raise ValueError('Not enough valid points for encoding.')
 
-        # -------------------------
-        # 4️⃣ 可见性掩码（严格以结构化起终点为边界）
-        # -------------------------
-        y_high = start_y
-        y_low = end_y
+        valid_indices = np.where(inside_mask)[0]
+        start_index = int(valid_indices[0])
+        end_index = int(valid_indices[-1])
 
-        vis = (sample_ys <= y_high + 1e-3) & (sample_ys >= y_low - 1e-3)
-        # -------------------------
-        # 5️⃣ 拟合整体方向角 theta
-        # -------------------------
-        k, b = np.polyfit(ys, xs, 1)
-        theta = -np.degrees(np.arctan(k))  # 左负右正（你也可以去掉负号换定义）
-        theta = np.clip(theta, -90.0, 90.0)
+        start_x = xs_sampled[start_index]
+        start_y = sample_ys[start_index]
+        end_x = xs_sampled[end_index]
+        end_y = sample_ys[end_index]
 
-        # -------------------------
-        # 6️⃣ 结构化长度（对齐到采样坐标）
-        # -------------------------
-        length = float(start_y - end_y)
+        xs_inside = xs_sampled[inside_mask]
+        ys_inside = sample_ys[inside_mask]
 
-        # -------------------------
-        # 7️⃣ 构造先验直线并计算残差
-        # -------------------------
-        tan_theta = np.tan(np.deg2rad(theta))
-        tan_theta = np.clip(tan_theta, -1e3, 1e3)  # 防止接近水平的车道线产生数值爆炸
-        x_prior = start_x + (start_y - sample_ys) * tan_theta
+        # 计算 theta_far：所有点相对于起点的角度并取均值
+        thetas = []
+        for i in range(1, len(xs_inside)):
+            dy = ys_inside[i] - ys_inside[0]
+            dx = xs_inside[i] - xs_inside[0]
+            tan_theta = -dx / (dy + 1e-5)
+            theta = np.arctan(tan_theta) / (np.pi / 2.0)
+            thetas.append(theta)
+        theta_far = float(np.mean(thetas)) if len(thetas) > 0 else 0.0
 
-        delta_x = xs_sampled - x_prior  # 固定Y采样点下，X坐标的偏移
-        xs_sampled[~vis] = -1e5
-        delta_x[~vis] = -1e5
-        # -------------------------
-        # 8️⃣ 拼接回归向量
-        # -------------------------
+        # 归一化处理
+        start_y_norm = start_y / float(self.img_h - 1)
+        start_x_norm = start_x / float(self.img_w - 1)
+        length_norm = (start_y - end_y) / float(self.img_h - 1)
+
+        delta_x = np.ones_like(xs_sampled, dtype=np.float32) * -1e5
+        theta_deg = theta_far * 90.0
+
+        # 隐藏的截断逻辑：限制先验倾斜角在 [-85, 85] 之间，防止 tan 值过大
+        theta_deg = np.clip(theta_deg, -85.0, 85.0)
+        tan_theta = np.tan(np.deg2rad(theta_deg))
+        prior_xs = start_x + (start_y - sample_ys) * tan_theta
+
+        # 计算相对残差
+        delta_x[inside_mask] = (xs_sampled[inside_mask] - prior_xs[inside_mask]) / float(self.img_w - 1)
+
         reg = np.concatenate(
             [
-                np.array([start_y, start_x, theta, length], dtype=np.float32),
+                np.array([start_y_norm, start_x_norm, theta_far, length_norm], dtype=np.float32),
                 delta_x.astype(np.float32),
             ]
         )

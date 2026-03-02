@@ -9,23 +9,17 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+from ..data.transform.lane_decoder import LaneDecoder
 from ..model.LLANet.line_iou import aligned_line_iou
 from .evaluator import DatasetEvaluator
 
 
-def lane_nms(predictions, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920):
-    """
-    NMS function with coordinate scaling fix.
-    """
-    # Memory: NMS threshold must NOT be normalized
-    # if nms_overlap_thresh > 1.0:
-    #    nms_overlap_thresh /= 100.0
-
+def lane_nms(lane_points, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920):
+    if nms_overlap_thresh > 1.0:
+        nms_overlap_thresh = nms_overlap_thresh / 100.0
     keep_index = []
     sorted_scores, sorted_indices = torch.sort(scores, descending=True)
     sorted_indices = sorted_indices[:top_k]
-
-    lane_points = predictions[:, 5:] * img_w
 
     while sorted_indices.size(0) > 0:
         idx = sorted_indices[0]
@@ -84,6 +78,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
         self.width = width
         self.metric = metric  # Renamed back to metric to match original logic if needed, but primary_metric_name was better. Wait, the old code used primary_metric_name?
         self.logger = logging.getLogger(__name__)
+        self.lane_decoder = LaneDecoder(cfg)
 
         # 1. Output Directory Setup
         if output_dir is None:
@@ -134,6 +129,17 @@ class OpenLaneEvaluator(DatasetEvaluator):
         self.generate_visualization = getattr(cfg, 'generate_visualization', False)
         self.reset()
 
+    def _decode_lane_points(self, preds):
+        if not torch.is_tensor(preds):
+            preds = torch.tensor(preds)
+        preds = preds.detach().to(torch.float32)
+        xs, ys, valid_mask = self.lane_decoder(preds)
+        if xs.dim() == 3:
+            xs = xs[0]
+            ys = ys[0]
+            valid_mask = valid_mask[0]
+        return xs, ys, valid_mask
+
     def reset(self):
         # Internal Python Stats
         self.category_correct = 0
@@ -175,6 +181,8 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 attr_logits_batch = outputs['attribute']
             if 'lane_lines' in outputs:
                 outputs = outputs['lane_lines']
+            elif 'last_pred_lanes' in outputs:
+                outputs = outputs['last_pred_lanes']
 
         batch_size = len(outputs)
 
@@ -212,8 +220,18 @@ class OpenLaneEvaluator(DatasetEvaluator):
                         break
 
             if not original_rel_path:
+                img_path_val = inputs.get('img_path')
+                if isinstance(img_path_val, list) and i < len(img_path_val):
+                    original_rel_path = img_path_val[i]
+                elif isinstance(img_path_val, str):
+                    original_rel_path = img_path_val
+
+            if not original_rel_path:
                 self.logger.warning(f'[WARNING] Meta content (partial): {str(inputs.keys())}')
                 continue
+
+            if isinstance(original_rel_path, str) and original_rel_path.startswith(self.cfg.data_root):
+                original_rel_path = os.path.relpath(original_rel_path, self.cfg.data_root)
 
             # FIX: Normalize path prefix to match annotation directory structure (lane3d_300/validation)
             if 'training_resized_800_320/validation' in original_rel_path:
@@ -256,17 +274,22 @@ class OpenLaneEvaluator(DatasetEvaluator):
             valid_scores = scores[valid_mask]
 
             if valid_mask.sum() == 0 and len(scores) > 0:
-                self.logger.error(f"No preds' confidence > {conf_threshold}")
-                self._save_empty_json(save_rel_path, original_rel_path)
-                continue
+                topk = min(self.cfg.test_parameters.nms_topk, scores.numel())
+                topk_indices = torch.topk(scores, k=topk).indices
+                valid_mask = torch.zeros_like(scores, dtype=torch.bool)
+                valid_mask[topk_indices] = True
+                valid_preds = pred_lines[valid_mask]
+                valid_scores = scores[valid_mask]
 
-            nms_preds = valid_preds.clone()
+            lane_xs, lane_ys, lane_mask = self._decode_lane_points(valid_preds)
+            nms_lanes = lane_xs.clone()
+            nms_lanes[~lane_mask] = -1e5
             keep_indices = lane_nms(
-                nms_preds,
+                nms_lanes,
                 valid_scores,
                 nms_overlap_thresh=self.cfg.test_parameters.nms_thres,
                 top_k=self.cfg.test_parameters.nms_topk,
-                img_w=self.cfg.img_w,  # 传入 img_w 用于反归一化
+                img_w=self.cfg.img_w,
             )
             # 获取 NMS 后的最终预测
             final_preds = valid_preds[keep_indices]
@@ -315,7 +338,6 @@ class OpenLaneEvaluator(DatasetEvaluator):
                         )
 
             # --- 6. 解码坐标并保存 ---
-            # decode_lanes 内部会乘以 ori_img_w，所以这里传入 normalized 的 final_preds 即可
             decoded_lanes = self.decode_lanes(
                 final_preds.numpy(),
                 self.cfg.img_w,
@@ -467,6 +489,8 @@ class OpenLaneEvaluator(DatasetEvaluator):
         # Merge Internal Python Metrics
         local_metrics = self._get_internal_metrics()
         metrics.update(local_metrics)
+        culane_metrics = self._run_culane_style_evaluation(all_json_files)
+        metrics.update(culane_metrics)
 
         self.logger.info('=' * 40)
         self.logger.info('OpenLane Evaluation Results:')
@@ -479,6 +503,85 @@ class OpenLaneEvaluator(DatasetEvaluator):
             self.logger.info(f'[OpenLaneEvaluator] Visualizations saved to: {self.annotated_images_dir}')
 
         return metrics
+
+    def _run_culane_style_evaluation(self, rel_paths):
+        try:
+            from . import culane_metric
+        except Exception as e:
+            self.logger.error(f'[OpenLaneEvaluator] Failed to import culane_metric: {e}')
+            return {}
+
+        lane_anno_dir = getattr(self.cfg, 'lane_anno_dir', 'lane3d_300/')
+        data_root = self.cfg.data_root
+        if hasattr(data_root, 'as_posix'):
+            data_root = data_root.as_posix()
+        dataset_dir = os.path.join(data_root.rstrip('/'), lane_anno_dir.rstrip('/')) + '/'
+
+        img_h = getattr(self.cfg, 'ori_img_h', 1280)
+        img_w = getattr(self.cfg, 'ori_img_w', 1920)
+        img_shape = (img_h, img_w, 3)
+
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+
+        for rel_path in rel_paths:
+            rel_json = rel_path.replace('.jpg', '.json')
+            pred_json = os.path.join(self.result_dir, rel_json)
+            gt_json = os.path.join(dataset_dir, rel_json)
+
+            pred_lanes = self._load_lane_lines(pred_json)
+            gt_lanes = self._load_lane_lines(gt_json)
+
+            tp, fp, fn, _, _ = culane_metric.culane_metric(
+                pred_lanes,
+                gt_lanes,
+                width=self.width,
+                iou_threshold=self.iou_threshold,
+                official=True,
+                img_shape=img_shape,
+            )
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+
+        if total_tp == 0:
+            precision = 0.0
+            recall = 0.0
+            f1 = 0.0
+        else:
+            precision = float(total_tp) / (total_tp + total_fp)
+            recall = float(total_tp) / (total_tp + total_fn)
+            f1 = 2 * precision * recall / (precision + recall)
+
+        return {'TP': total_tp, 'FP': total_fp, 'FN': total_fn, 'Precision': precision, 'Recall': recall, 'F1': f1}
+
+    def _load_lane_lines(self, json_path):
+        if not os.path.exists(json_path):
+            return []
+        try:
+            with open(json_path, 'r') as f:
+                content = json.load(f)
+        except Exception:
+            return []
+        lanes = []
+        for lane in content.get('lane_lines', []):
+            uv = lane.get('uv', None)
+            if not uv or len(uv) != 2:
+                continue
+            xs, ys = uv
+            points = []
+            for x, y in zip(xs, ys):
+                if x is None or y is None:
+                    continue
+                if x < 0 or y < 0:
+                    continue
+                points.append((float(x), float(y)))
+            if len(points) < 2:
+                continue
+            points = sorted(points, key=lambda p: p[1])
+            lanes.append(points)
+        return lanes
 
     def _execute_visualizations(self):
         """
@@ -637,34 +740,21 @@ class OpenLaneEvaluator(DatasetEvaluator):
         return {'Internal/Category_Acc': cat_acc, 'Internal/Attribute_Acc': attr_acc}
 
     def decode_lanes(self, preds, img_w, img_h, ori_img_w, ori_img_h, num_points):
-        """
-        将模型预测的归一化坐标解码回原始图像尺寸 (1920x1280)
-        """
         decoded = []
         cut_height = self.cfg.cut_height
-        strip_size = img_h / (num_points - 1)  # 320 / 71 ≈ 4.507
-        orig_crop_h = ori_img_h - cut_height  # 1280 - 270 = 1010
-
-        for lane in preds:
-            # lane indices: 0:score, 1:cat, 2:start_y, 3:start_x, 4:length, 5..76:offsets
-            start_y = lane[2].item() if torch.is_tensor(lane) else lane[2]
-            length = lane[5].item() if torch.is_tensor(lane) else lane[5]
-            real_start_y = 1.0 - start_y
-            y_start_orig = real_start_y * orig_crop_h + cut_height
-            y_end_orig = (real_start_y - length) * orig_crop_h + cut_height
-            xs = lane[6:].detach().cpu().numpy() if torch.is_tensor(lane) else lane[6:]
-            xs = xs[::-1]
+        orig_crop_h = ori_img_h - cut_height
+        xs, ys, valid_mask = self._decode_lane_points(preds)
+        for i in range(xs.shape[0]):
             lane_points = []
-            for i, x in enumerate(xs):
-                y_train = i * strip_size
-                y_orig = (y_train / img_h) * orig_crop_h + cut_height
-                x_orig = x * ori_img_w
-                if y_orig < y_end_orig - 2 or y_orig > y_start_orig + 2:
+            for x, y, m in zip(xs[i], ys[i], valid_mask[i]):
+                if not m:
                     continue
-                x_orig = x * ori_img_w
+                x_orig = float(x) / img_w * ori_img_w
+                y_orig = float(y) / img_h * orig_crop_h + cut_height
                 if x_orig < 0 or x_orig > ori_img_w:
                     continue
+                if y_orig < cut_height or y_orig > ori_img_h:
+                    continue
                 lane_points.append((x_orig, y_orig))
-            lane_points = lane_points[::-1]
             decoded.append(lane_points)
         return decoded

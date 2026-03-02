@@ -13,6 +13,7 @@ from ..module.losses.focal_loss import FocalLoss
 from .dynamic_assign import assign
 from .line_iou import aligned_line_iou
 from .roi_gather import LinearModule, ROIGather
+from .vis_monitor import visualize_training_progress
 
 
 class LLANetHead(nn.Module):
@@ -220,8 +221,7 @@ class LLANetHead(nn.Module):
         theta = torch.clip(theta, -85.0, 85.0)
         offsets = priors[..., 6:]
         tan_theta = torch.tan(torch.deg2rad(theta))
-        aspect_ratio = (self.img_h - 1) / (self.img_w - 1)
-        prior_xs = start_x + (start_y - sample_ys) * aspect_ratio * tan_theta + offsets
+        prior_xs = start_x + (start_y - sample_ys) * (self.img_h / self.img_w) * tan_theta + offsets
         return prior_xs
 
     def generate_priors_from_embeddings(self):
@@ -250,7 +250,7 @@ class LLANetHead(nn.Module):
         pred[..., 2] *= self.img_h - 1
         pred[..., 3] *= self.img_w - 1
         pred[..., 4] *= 90
-        pred[..., 5] *= self.img_h
+        pred[..., 5] *= self.img_h - 1
         pred[..., 6:] *= self.img_w - 1
 
     def forward(self, features, img_metas=None, **kwargs):
@@ -309,7 +309,7 @@ class LLANetHead(nn.Module):
             predictions = priors.clone()
             predictions[..., :2] = cls_logits
             predictions[..., 2:5] += reg[..., 0:3]  # y, x, theta
-            predictions[..., 5] = F.softplus(reg[..., 3])  # length
+            predictions[..., 5] = reg[..., 3]  # length
             predictions[..., 6:] += reg[..., 4:]  # offsets
             predictions_lists.append(predictions)
 
@@ -365,8 +365,7 @@ class LLANetHead(nn.Module):
     def loss(self, outputs, batch, current_iter=0):
         device = self.priors.device
         predictions_lists = outputs['predictions_lists']  # [tensor(B, num_priors, 6 + num_offsets)]
-        targets = batch['lane_line'].to(device)  # tensor(B, max_lanes, 6 + num_offsets)
-        sample_xs = batch['sample_xs'].to(device)  # tensor(B, max_lanes, num_offsets)
+        targets = batch['lane_line'].to(device).clone()  # tensor(B, max_lanes, 6 + num_offsets)
         batch_lane_categories = batch.get('lane_categories', None).to(device)  # tensor(B， max_lanes)
         batch_lane_attributes = batch.get('lane_attributes', None).to(device)  # tensor(B， max_lanes)
 
@@ -386,14 +385,15 @@ class LLANetHead(nn.Module):
 
         total_stage_count = 0
         for stage in range(self.refine_layers):
-            predictions = predictions_lists[stage].clone()  # tensor(B, num_priors, 6 + num_offsets)
-            sample_ys_pixels = self.sample_ys * (self.img_h - 1)
-            sample_xs_preds, _, _ = self.decoder(predictions, sample_ys_pixels)  # decode predicted lanes
-            self._anti_normalize(predictions)  # anti-normalize predictions(now predictions are in pixel space)
+            predictions = predictions_lists[stage]  # tensor(B, num_priors, 6 + num_offsets)
             with torch.no_grad():
+                predictions_for_assign = predictions.detach().clone()
+                targets_for_assign = targets.detach().clone()
+                self._anti_normalize(predictions_for_assign)
+                self._anti_normalize(targets_for_assign)
                 assigned_mask, assigned_ids = assign(
-                    predictions,
-                    targets,
+                    predictions_for_assign,
+                    targets_for_assign,
                     targets_mask,
                     self.img_w,
                     self.img_h,
@@ -420,42 +420,93 @@ class LLANetHead(nn.Module):
             target_idx = assigned_ids[batch_idx, prior_idx]  # (num_positives,)
             pos_preds = predictions[batch_idx, prior_idx]  # (num_positives, 6 + num_offsets)
             pos_targets = targets[batch_idx, target_idx]  # (num_positives, 6 + num_offsets)
-            sample_xs_preds = sample_xs_preds[batch_idx, prior_idx]  # (num_positives, num_offsets) pixels
-            sample_xs_targets = sample_xs[batch_idx, target_idx]  # (num_positives, num_offsets)
 
-            # pos_preds/pos_targets are currently in [Pixels, Pixels, Degrees, Pixels, ...]
-            reg_preds_loss = pos_preds.clone()
-            reg_targets_loss = pos_targets.clone()
-            reg_pred_vec = reg_preds_loss[:, 2:6]
-            reg_target_vec = reg_targets_loss[:, 2:6]
-            stage_reg_xytl_loss = F.smooth_l1_loss(reg_pred_vec, reg_target_vec, reduction='none')
-            match_batch_idx = batch_idx
-            loss_per_match_mean = stage_reg_xytl_loss.mean(dim=1)  # (N,) Average over 4 params
-            stage_reg_loss_sum = torch.zeros(batch_size, device=device)
-            stage_reg_loss_sum.index_add_(0, match_batch_idx, loss_per_match_mean)
-            matches_per_img = torch.zeros(batch_size, device=device)
-            matches_per_img.index_add_(0, match_batch_idx, torch.ones_like(match_batch_idx, dtype=torch.float))
-            norm_matches = torch.clamp(matches_per_img, min=1.0)
-            stage_reg_loss_per_img = stage_reg_loss_sum / norm_matches
-            total_reg_xytl_loss += stage_reg_loss_per_img.sum() / batch_size
+            reg_yxtl = pos_preds[:, 2:6].clone()
+            reg_yxtl[:, 0] *= self.n_strips
+            reg_yxtl[:, 1] *= self.img_w - 1
+            reg_yxtl[:, 2] *= 90
+            reg_yxtl[:, 3] *= self.n_strips
 
+            target_yxtl = pos_targets[:, 2:6].clone()
+            target_yxtl[:, 0] *= self.n_strips
+            target_yxtl[:, 1] *= self.img_w - 1
+            target_yxtl[:, 2] *= 90
+            target_yxtl[:, 3] *= self.n_strips
+
+            with torch.no_grad():
+                pred_start_y = torch.clamp(reg_yxtl[:, 0].round().long(), 0, self.n_strips)
+                target_start_y = torch.clamp(target_yxtl[:, 0].round().long(), 0, self.n_strips)
+                target_yxtl[:, 3] -= pred_start_y - target_start_y
+
+            stage_reg_xytl_loss = F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction='none')
+
+            # Reg Loss should also be averaged over positive samples to be consistent with CLRNet
+            stage_reg_loss = stage_reg_xytl_loss.mean()
+            total_reg_xytl_loss += stage_reg_loss
+
+            loss_y = F.smooth_l1_loss(reg_yxtl[:, 0], target_yxtl[:, 0], reduction='none')
+            loss_x = F.smooth_l1_loss(reg_yxtl[:, 1], target_yxtl[:, 1], reduction='none')
+            loss_theta = F.smooth_l1_loss(reg_yxtl[:, 2], target_yxtl[:, 2], reduction='none')
+            loss_len = F.smooth_l1_loss(reg_yxtl[:, 3], target_yxtl[:, 3], reduction='none')
             if self.detailed_loss_logger is not None:
-                loss_y = F.smooth_l1_loss(pos_preds[:, 2], pos_targets[:, 2], reduction='none')
-                loss_x = F.smooth_l1_loss(pos_preds[:, 3], pos_targets[:, 3], reduction='none')
-                loss_theta = F.smooth_l1_loss(pos_preds[:, 4], pos_targets[:, 4], reduction='none')
-                loss_len = F.smooth_l1_loss(pos_preds[:, 5], pos_targets[:, 5], reduction='none')
                 log_ly += loss_y.mean()
                 log_lx += loss_x.mean()
                 log_lt += loss_theta.mean()
                 log_ll += loss_len.mean()
                 total_stage_count += 1
 
-            iou = aligned_line_iou(sample_xs_preds, sample_xs_targets, img_w=self.img_w, length=15)
+            pred_start_y = pos_preds[:, 2] * (self.img_h - 1)
+            pred_start_x = pos_preds[:, 3] * (self.img_w - 1)
+            pred_theta = pos_preds[:, 4] * 90
+            pred_theta_rad = torch.deg2rad(pred_theta)
+            pred_delta_x = pos_preds[:, 6:] * (self.img_w - 1)
+            sample_ys_pixels = self.sample_ys.to(device) * (self.img_h - 1)
+            sample_ys_pixels = sample_ys_pixels.unsqueeze(0)  # (1, n_strips)
+            pred_tan_theta = torch.tan(pred_theta_rad)
+            pred_x_prior = pred_start_x.unsqueeze(1) + (
+                pred_start_y.unsqueeze(1) - sample_ys_pixels
+            ) * pred_tan_theta.unsqueeze(1)
+            pred_xs = pred_x_prior + pred_delta_x
+
+            target_xs = batch['sample_xs'].to(device)  # (B, max_lanes, n_strips)
+            target_xs = target_xs[batch_idx, target_idx]  # (N_pos, n_strips)
+
+            iou = aligned_line_iou(pred_xs, target_xs, img_w=self.img_w, length=15)
             liou = 1.0 - iou
-            stage_iou_loss_sum = torch.zeros(batch_size, device=device)
-            stage_iou_loss_sum.index_add_(0, match_batch_idx, liou)  # Aggregate per image
-            stage_iou_loss_per_img = stage_iou_loss_sum / norm_matches  # Normalize per image
-            total_iou_loss += stage_iou_loss_per_img.sum() / batch_size
+            stage_iou_loss = liou.mean()
+            total_iou_loss += stage_iou_loss
+
+            if stage == self.refine_layers - 1:
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    rank = torch.distributed.get_rank()
+                else:
+                    rank = 0
+                if current_iter % 50 == 0 and rank == 0:
+                    targets_list = batch['lane_line']
+                    if torch.is_tensor(targets_list):
+                        targets_list = targets_list.detach().cpu().numpy()
+                    visualize_training_progress(
+                        current_iter,
+                        batch,
+                        targets_list,
+                        batch_lane_categories,
+                        batch_lane_attributes,
+                        pos_preds,
+                        batch_idx,
+                        prior_idx,
+                        outputs,
+                        iou,
+                        loss_y,
+                        loss_x,
+                        loss_theta,
+                        loss_len,
+                        target_idx,
+                        self.img_h,
+                        self.img_w,
+                        self.sample_ys,
+                        self.enable_category,
+                        self.enable_attribute,
+                    )
 
             # only add category/attribute loss in the last stage
             if stage == self.refine_layers - 1:

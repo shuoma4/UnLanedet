@@ -116,10 +116,16 @@ class OpenLane(BaseDataset):
             name_part = 'lane3d_1000'
         else:
             name_part = 'unknown'
+        
+        # Use local cache directory to avoid permission issues and force regeneration
+        local_cache_dir = '/data1/lxy_log/workspace/ms/UnLanedet/output/cache'
+        import os
+        os.makedirs(local_cache_dir, exist_ok=True)
         self.cache_path = osp.join(
-            data_root,
-            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v1.pkl',
+            local_cache_dir,
+            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v2.pkl',
         )
+        
         self.data_infos = self.load_annotations(split)
         self.logger = logging.getLogger(__name__)
         self.logger.info(f'加载 {split} 数据集完成: {len(self.data_infos)} 个样本')

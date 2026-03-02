@@ -1,12 +1,12 @@
-import os.path as osp
-import numpy as np
 import math
+
 import imgaug.augmenters as iaa
-from imgaug.augmenters import Resize
+import numpy as np
 from imgaug.augmentables.lines import LineString, LineStringsOnImage
-from scipy.interpolate import InterpolatedUnivariateSpline
 from imgaug.augmentables.segmaps import SegmentationMapsOnImage
+from imgaug.augmenters import Resize
 from omegaconf import DictConfig
+from scipy.interpolate import InterpolatedUnivariateSpline
 
 
 def convert_dictconfig_to_dict(config):
@@ -21,12 +21,10 @@ def convert_dictconfig_to_dict(config):
 
 def CLRTransforms(img_h, img_w):
     return [
+        dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
+        dict(name='HorizontalFlip', parameters=dict(p=1.0), p=0.5),
         dict(
-            name="Resize", parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0
-        ),
-        dict(name="HorizontalFlip", parameters=dict(p=1.0), p=0.5),
-        dict(
-            name="Affine",
+            name='Affine',
             parameters=dict(
                 translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)),
                 rotate=(-10, 10),
@@ -34,9 +32,7 @@ def CLRTransforms(img_h, img_w):
             ),
             p=0.7,
         ),
-        dict(
-            name="Resize", parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0
-        ),
+        dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
     ]
 
 
@@ -61,12 +57,12 @@ class GenerateLaneLine(object):
             transforms = [convert_dictconfig_to_dict(aug) for aug in transforms]
             img_transforms = []
             for aug in transforms:
-                p = aug["p"]
-                if aug["name"] != "OneOf":
+                p = aug['p']
+                if aug['name'] != 'OneOf':
                     img_transforms.append(
                         iaa.Sometimes(
                             p=p,
-                            then_list=getattr(iaa, aug["name"])(**aug["parameters"]),
+                            then_list=getattr(iaa, aug['name'])(**aug['parameters']),
                         )
                     )
                 else:
@@ -74,10 +70,7 @@ class GenerateLaneLine(object):
                         iaa.Sometimes(
                             p=p,
                             then_list=iaa.OneOf(
-                                [
-                                    getattr(iaa, aug_["name"])(**aug_["parameters"])
-                                    for aug_ in aug["transforms"]
-                                ]
+                                [getattr(iaa, aug_['name'])(**aug_['parameters']) for aug_ in aug['transforms']]
                             ),
                         )
                     )
@@ -96,24 +89,20 @@ class GenerateLaneLine(object):
         # this function expects the points to be sorted
         points = np.array(points)
         if not np.all(points[1:, 1] < points[:-1, 1]):
-            raise Exception("Annotaion points have to be sorted")
+            raise Exception('Annotaion points have to be sorted')
         x, y = points[:, 0], points[:, 1]
 
         # interpolate points inside domain
         assert len(points) > 1
         domain_min_y = y.min()
         domain_max_y = y.max()
-        sample_ys_inside_domain = sample_ys[
-            (sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)
-        ]
+        sample_ys_inside_domain = sample_ys[(sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)]
         assert len(sample_ys_inside_domain) > 0
 
         # Use np.interp for robust linear interpolation instead of Spline
         # Note: np.interp expects xp to be increasing
         # points are sorted by Y descending, so we reverse them for np.interp
-        interp_xs = np.interp(
-            sample_ys_inside_domain, y[::-1], x[::-1], left=np.nan, right=np.nan
-        )
+        interp_xs = np.interp(sample_ys_inside_domain, y[::-1], x[::-1], left=np.nan, right=np.nan)
 
         # extrapolate lane to the bottom of the image with a straight line
         # using the closest points (up to 5) to reduce noise sensitivity
@@ -153,7 +142,7 @@ class GenerateLaneLine(object):
     def transform_annotation(self, anno, img_wh=None):
         img_w, img_h = self.img_w, self.img_h
 
-        old_lanes = anno["lanes"]
+        old_lanes = anno['lanes']
 
         # removing lanes with less than 2 points
         old_lanes = filter(lambda x: len(x) > 1, old_lanes)
@@ -163,22 +152,17 @@ class GenerateLaneLine(object):
         old_lanes = [self.filter_lane(lane) for lane in old_lanes]
         # normalize the annotation coordinates
         old_lanes = [
-            [
-                [x * self.img_w / float(img_w), y * self.img_h / float(img_h)]
-                for x, y in lane
-            ]
-            for lane in old_lanes
+            [[x * self.img_w / float(img_w), y * self.img_h / float(img_h)] for x, y in lane] for lane in old_lanes
         ]
         # create tranformed annotations
         lanes = (
-            np.ones((self.max_lanes, 2 + 1 + 1 + 2 + self.n_offsets), dtype=np.float32)
-            * -1e5
+            np.ones((self.max_lanes, 2 + 1 + 1 + 2 + self.n_offsets), dtype=np.float32) * -1e5
         )  # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, S+1 coordinates
         lanes_endpoints = np.ones((self.max_lanes, 2))
         # lanes are invalid by default
         lanes[:, 0] = 1
         lanes[:, 1] = 0
-        for lane_idx, lane in enumerate(old_lanes):
+        for lane_idx, lane in enumerate[list[list]](old_lanes):
             if lane_idx >= self.max_lanes:
                 break
 
@@ -224,7 +208,7 @@ class GenerateLaneLine(object):
             lanes_endpoints[lane_idx, 0] = valid_indices[-1] / self.n_strips
             lanes_endpoints[lane_idx, 1] = xs_inside[-1]
 
-        new_anno = {"label": lanes, "old_anno": anno, "lane_endpoints": lanes_endpoints}
+        new_anno = {'label': lanes, 'old_anno': anno, 'lane_endpoints': lanes_endpoints}
         return new_anno
 
     def linestrings_to_lanes(self, lines):
@@ -235,25 +219,25 @@ class GenerateLaneLine(object):
         return lanes
 
     def __call__(self, sample):
-        img_org = sample["img"]
+        img_org = sample['img']
         # print(img_org is None)
-        if "cut_height" in sample.keys():
-            self.cfg.cut_height = sample["cut_height"]
+        if 'cut_height' in sample.keys():
+            self.cfg.cut_height = sample['cut_height']
         if self.cfg.cut_height != 0:
             new_lanes = []
-            for i in sample["lanes"]:
+            for i in sample['lanes']:
                 lanes = []
                 for p in i:
                     lanes.append((p[0], p[1] - self.cfg.cut_height))
                 new_lanes.append(lanes)
-            sample.update({"lanes": new_lanes})
-        line_strings_org = self.lane_to_linestrings(sample["lanes"])
+            sample.update({'lanes': new_lanes})
+        line_strings_org = self.lane_to_linestrings(sample['lanes'])
         line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
 
         # print(111111)
         for i in range(30):
             if self.training:
-                mask_org = SegmentationMapsOnImage(sample["mask"], shape=img_org.shape)
+                mask_org = SegmentationMapsOnImage(sample['mask'], shape=img_org.shape)
                 # print("img:",(img_org is None))
                 # print("line:",line_strings_org is None)
                 # print("mask_org:",mask_org is None)
@@ -268,29 +252,25 @@ class GenerateLaneLine(object):
                 # print("seg+++:",seg is None)
                 # print("mask_org+++:",mask_org is None)
             else:
-                img, line_strings = self.transform(
-                    image=img_org.copy().astype(np.uint8), line_strings=line_strings_org
-                )
+                img, line_strings = self.transform(image=img_org.copy().astype(np.uint8), line_strings=line_strings_org)
             line_strings.clip_out_of_image_()
-            new_anno = {"lanes": self.linestrings_to_lanes(line_strings)}
+            new_anno = {'lanes': self.linestrings_to_lanes(line_strings)}
             try:
-                annos = self.transform_annotation(
-                    new_anno, img_wh=(self.img_w, self.img_h)
-                )
-                label = annos["label"]
-                lane_endpoints = annos["lane_endpoints"]
+                annos = self.transform_annotation(new_anno, img_wh=(self.img_w, self.img_h))
+                label = annos['label']
+                lane_endpoints = annos['lane_endpoints']
                 break
             except:
                 if (i + 1) == 30:
-                    self.logger.critical("Transform annotation failed 30 times :(")
+                    self.logger.critical('Transform annotation failed 30 times :(')
                     exit()
 
         # print(22222)
-        sample["img"] = img.astype(np.float32) / 255.0
-        sample["lane_line"] = label
-        sample["lanes_endpoints"] = lane_endpoints
-        sample["gt_points"] = new_anno["lanes"]
-        sample["seg"] = seg.get_arr() if self.training else np.zeros(img_org.shape)
+        sample['img'] = img.astype(np.float32) / 255.0
+        sample['lane_line'] = label
+        sample['lanes_endpoints'] = lane_endpoints
+        sample['gt_points'] = new_anno['lanes']
+        sample['seg'] = seg.get_arr() if self.training else np.zeros(img_org.shape)
 
         return sample
 
@@ -305,21 +285,14 @@ class GenerateLaneLineATT(object):
         self.strip_size = self.img_h / self.n_strips
         self.max_lanes = cfg.max_lanes
         self.offsets_ys = np.arange(self.img_h, -1, -self.strip_size)
-        transformations = iaa.Sequential(
-            [Resize({"height": self.img_h, "width": self.img_w})]
-        )
+        transformations = iaa.Sequential([Resize({'height': self.img_h, 'width': self.img_w})])
         if transforms is not None:
             transforms = [
-                getattr(iaa, aug["name"])(
-                    **convert_dictconfig_to_dict(aug)["parameters"]
-                )
-                for aug in transforms
+                getattr(iaa, aug['name'])(**convert_dictconfig_to_dict(aug)['parameters']) for aug in transforms
             ]  # add augmentation
         else:
             transforms = []
-        self.transform = iaa.Sequential(
-            [iaa.Sometimes(then_list=transforms, p=1.0), transformations]
-        )
+        self.transform = iaa.Sequential([iaa.Sometimes(then_list=transforms, p=1.0), transformations])
 
     def lane_to_linestrings(self, lanes):
         lines = []
@@ -332,19 +305,15 @@ class GenerateLaneLineATT(object):
         # this function expects the points to be sorted
         points = np.array(points)
         if not np.all(points[1:, 1] < points[:-1, 1]):
-            raise Exception("Annotaion points have to be sorted")
+            raise Exception('Annotaion points have to be sorted')
         x, y = points[:, 0], points[:, 1]
 
         # interpolate points inside domain
         assert len(points) > 1
-        interp = InterpolatedUnivariateSpline(
-            y[::-1], x[::-1], k=min(3, len(points) - 1)
-        )
+        interp = InterpolatedUnivariateSpline(y[::-1], x[::-1], k=min(3, len(points) - 1))
         domain_min_y = y.min()
         domain_max_y = y.max()
-        sample_ys_inside_domain = sample_ys[
-            (sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)
-        ]
+        sample_ys_inside_domain = sample_ys[(sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)]
         assert len(sample_ys_inside_domain) > 0
         interp_xs = interp(sample_ys_inside_domain)
 
@@ -376,7 +345,7 @@ class GenerateLaneLineATT(object):
     def transform_annotation(self, anno, img_wh=None):
         img_w, img_h = self.img_w, self.img_h
 
-        old_lanes = anno["lanes"]
+        old_lanes = anno['lanes']
 
         # removing lanes with less than 2 points
         old_lanes = filter(lambda x: len(x) > 1, old_lanes)
@@ -386,25 +355,18 @@ class GenerateLaneLineATT(object):
         old_lanes = [self.filter_lane(lane) for lane in old_lanes]
         # normalize the annotation coordinates
         old_lanes = [
-            [
-                [x * self.img_w / float(img_w), y * self.img_h / float(img_h)]
-                for x, y in lane
-            ]
-            for lane in old_lanes
+            [[x * self.img_w / float(img_w), y * self.img_h / float(img_h)] for x, y in lane] for lane in old_lanes
         ]
         # create tranformed annotations
         lanes = (
-            np.ones((self.max_lanes, 2 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32)
-            * -1e5
+            np.ones((self.max_lanes, 2 + 1 + 1 + 1 + self.n_offsets), dtype=np.float32) * -1e5
         )  # 2 scores, 1 start_y, 1 start_x, 1 length, S+1 coordinates
         # lanes are invalid by default
         lanes[:, 0] = 1
         lanes[:, 1] = 0
         for lane_idx, lane in enumerate(old_lanes):
             try:
-                xs_outside_image, xs_inside_image = self.sample_lane(
-                    lane, self.offsets_ys
-                )
+                xs_outside_image, xs_inside_image = self.sample_lane(lane, self.offsets_ys)
             except AssertionError:
                 continue
             if len(xs_inside_image) == 0:
@@ -417,7 +379,7 @@ class GenerateLaneLineATT(object):
             lanes[lane_idx, 4] = len(xs_inside_image)
             lanes[lane_idx, 5 : 5 + len(all_xs)] = all_xs
 
-        new_anno = {"label": lanes, "old_anno": anno}
+        new_anno = {'label': lanes, 'old_anno': anno}
         return new_anno
 
     def linestrings_to_lanes(self, lines):
@@ -428,28 +390,24 @@ class GenerateLaneLineATT(object):
         return lanes
 
     def __call__(self, sample):
-        img_org = sample["img"]
-        line_strings_org = self.lane_to_linestrings(sample["lanes"])
+        img_org = sample['img']
+        line_strings_org = self.lane_to_linestrings(sample['lanes'])
         line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
 
         for i in range(30):
-            img, line_strings = self.transform(
-                image=img_org.copy(), line_strings=line_strings_org
-            )
+            img, line_strings = self.transform(image=img_org.copy(), line_strings=line_strings_org)
             line_strings.clip_out_of_image_()
-            new_anno = {"lanes": self.linestrings_to_lanes(line_strings)}
+            new_anno = {'lanes': self.linestrings_to_lanes(line_strings)}
             try:
-                label = self.transform_annotation(
-                    new_anno, img_wh=(self.img_w, self.img_h)
-                )["label"]
+                label = self.transform_annotation(new_anno, img_wh=(self.img_w, self.img_h))['label']
                 break
             except:
                 if (i + 1) == 30:
-                    self.logger.critical("Transform annotation failed 30 times :(")
+                    self.logger.critical('Transform annotation failed 30 times :(')
                     exit()
 
-        sample["img"] = (img / 255.0).astype(np.float32)
-        sample["lane_line"] = label
+        sample['img'] = (img / 255.0).astype(np.float32)
+        sample['lane_line'] = label
 
         return sample
 
@@ -478,12 +436,12 @@ class GenerateLanePts(object):
             transforms = [convert_dictconfig_to_dict(aug) for aug in transforms]
             img_transforms = []
             for aug in transforms:
-                p = aug["p"]
-                if aug["name"] != "OneOf":
+                p = aug['p']
+                if aug['name'] != 'OneOf':
                     img_transforms.append(
                         iaa.Sometimes(
                             p=p,
-                            then_list=getattr(iaa, aug["name"])(**aug["parameters"]),
+                            then_list=getattr(iaa, aug['name'])(**aug['parameters']),
                         )
                     )
                 else:
@@ -491,10 +449,7 @@ class GenerateLanePts(object):
                         iaa.Sometimes(
                             p=p,
                             then_list=iaa.OneOf(
-                                [
-                                    getattr(iaa, aug_["name"])(**aug_["parameters"])
-                                    for aug_ in aug["transforms"]
-                                ]
+                                [getattr(iaa, aug_['name'])(**aug_['parameters']) for aug_ in aug['transforms']]
                             ),
                         )
                     )
@@ -513,19 +468,15 @@ class GenerateLanePts(object):
         # this function expects the points to be sorted
         points = np.array(points)
         if not np.all(points[1:, 1] < points[:-1, 1]):
-            raise Exception("Annotaion points have to be sorted")
+            raise Exception('Annotaion points have to be sorted')
         x, y = points[:, 0], points[:, 1]
 
         # interpolate points inside domain
         assert len(points) > 1
-        interp = InterpolatedUnivariateSpline(
-            y[::-1], x[::-1], k=min(3, len(points) - 1)
-        )
+        interp = InterpolatedUnivariateSpline(y[::-1], x[::-1], k=min(3, len(points) - 1))
         domain_min_y = y.min()
         domain_max_y = y.max()
-        sample_ys_inside_domain = sample_ys[
-            (sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)
-        ]
+        sample_ys_inside_domain = sample_ys[(sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)]
         assert len(sample_ys_inside_domain) > 0
         interp_xs = interp(sample_ys_inside_domain)
 
@@ -557,7 +508,7 @@ class GenerateLanePts(object):
     def transform_annotation(self, anno, img_wh=None):
         img_w, img_h = self.img_w, self.img_h
 
-        old_lanes = anno["lanes"]
+        old_lanes = anno['lanes']
 
         # removing lanes with less than 2 points
         old_lanes = filter(lambda x: len(x) > 1, old_lanes)
@@ -567,18 +518,13 @@ class GenerateLanePts(object):
         old_lanes = [self.filter_lane(lane) for lane in old_lanes]
         # normalize the annotation coordinates
         old_lanes = [
-            [
-                [x * self.img_w / float(img_w), y * self.img_h / float(img_h)]
-                for x, y in lane
-            ]
-            for lane in old_lanes
+            [[x * self.img_w / float(img_w), y * self.img_h / float(img_h)] for x, y in lane] for lane in old_lanes
         ]
         # create tranformed annotations
         # ===========================================================================
         # *                            plus theta
         lanes = (
-            np.ones((self.max_lanes, 2 + 1 + 1 + 2 + self.n_offsets), dtype=np.float32)
-            * -1e5
+            np.ones((self.max_lanes, 2 + 1 + 1 + 2 + self.n_offsets), dtype=np.float32) * -1e5
         )  # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, S+1 coordinates
         # ===========================================================================
         # lanes = np.ones((self.max_lanes, 2 + 1 + 1 + 1 + self.n_offsets),
@@ -592,9 +538,7 @@ class GenerateLanePts(object):
                 break
 
             try:
-                xs_outside_image, xs_inside_image = self.sample_lane(
-                    lane, self.offsets_ys
-                )
+                xs_outside_image, xs_inside_image = self.sample_lane(lane, self.offsets_ys)
             except AssertionError:
                 continue
             if len(xs_inside_image) <= 1:
@@ -609,14 +553,7 @@ class GenerateLanePts(object):
 
             thetas = []
             for i in range(1, len(xs_inside_image)):
-                theta = (
-                    math.atan(
-                        i
-                        * self.strip_size
-                        / (xs_inside_image[i] - xs_inside_image[0] + 1e-5)
-                    )
-                    / math.pi
-                )
+                theta = math.atan(i * self.strip_size / (xs_inside_image[i] - xs_inside_image[0] + 1e-5)) / math.pi
                 theta = theta if theta > 0 else 1 - abs(theta)
                 thetas.append(theta)
             theta_far = sum(thetas) / len(thetas)
@@ -639,7 +576,7 @@ class GenerateLanePts(object):
             # lanes_endpoints[lane_idx, 0] = (len(all_xs) - 1) / self.n_strips
             # lanes_endpoints[lane_idx, 1] = xs_inside_image[-1]
 
-        new_anno = {"label": lanes, "old_anno": anno, "lane_endpoints": lanes_endpoints}
+        new_anno = {'label': lanes, 'old_anno': anno, 'lane_endpoints': lanes_endpoints}
         return new_anno
 
     def linestrings_to_lanes(self, lines):
@@ -659,54 +596,50 @@ class GenerateLanePts(object):
         return all_gt_points
 
     def __call__(self, sample):
-        img_org = sample["img"]
-        if "cut_height" in sample.keys():
-            self.cfg.cut_height = sample["cut_height"]
+        img_org = sample['img']
+        if 'cut_height' in sample.keys():
+            self.cfg.cut_height = sample['cut_height']
         if self.cfg.cut_height != 0:
             new_lanes = []
-            for i in sample["lanes"]:
+            for i in sample['lanes']:
                 lanes = []
                 for p in i:
                     lanes.append((p[0], p[1] - self.cfg.cut_height))
                 new_lanes.append(lanes)
-            sample.update({"lanes": new_lanes})
-        line_strings_org = self.lane_to_linestrings(sample["lanes"])
+            sample.update({'lanes': new_lanes})
+        line_strings_org = self.lane_to_linestrings(sample['lanes'])
         line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
 
         for i in range(30):
             if self.training:
-                mask_org = SegmentationMapsOnImage(sample["mask"], shape=img_org.shape)
+                mask_org = SegmentationMapsOnImage(sample['mask'], shape=img_org.shape)
                 img, line_strings, seg = self.transform(
                     image=img_org.copy().astype(np.uint8),
                     line_strings=line_strings_org,
                     segmentation_maps=mask_org,
                 )
             else:
-                img, line_strings = self.transform(
-                    image=img_org.copy().astype(np.uint8), line_strings=line_strings_org
-                )
+                img, line_strings = self.transform(image=img_org.copy().astype(np.uint8), line_strings=line_strings_org)
             line_strings.clip_out_of_image_()
             new_anno = {
-                "lanes": self.linestrings_to_lanes(line_strings),
-                "gt_points": self.linestrings_to_gtpoints(line_strings),
+                'lanes': self.linestrings_to_lanes(line_strings),
+                'gt_points': self.linestrings_to_gtpoints(line_strings),
             }
             try:
-                annos = self.transform_annotation(
-                    new_anno, img_wh=(self.img_w, self.img_h)
-                )
-                label = annos["label"]
-                lane_endpoints = annos["lane_endpoints"]
+                annos = self.transform_annotation(new_anno, img_wh=(self.img_w, self.img_h))
+                label = annos['label']
+                lane_endpoints = annos['lane_endpoints']
                 break
             except:
                 if (i + 1) == 30:
-                    self.logger.critical("Transform annotation failed 30 times :(")
+                    self.logger.critical('Transform annotation failed 30 times :(')
                     exit()
 
-        sample["img"] = img.astype(np.float32) / 255.0
-        sample["lane_line"] = label
-        sample["lanes_endpoints"] = lane_endpoints
-        sample["gt_points"] = new_anno["gt_points"]
-        sample["seg"] = seg.get_arr() if self.training else np.zeros(img_org.shape)
+        sample['img'] = img.astype(np.float32) / 255.0
+        sample['lane_line'] = label
+        sample['lanes_endpoints'] = lane_endpoints
+        sample['gt_points'] = new_anno['gt_points']
+        sample['seg'] = seg.get_arr() if self.training else np.zeros(img_org.shape)
 
         return sample
 
@@ -726,18 +659,18 @@ class GenerateSRLaneLine(object):
         self.cfg = cfg
 
         if transforms is None:
-            raise NotImplementedError("transforms is None")
+            raise NotImplementedError('transforms is None')
 
         if transforms is not None:
             transforms = [convert_dictconfig_to_dict(aug) for aug in transforms]
             img_transforms = []
             for aug in transforms:
-                p = aug["p"]
-                if aug["name"] != "OneOf":
+                p = aug['p']
+                if aug['name'] != 'OneOf':
                     img_transforms.append(
                         iaa.Sometimes(
                             p=p,
-                            then_list=getattr(iaa, aug["name"])(**aug["parameters"]),
+                            then_list=getattr(iaa, aug['name'])(**aug['parameters']),
                         )
                     )
                 else:
@@ -745,10 +678,7 @@ class GenerateSRLaneLine(object):
                         iaa.Sometimes(
                             p=p,
                             then_list=iaa.OneOf(
-                                [
-                                    getattr(iaa, aug_["name"])(**aug_["parameters"])
-                                    for aug_ in aug["transforms"]
-                                ]
+                                [getattr(iaa, aug_['name'])(**aug_['parameters']) for aug_ in aug['transforms']]
                             ),
                         )
                     )
@@ -778,19 +708,15 @@ class GenerateSRLaneLine(object):
         # this function expects the points to be sorted
         points = np.array(points)
         if not np.all(points[1:, 1] < points[:-1, 1]):
-            raise ValueError("Annotaion points have to be sorted")
+            raise ValueError('Annotaion points have to be sorted')
         x, y = points[:, 0], points[:, 1]
 
         # interpolate points inside domain
         assert len(points) > 1
-        interp = InterpolatedUnivariateSpline(
-            y[::-1], x[::-1], k=min(3, len(points) - 1)
-        )
+        interp = InterpolatedUnivariateSpline(y[::-1], x[::-1], k=min(3, len(points) - 1))
         domain_min_y = y.min()
         domain_max_y = y.max()
-        sample_ys_inside_domain = sample_ys[
-            (sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)
-        ]
+        sample_ys_inside_domain = sample_ys[(sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)]
         assert len(sample_ys_inside_domain) > 0
         interp_xs = interp(
             sample_ys_inside_domain
@@ -801,9 +727,7 @@ class GenerateSRLaneLine(object):
         two_closest_points = points[:2]
         extrap = np.polyfit(two_closest_points[:, 1], two_closest_points[:, 0], deg=1)
         extrap_ys = sample_ys[sample_ys > domain_max_y]
-        extrap_xs = np.polyval(
-            extrap, extrap_ys
-        )  # It is possible to exceed the range. # noqa: E501
+        extrap_xs = np.polyval(extrap, extrap_ys)  # It is possible to exceed the range. # noqa: E501
         all_xs = np.hstack((extrap_xs, interp_xs))
 
         return all_xs
@@ -819,7 +743,7 @@ class GenerateSRLaneLine(object):
             List: Filtered points.
         """
         if points[-1][1] > points[0][1]:
-            raise ValueError("Annotaion points have to be sorted")
+            raise ValueError('Annotaion points have to be sorted')
         filtered_points = []
         used = set()
         for p in points:
@@ -843,11 +767,7 @@ class GenerateSRLaneLine(object):
         """
         if len(points) < 2:
             return False
-        rad = math.atan(
-            math.fabs(
-                (points[-1][1] - points[0][1]) / (points[0][0] - points[-1][0] + 1e-6)
-            )
-        )
+        rad = math.atan(math.fabs((points[-1][1] - points[0][1]) / (points[0][0] - points[-1][0] + 1e-6)))
         angle = math.degrees(rad)
 
         return angle > angle_threshold
@@ -876,12 +796,7 @@ class GenerateSRLaneLine(object):
                 offsets_ys_down = offsets_ys / stride
                 for i, (x, y) in enumerate(zip(all_xs[1:], offsets_ys_down[1:]), 1):
                     int_x, int_y = int(x), int(y)
-                    if (
-                        int_x < 0
-                        or int_x >= gt_angle.shape[1]
-                        or int_y < 0
-                        or int_y >= gt_angle.shape[0]
-                    ):
+                    if int_x < 0 or int_x >= gt_angle.shape[1] or int_y < 0 or int_y >= gt_angle.shape[0]:
                         continue
                     theta = math.atan(1 / (x - all_xs[i - 1] + 1e-6)) / math.pi
                     theta = theta if theta > 0 else 1 - abs(theta)
@@ -914,11 +829,7 @@ class GenerateSRLaneLine(object):
         old_lanes = list(filter(self.check_horizontal_lane, old_lanes))
         # normalize the annotation coordinates
         old_lanes = [
-            [
-                [x * self.img_w / float(img_w), y * self.img_h / float(img_h)]
-                for x, y in lane
-            ]
-            for lane in old_lanes
+            [[x * self.img_w / float(img_w), y * self.img_h / float(img_h)] for x, y in lane] for lane in old_lanes
         ]
 
         angle_map_list, seg_map_list = self.generate_angle_map(old_lanes)
@@ -950,9 +861,9 @@ class GenerateSRLaneLine(object):
             lanes[lane_idx, 4 : 4 + len(all_xs)] = all_xs
 
         new_anno = {
-            "gt_lane": lanes,
-            "gt_angle": angle_map_list,
-            "gt_seg": seg_map_list,
+            'gt_lane': lanes,
+            'gt_angle': angle_map_list,
+            'gt_seg': seg_map_list,
         }
         return new_anno
 
@@ -978,36 +889,30 @@ class GenerateSRLaneLine(object):
         """
         if self.cfg.cut_height != 0:
             new_lanes = []
-            for i in sample["lanes"]:
+            for i in sample['lanes']:
                 lanes = []
                 for p in i:
                     lanes.append((p[0], p[1] - self.cfg.cut_height))
                 new_lanes.append(lanes)
-            sample.update({"lanes": new_lanes})
-        img_org = sample["img"]
-        line_strings_org = self.lane_to_linestrings(sample["lanes"])
+            sample.update({'lanes': new_lanes})
+        img_org = sample['img']
+        line_strings_org = self.lane_to_linestrings(sample['lanes'])
         line_strings_org = LineStringsOnImage(line_strings_org, shape=img_org.shape)
 
         for i in range(10):
             if self.training:
-                img, line_strings = self.transform(
-                    image=img_org.copy().astype(np.uint8), line_strings=line_strings_org
-                )
+                img, line_strings = self.transform(image=img_org.copy().astype(np.uint8), line_strings=line_strings_org)
             else:
-                img, line_strings = self.transform(
-                    image=img_org.copy().astype(np.uint8), line_strings=line_strings_org
-                )
+                img, line_strings = self.transform(image=img_org.copy().astype(np.uint8), line_strings=line_strings_org)
             line_strings.clip_out_of_image_()
             try:
-                annos = self.transform_annotation(
-                    self.linestrings_to_lanes(line_strings)
-                )
+                annos = self.transform_annotation(self.linestrings_to_lanes(line_strings))
                 break
             except Exception as e:
                 if (i + 1) == 10:
                     raise Exception(e)
 
-        sample["img"] = img.astype(np.float32) / 255.0
+        sample['img'] = img.astype(np.float32) / 255.0
         sample.update(annos)
 
         return sample

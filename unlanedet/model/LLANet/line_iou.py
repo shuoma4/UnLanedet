@@ -1,7 +1,7 @@
 import torch
 
 
-def pairwise_line_iou(pred, target, img_w, length=15):
+def pairwise_line_iou(pred, target, img_w, length=15, invalid_value=-1e5):
     """
     Pairwise Line IoU (all-to-all)
     Args:
@@ -9,6 +9,7 @@ def pairwise_line_iou(pred, target, img_w, length=15):
         target: [N_gt, L]   or [B, N_gt, L]
         img_w: image width
         length: extended radius
+        invalid_value: sentinel value for invalid points
     Returns:
         iou: [N_pred, N_gt] or [B, N_pred, N_gt]
     """
@@ -20,23 +21,31 @@ def pairwise_line_iou(pred, target, img_w, length=15):
         # [N_pred, L] x [N_gt, L] -> [N_pred, N_gt, L]
         ovr = torch.min(px2[:, None, :], tx2[None, :, :]) - torch.max(px1[:, None, :], tx1[None, :, :])
         union = torch.max(px2[:, None, :], tx2[None, :, :]) - torch.min(px1[:, None, :], tx1[None, :, :])
-        invalid_mask = (target < 0) | (target >= img_w)
-        invalid_mask = invalid_mask[None, :, :]  # [1, N_gt, L]
     elif pred.dim() == 3:
         # [B, N_pred, L] x [B, N_gt, L] -> [B, N_pred, N_gt, L]
         ovr = torch.min(px2[:, :, None, :], tx2[:, None, :, :]) - torch.max(px1[:, :, None, :], tx1[:, None, :, :])
         union = torch.max(px2[:, :, None, :], tx2[:, None, :, :]) - torch.min(px1[:, :, None, :], tx1[:, None, :, :])
-        invalid_mask = (target < 0) | (target >= img_w)
-        invalid_mask = invalid_mask[:, None, :, :]  # [B, 1, N_gt, L]
     else:
         raise ValueError(f'Unsupported pred dim: {pred.dim()}')
+
+    if pred.dim() == 2:
+        invalid_mask = (target < 0) | (target >= img_w)
+        invalid_mask = invalid_mask[None, :, :]  # [1, N_gt, L]
+    else:
+        invalid_mask = (target < 0) | (target >= img_w)
+        invalid_mask = invalid_mask[:, None, :, :]  # [B, 1, N_gt, L]
+
+    ovr = torch.clamp(ovr, min=0.0)
+    union = torch.clamp(union, min=1e-9)
+
     ovr = ovr.masked_fill(invalid_mask, 0.0)
     union = union.masked_fill(invalid_mask, 0.0)
+
     iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
     return iou
 
 
-def aligned_line_iou(pred, target, img_w, length=15):
+def aligned_line_iou(pred, target, img_w, length=15, invalid_value=-1e5):
     """
     Aligned Line IoU (one-to-one)
     Args:
@@ -44,6 +53,7 @@ def aligned_line_iou(pred, target, img_w, length=15):
         target: [N, L] or [B, N, L]
         img_w: image width
         length: extended radius
+        invalid_value: sentinel value for invalid points
     Returns:
         iou: [N] or [B, N]
     """
@@ -51,12 +61,9 @@ def aligned_line_iou(pred, target, img_w, length=15):
     px2 = pred + length
     tx1 = target - length
     tx2 = target + length
-    # overlap & union
     ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
-    ovr = torch.clamp(ovr, min=0.0)
     union = torch.max(px2, tx2) - torch.min(px1, tx1)
-    # invalid mask (target 越界 or 不可见)
-    invalid_mask = (target < 0) | (target >= img_w)
+    invalid_mask = (target < -100) | (target >= img_w + 100)
     ovr = ovr.masked_fill(invalid_mask, 0.0)
     union = union.masked_fill(invalid_mask, 0.0)
     iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)

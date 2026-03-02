@@ -22,8 +22,8 @@ if '--num-gpus' in sys.argv:
         pass
 
 # Resource Calc
-MAX_TOTAL_WORKERS = 12
-TARGET_BATCH_PER_GPU = 64
+MAX_TOTAL_WORKERS = 16
+TARGET_BATCH_PER_GPU = 160
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
@@ -31,7 +31,6 @@ dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
 from fvcore.common.param_scheduler import CompositeParamScheduler, CosineParamScheduler, LinearParamScheduler
 from omegaconf import OmegaConf
 
-from config.llanet.priors import SAMPLE_YS_EQUIDISTANT
 from unlanedet.config import LazyCall as L
 from unlanedet.data.transform.lane_decoder import LaneDecoder
 from unlanedet.data.transform.openlane_generate import OpenLaneGenerate
@@ -62,8 +61,9 @@ warmup_epochs = 15
 
 sample_ys_mode = 'equal_interval'  # equal_interval-等间距， equal_density-等密度， lane_adaptive-自适应
 sample_lane_mode = 'linear_interp'  # linear_interp-线性插值， arc_length-弧长重采样
-sample_y = SAMPLE_YS_EQUIDISTANT
-num_points = int(len(sample_y))  # 偏移采样点
+# sample_y = SAMPLE_YS_EQUIDISTANT
+# num_points = int(len(sample_y))  # 偏移采样点
+num_points = 72
 max_lanes = 24  # 最大车道数
 num_priors = 96  # 车道线候选框数目
 num_lane_categories = 14 + 1  # 车道线类别数目
@@ -131,7 +131,7 @@ param_config.featuremap_out_channel = featuremap_out_channel
 param_config.num_classes = num_classes
 param_config.num_lane_categories = num_lane_categories
 param_config.num_lr_attributes = num_lr_attributes
-param_config.sample_y = list(sample_y)
+# param_config.sample_y = list(sample_y)
 param_config.num_priors = num_priors
 param_config.sample_ys_mode = sample_ys_mode
 param_config.sample_lane_mode = sample_lane_mode
@@ -148,7 +148,7 @@ epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
-train.eval_period = epoch_per_iter * 100  # 暂时不评估
+train.eval_period = epoch_per_iter * 10
 train.output_dir = './output/llanet/mobilenetv4_openlane/'
 
 # Model Config
@@ -173,7 +173,7 @@ lr_multiplier = L(CompositeParamScheduler)(
         L(LinearParamScheduler)(start_value=0.1, end_value=1.0),
         L(CosineParamScheduler)(start_value=1.0, end_value=0.1),
     ],
-    lengths=[0.3, 0.7],
+    lengths=[0.1, 0.9],
     interval_scaling=['rescaled', 'rescaled'],
 )
 
@@ -235,7 +235,6 @@ dataloader.train.dataset.cfg = param_config
 dataloader.train.total_batch_size = batch_size
 
 dataloader.train.num_workers = safe_workers_per_gpu
-# === INCREASE PREFETCH ===
 dataloader.train.prefetch_factor = 4
 dataloader.train.pin_memory = True
 dataloader.train.persistent_workers = True
@@ -256,13 +255,13 @@ dataloader.evaluator = L(OpenLaneEvaluator)(
     output_dir=f'{train.output_dir}/eval_results/',
     iou_threshold=0.5,
     width=30,
-    metric='OpenLane/F1',
+    metric='F1',
 )
 
 # DDP & AMP
 train.ddp = dict(
     broadcast_buffers=False,
-    find_unused_parameters=True,
+    find_unused_parameters=False,
     fp16_compression=False,
 )
 train.amp = dict(enabled=True)
