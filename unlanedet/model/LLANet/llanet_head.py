@@ -162,7 +162,7 @@ class LLANetHead(nn.Module):
         for m in self.reg_layers.parameters():
             nn.init.normal_(m, mean=0.0, std=1e-3)
 
-        # Initialize seg layers
+        # todo Initialize seg layers
         nn.init.kaiming_normal_(self.seg_conv.weight, mode='fan_out', nonlinearity='relu')
         if self.seg_conv.bias is not None:
             nn.init.constant_(self.seg_conv.bias, 0)
@@ -226,8 +226,7 @@ class LLANetHead(nn.Module):
 
     def generate_priors_from_embeddings(self):
         device = self.prior_embeddings.weight.device
-        # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, 72 coordinates
-        # score[0] = negative prob, score[1] = positive prob
+        # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, 72 coordinates, score[0] = negative prob, score[1] = positive prob
         priors = torch.zeros((self.num_priors, 6 + self.n_offsets), device=device)
         priors[:, 2:5] = self.prior_embeddings.weight.clone()  # y, x, theta
         prior_xs = self.decode_dims(priors)
@@ -268,7 +267,7 @@ class LLANetHead(nn.Module):
                 category: (B, num_priors, self.num_lane_categories)  --- always, need to softmax
                 attributes: (B, num_priors, self.num_lr_attributes)  --- always, need to softmax
         """
-        batch_features = list(features[-self.refine_layers:])
+        batch_features = list(features[-self.refine_layers :])
         batch_features.reverse()
         batch_size = batch_features[-1].shape[0]
 
@@ -285,7 +284,7 @@ class LLANetHead(nn.Module):
         for stage in range(self.refine_layers):
             num_priors = priors_on_featmap.shape[1]
             prior_xs = torch.flip(priors_on_featmap, dims=[2])
-            prior_xs = torch.clamp(prior_xs, 0.0, 1.0)
+            prior_xs = torch.clamp(prior_xs, 0.0, 1.0)  # todo clamp to [0, 1]
             batch_prior_features = self.pool_prior_features(batch_features[stage], num_priors, prior_xs)
             prior_features_stages.append(batch_prior_features)
             fc_features = self.roi_gather(prior_features_stages, batch_features[stage], stage)
@@ -367,8 +366,8 @@ class LLANetHead(nn.Module):
         device = self.priors.device
         predictions_lists = outputs['predictions_lists']  # [tensor(B, num_priors, 6 + num_offsets)]
         targets = batch['lane_line'].to(device).clone()  # tensor(B, max_lanes, 6 + num_offsets)
-        batch_lane_categories = batch.get('lane_categories', None).to(device)  # tensor(B, max_lanes)
-        batch_lane_attributes = batch.get('lane_attributes', None).to(device)  # tensor(B, max_lanes)
+        batch_lane_categories = batch.get('lane_categories', None).to(device)  # tensor(B， max_lanes)
+        batch_lane_attributes = batch.get('lane_attributes', None).to(device)  # tensor(B， max_lanes)
 
         cls_criterion = FocalLoss(alpha=0.25, gamma=2.0, reduction='none')
 
@@ -441,6 +440,7 @@ class LLANetHead(nn.Module):
 
             stage_reg_xytl_loss = F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction='none')
 
+            # Reg Loss should also be averaged over positive samples to be consistent with CLRNet
             stage_reg_loss = stage_reg_xytl_loss.mean()
             total_reg_xytl_loss += stage_reg_loss
 
@@ -461,18 +461,15 @@ class LLANetHead(nn.Module):
             pred_theta_rad = torch.deg2rad(pred_theta)
             pred_delta_x = pos_preds[:, 6:] * (self.img_w - 1)
             sample_ys_pixels = self.sample_ys.to(device) * (self.img_h - 1)
-            sample_ys_pixels = sample_ys_pixels.unsqueeze(0)  # (1, n_offsets)
+            sample_ys_pixels = sample_ys_pixels.unsqueeze(0)  # (1, n_strips)
             pred_tan_theta = torch.tan(pred_theta_rad)
             pred_x_prior = pred_start_x.unsqueeze(1) + (
                 pred_start_y.unsqueeze(1) - sample_ys_pixels
             ) * pred_tan_theta.unsqueeze(1)
             pred_xs = pred_x_prior + pred_delta_x
 
-            # FIX: target_xs from lane_encoder.encode() is xs_sampled in pixel coords [0, img_w).
-            # Clamp invalid (-1e5) entries before passing to IoU to prevent NaN.
-            target_xs = batch['sample_xs'].to(device)  # (B, max_lanes, n_offsets), pixel coords
-            target_xs = target_xs[batch_idx, target_idx]  # (N_pos, n_offsets)
-            target_xs = torch.clamp(target_xs, min=-self.img_w, max=self.img_w * 2)
+            target_xs = batch['sample_xs'].to(device)  # (B, max_lanes, n_strips)
+            target_xs = target_xs[batch_idx, target_idx]  # (N_pos, n_strips)
 
             iou = aligned_line_iou(pred_xs, target_xs, img_w=self.img_w, length=15)
             liou = 1.0 - iou
@@ -526,15 +523,7 @@ class LLANetHead(nn.Module):
                         self.attribute_criterion(F.log_softmax(attr_preds, dim=-1), attr_targets) / num_positives
                     )
 
-        # Seg loss: FIX — clamp seg_target to valid class range to guard against
-        # any spurious out-of-range values after augmentation (except ignore_label).
         seg_target = batch['seg'].long().to(device)
-        # Ensure seg_target values are in [0, num_classes-1] or equal to ignore_label.
-        # Values like -1 or >num_classes from augmentation boundary padding can cause NaN.
-        valid_mask = seg_target != self.cfg.ignore_label
-        seg_target[valid_mask] = torch.clamp(
-            seg_target[valid_mask], min=0, max=self.cfg.num_classes - 1
-        )
         seg_loss = self.seg_criterion(
             F.log_softmax(outputs['seg'], dim=1),
             seg_target,
