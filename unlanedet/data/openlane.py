@@ -116,16 +116,19 @@ class OpenLane(BaseDataset):
             name_part = 'lane3d_1000'
         else:
             name_part = 'unknown'
-        
+
         # Use local cache directory to avoid permission issues and force regeneration
         local_cache_dir = '/data1/lxy_log/workspace/ms/UnLanedet/output/cache'
         import os
         os.makedirs(local_cache_dir, exist_ok=True)
+        # NOTE: cache version bumped to v3 after fixing process_lane_points coordinate scaling bug.
+        # Old v2 caches stored lanes in original image space (1920x1280), causing seg_loss explosion.
+        # v3 caches store lanes in final resized image space (img_w x img_h).
         self.cache_path = osp.join(
             local_cache_dir,
-            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v2.pkl',
+            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v3.pkl',
         )
-        
+
         self.data_infos = self.load_annotations(split)
         self.logger = logging.getLogger(__name__)
         self.logger.info(f'加载 {split} 数据集完成: {len(self.data_infos)} 个样本')
@@ -223,7 +226,7 @@ class OpenLane(BaseDataset):
                 sample = {
                     'img_path': img_path,  # 用于训练的图片完整路径(无论是否经过预处理)
                     'origin_img_path': osp.join(self.data_root, rel_file_path),  # 原图路径(相对于data_root)
-                    'lanes': lanes,  # 2D车道线坐标
+                    'lanes': lanes,  # 2D车道线坐标 — 已转换到最终图像空间 (img_w x img_h)
                     'lanes_3d': lanes_3d,  # 3D车道线坐标
                     'lane_vis': visibilities,  # 可见性信息
                     'lane_categories': categories,  # 车道线类别
@@ -264,7 +267,13 @@ class OpenLane(BaseDataset):
         return data_infos
 
     def process_lane_points(self, u_coords, v_coords, visibility=None):
-        """处理2D车道线点坐标和可见性"""
+        """处理2D车道线点坐标和可见性。
+        输出坐标已转换到最终图像空间 (img_w x img_h)，可直接用于生成分割掩码。
+
+        Bug fix: 之前非预处理路径只做了 cut_height 裁剪，没有做 h_scale/w_scale 缩放，
+        导致 lanes 坐标仍在原始图像空间 (1920x1280)，而 mask 的 shape 是 (img_h, img_w)，
+        polylines 全部越界，seg mask 基本为全0，引发 seg_loss 发散。
+        """
         # 确保u和v坐标长度一致
         if len(u_coords) != len(v_coords):
             min_len = min(len(u_coords), len(v_coords))
@@ -288,15 +297,12 @@ class OpenLane(BaseDataset):
         u_valid, v_valid, vis_valid = u[valid_mask], v[valid_mask], vis[valid_mask]
         if len(u_valid) < 2:  # 有效车道线点数少于两个
             return None, None
-        # 坐标转换
-        if self.use_preprocessed:
-            # 预处理图像：已经缩放，只需要调整坐标
-            v_transformed = (v_valid - self.cut_height) * self.h_scale
-            u_transformed = u_valid * self.w_scale
-        else:
-            # 原始图像：需要裁剪和缩放
-            v_transformed = v_valid - self.cut_height
-            u_transformed = u_valid
+
+        # 坐标转换：无论是否预处理，输出坐标都应在最终图像空间 (img_w x img_h)
+        # FIX: 非预处理路径之前缺少 * self.h_scale 和 * self.w_scale
+        v_transformed = (v_valid - self.cut_height) * self.h_scale  # -> [0, img_h]
+        u_transformed = u_valid * self.w_scale                       # -> [0, img_w]
+
         points = np.stack([u_transformed, v_transformed], axis=1)
         sort_idx = points[:, 1].argsort()[::-1]
         return points[sort_idx], vis_valid[sort_idx]
@@ -337,11 +343,12 @@ class OpenLane(BaseDataset):
         img = cv2.imread(data_info['img_path'])
         # 裁剪天空区域（如果是原始图像），此处无需再resize
         if not self.use_preprocessed:
-            img = img[self.cut_height :, :, :]
+            img = img[self.cut_height:, :, :]
         # 调整图像尺寸（如果是原始图像）
         if not self.use_preprocessed and (img.shape[0] != self.img_h or img.shape[1] != self.img_w):
             img = cv2.resize(img, (self.img_w, self.img_h))
         # 生成分割掩码
+        # NOTE: data_info['lanes'] 现在已经在最终图像空间 (img_w x img_h)，与 img.shape 一致
         mask = generate_lane_mask_binary(img, data_info['lanes'])
         # 构建样本
         sample = {
