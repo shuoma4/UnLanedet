@@ -63,6 +63,10 @@ def aligned_line_iou(pred, target, img_w, length=15, invalid_value=-1e5):
     tx2 = target + length
     ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
     union = torch.max(px2, tx2) - torch.min(px1, tx1)
+
+    ovr = torch.clamp(ovr, min=0.0)
+    union = torch.clamp(union, min=1e-9)
+
     invalid_mask = (target < -100) | (target >= img_w + 100)
     ovr = ovr.masked_fill(invalid_mask, 0.0)
     union = union.masked_fill(invalid_mask, 0.0)

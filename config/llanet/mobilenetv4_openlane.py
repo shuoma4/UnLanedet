@@ -48,7 +48,7 @@ category_loss_weight = 1.0
 attribute_loss_weight = 2.0
 
 # dynamic assignment weights (Geometry-Aware)
-assign_method_name = 'CLRNet'  # Ooptions : GeometryAware or CLRNet
+assign_method_name = 'GeometryAware'  # Ooptions : GeometryAware or CLRNet
 w_cls = 2.0
 w_geom = 4.0
 w_iou = 2.0
@@ -82,7 +82,7 @@ bg_weight = 0.4
 featuremap_out_channel = 64
 num_classes = 1 + 1  # 分割任务只分类车道线和背景
 data_root = '/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/'  # openlane 数据集根目录
-lane_anno_dir = 'lane3d_1000/'  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
+lane_anno_dir = 'lane3d_300/'  # 车道线标注目录，相对于data_root的目录（lane3d_300是小数据集，lane3d_1000为大数据集）
 opencv_path = '/home/lixiyang/anaconda3/envs/dataset-manger/lib'  # OpenLane 2d 评估可执行程序链接的opencv库
 dataset_statistics = (
     '/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz'
@@ -142,7 +142,7 @@ param_config.decoder = L(LaneDecoder)(cfg=param_config)
 # Training Config
 train = get_config('config/common/train.py').train
 epochs = 30
-train_samples = 142226  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
+train_samples = 45903  # 300d训练集样本数 - 45903; 1000d训练集样本数 - 142226
 batch_size = dynamic_total_batch_size
 epoch_per_iter = (train_samples + batch_size - 1) // batch_size
 total_iter = epoch_per_iter * epochs

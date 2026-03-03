@@ -68,7 +68,11 @@ class LLANetHead(nn.Module):
         self.register_buffer('priors_on_featmap', priors_on_featmap)
 
         # seg module
-        self.seg_conv = nn.Conv2d(self.prior_feat_channels * self.refine_layers, self.prior_feat_channels, 1)
+        self.seg_conv = nn.Sequential(
+            nn.Conv2d(self.prior_feat_channels * self.refine_layers, self.prior_feat_channels, 1, bias=False),
+            nn.BatchNorm2d(self.prior_feat_channels),
+            nn.ReLU(inplace=True),
+        )
         self.seg_decoder = PlainDecoder(cfg)
 
         self.roi_gather = ROIGather(
@@ -163,9 +167,14 @@ class LLANetHead(nn.Module):
             nn.init.normal_(m, mean=0.0, std=1e-3)
 
         # todo Initialize seg layers
-        nn.init.kaiming_normal_(self.seg_conv.weight, mode='fan_out', nonlinearity='relu')
-        if self.seg_conv.bias is not None:
-            nn.init.constant_(self.seg_conv.bias, 0)
+        for m in self.seg_conv.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
         for m in self.seg_decoder.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -458,6 +467,7 @@ class LLANetHead(nn.Module):
             pred_start_y = pos_preds[:, 2] * (self.img_h - 1)
             pred_start_x = pos_preds[:, 3] * (self.img_w - 1)
             pred_theta = pos_preds[:, 4] * 90
+            pred_theta = torch.clamp(pred_theta, -85.0, 85.0)
             pred_theta_rad = torch.deg2rad(pred_theta)
             pred_delta_x = pos_preds[:, 6:] * (self.img_w - 1)
             sample_ys_pixels = self.sample_ys.to(device) * (self.img_h - 1)
@@ -514,18 +524,19 @@ class LLANetHead(nn.Module):
                     cat_preds = outputs['category'][assigned_mask]
                     cat_targets = batch_lane_categories[batch_idx, target_idx]
                     total_category_loss += (
-                        self.category_criterion(F.log_softmax(cat_preds, dim=-1), cat_targets) / num_positives
+                        self.category_criterion(F.log_softmax(cat_preds.float(), dim=-1), cat_targets) / num_positives
                     )
                 if self.enable_attribute:
                     attr_preds = outputs['attribute'][assigned_mask]
                     attr_targets = batch_lane_attributes[batch_idx, target_idx]
                     total_attribute_loss += (
-                        self.attribute_criterion(F.log_softmax(attr_preds, dim=-1), attr_targets) / num_positives
+                        self.attribute_criterion(F.log_softmax(attr_preds.float(), dim=-1), attr_targets)
+                        / num_positives
                     )
 
         seg_target = batch['seg'].long().to(device)
         seg_loss = self.seg_criterion(
-            F.log_softmax(outputs['seg'], dim=1),
+            F.log_softmax(outputs['seg'].float(), dim=1),
             seg_target,
         )
 
