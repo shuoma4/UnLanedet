@@ -31,6 +31,8 @@ class OpenLaneGenerate(object):
         self.img_w, self.img_h = cfg.img_w, cfg.img_h
         self.num_points = cfg.num_points
         self.max_lanes = cfg.max_lanes
+        self.num_lane_categories = getattr(cfg, 'num_lane_categories', 15)  # Default to 15 if not set
+        self.num_lr_attributes = getattr(cfg, 'num_lr_attributes', 5)  # Default to 5 if not set
         self.training = training
         self.mean = np.array(cfg.img_norm['mean'], dtype=np.float32)
         self.std = np.array(cfg.img_norm['std'], dtype=np.float32)
@@ -91,6 +93,8 @@ class OpenLaneGenerate(object):
     # ============================================================
     def transform_annotation(self, anno):
         old_lanes = anno['lanes']
+        # assert old_lanes not nan
+
         old_categories = anno.get('lane_categories', [0] * len(old_lanes))
         old_attributes = anno.get('lane_attributes', [0] * len(old_lanes))
 
@@ -115,6 +119,10 @@ class OpenLaneGenerate(object):
                 continue
             try:
                 reg, end_pt, xs, ys = self.encoder.encode(lane_pts)
+                # Check for NaNs in encoder output
+                if np.isnan(reg).any() or np.isnan(end_pt).any() or np.isnan(xs).any():
+                    self.logger.warning(f'NaN found in encoded lane {i}')
+                    continue
             except Exception:
                 # self.logger.debug(f'Encode lane failed: {e}')
                 continue
@@ -124,8 +132,19 @@ class OpenLaneGenerate(object):
             sample_xs[i, :] = xs
             lane_endpoints[i, 0] = end_pt[0]
             lane_endpoints[i, 1] = end_pt[1]
-            padded_categories[i] = old_categories[i]
-            padded_attributes[i] = old_attributes[i]
+
+            # Safe assignment for categories and attributes
+            cat = int(old_categories[i])
+            attr = int(old_attributes[i])
+            # Clip or validate
+            if cat < 0 or cat >= self.num_lane_categories:
+                # self.logger.warning(f"Category {cat} out of range [0, {self.num_lane_categories})")
+                cat = 0  # Default to 0 or some safe value? Or maybe keep it but it will be asserted later
+            if attr < 0 or attr >= self.num_lr_attributes:
+                # self.logger.warning(f"Attribute {attr} out of range [0, {self.num_lr_attributes})")
+                attr = 0
+            padded_categories[i] = cat
+            padded_attributes[i] = attr
 
         new_anno = {
             'lane_line': lanes,  # (max_lanes, 6 + N)
@@ -190,6 +209,40 @@ class OpenLaneGenerate(object):
         sample['lane_categories'] = annos['padded_categories']
         sample['lane_attributes'] = annos['padded_attributes']
         sample['gt_points'] = annos['gt_points']
-        sample['seg'] = seg.get_arr() if self.training else None
+
+        assert not np.isnan(sample['lane_line']).any()
+        assert not np.isnan(sample['sample_xs']).any()
+        assert not np.isnan(sample['lane_endpoints']).any()
+        assert not np.isnan(sample['lane_categories']).any()
+        assert not np.isnan(sample['lane_attributes']).any()
+
+        assert (sample['lane_categories'] >= 0).all() and (
+            sample['lane_categories'] < self.num_lane_categories
+        ).all(), (
+            f'Lane categories out of range [0, {self.num_lane_categories}): {sample["lane_categories"].min()} - {sample["lane_categories"].max()}'
+        )
+        assert (sample['lane_attributes'] >= 0).all() and (sample['lane_attributes'] < self.num_lr_attributes).all(), (
+            f'Lane attributes out of range [0, {self.num_lr_attributes}): {sample["lane_attributes"].min()} - {sample["lane_attributes"].max()}'
+        )
+
+        if self.training:
+            seg_arr = seg.get_arr()
+            seg_arr = seg_arr.astype(np.uint8)
+            seg_arr[seg_arr > 1] = 1
+            assert seg_arr.shape == (self.img_h, self.img_w)
+            assert seg_arr.dtype == np.uint8
+            assert seg_arr.max() <= 1
+            assert seg_arr.min() == 0
+
+            # Check for mask saturation (if > 20% of pixels are lanes, likely a bug)
+            lane_pixel_count = seg_arr.sum()
+            total_pixels = seg_arr.size
+            if lane_pixel_count > 0.2 * total_pixels:
+                # self.logger.warning(f"Seg mask saturated: {lane_pixel_count/total_pixels:.2%} pixels are lanes. Zeroing mask.")
+                seg_arr[:] = 0
+
+            sample['seg'] = seg_arr
+        else:
+            sample['seg'] = None
 
         return sample

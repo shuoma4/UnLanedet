@@ -184,7 +184,6 @@ class LaneEncoder(object):
         delta_x = np.ones_like(xs_sampled, dtype=np.float32) * -1e5
         theta_deg = theta_far * 90.0
 
-        # 隐藏的截断逻辑：限制先验倾斜角在 [-85, 85] 之间，防止 tan 值过大
         theta_deg = np.clip(theta_deg, -85.0, 85.0)
         tan_theta = np.tan(np.deg2rad(theta_deg))
         prior_xs = start_x + (start_y - sample_ys) * tan_theta

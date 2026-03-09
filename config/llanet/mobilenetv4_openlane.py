@@ -23,7 +23,7 @@ if '--num-gpus' in sys.argv:
 
 # Resource Calc
 MAX_TOTAL_WORKERS = 16
-TARGET_BATCH_PER_GPU = 160
+TARGET_BATCH_PER_GPU = 80
 
 safe_workers_per_gpu = max(1, MAX_TOTAL_WORKERS // runtime_num_gpus)
 dynamic_total_batch_size = TARGET_BATCH_PER_GPU * runtime_num_gpus
@@ -35,6 +35,7 @@ from unlanedet.config import LazyCall as L
 from unlanedet.data.transform.lane_decoder import LaneDecoder
 from unlanedet.data.transform.openlane_generate import OpenLaneGenerate
 from unlanedet.data.transform.transforms import ToTensor
+from unlanedet.data.transform.custom_transforms import BGR2RGB
 from unlanedet.evaluation.openlane_evaluator import OpenLaneEvaluator
 
 from ..modelzoo import get_config
@@ -158,8 +159,8 @@ param_config.output_dir = train.output_dir  # 输出目录，用于保存模型�
 param_config.epoch_per_iter = epoch_per_iter  # 每个epoch的迭代次数
 param_config.assign_method = assign_method_name
 param_config.pretrained_model_name = 'mobilenetv4_conv_small'  # 预训练模型名称
-param_config.enable_category = True
-param_config.enable_attribute = True
+param_config.enable_category = False
+param_config.enable_attribute = False
 param_config.scale_factor = 20.0
 param_config.detailed_loss_logger_config = dict(output_dir=param_config.output_dir, filename='detailed_metrics.json')
 model = create_llanet_model(param_config)
@@ -208,6 +209,7 @@ train_transforms = base_transforms + [
 ]
 
 train_process = [
+    L(BGR2RGB)(),
     L(OpenLaneGenerate)(transforms=train_transforms, cfg=param_config, training=True),
     L(ToTensor)(
         keys=['img', 'lane_line', 'sample_xs', 'seg'],
@@ -218,6 +220,7 @@ train_process = [
 # 验证时的处理
 val_transforms = base_transforms
 val_process = [
+    L(BGR2RGB)(),
     L(OpenLaneGenerate)(
         transforms=val_transforms,
         training=False,

@@ -57,7 +57,7 @@ def create_llanet_model(cfg):
     if pretrained_model_name not in backbone_channels:
         print(f'Warning: Unknown backbone {pretrained_model_name}, defaulting to medium channels [80, 160, 960]')
 
-    neck_type = getattr(cfg, 'neck_type', 'GSAFPN')
+    neck_type = getattr(cfg, 'neck_type', 'FPN')
     if neck_type == 'GSAFPN':
         neck = L(GSAFPN)(
             in_channels=in_channels,

@@ -169,6 +169,8 @@ cython_debug/
 /source
 .trae
 /vis
+/papers
+/experiment
 
 # extra ide
 .codebuddy 

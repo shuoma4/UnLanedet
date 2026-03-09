@@ -20,3 +20,4 @@ from .lane_decoder import LaneDecoder
 from .lane_encoder import LaneEncoder
 from .test_time_aug import MultiScaleFlipAug
 from .transforms import *
+from .custom_transforms import BGR2RGB

@@ -38,4 +38,10 @@ dataloader.test = L(build_batch_data_loader)(
     shuffle=False,
 )
 
-dataloader.evaluator = L(OpenLaneEvaluator)(iou_threshold=0.5, width=30, metric='F1')
+dataloader.evaluator = L(OpenLaneEvaluator)(
+    cfg='${...dataloader.test.dataset.processes[0].cfg}',
+    evaluate_bin_path='unlanedet/evaluation/openlane/evaluate',
+    iou_threshold=0.5,
+    width=30,
+    metric='F1',
+)

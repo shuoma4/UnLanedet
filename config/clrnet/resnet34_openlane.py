@@ -173,7 +173,7 @@ dataloader.evaluator = L(OpenLaneEvaluator)(
     output_dir='/data1/lxy_log/workspace/ms/UnLanedet/output/clrnet/resnet34_openlane/eval_results/',
     iou_threshold=0.5,
     width=30,
-    metric='OpenLane/F1',
+    metric='F1',
 )
 
 # Training Config

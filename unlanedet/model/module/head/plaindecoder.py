@@ -1,7 +1,5 @@
-import torch
-from torch import nn
 import torch.nn.functional as F
-from torch.hub import load_state_dict_from_url
+from torch import nn
 
 
 class PlainDecoder(nn.Module):
@@ -16,23 +14,23 @@ class PlainDecoder(nn.Module):
 
         x = self.dropout(x)
         x = self.conv8(x)
-        if "img_height" in self.cfg:
+        if 'img_height' in self.cfg:
             x = F.interpolate(
                 x,
                 size=[self.cfg.img_height, self.cfg.img_width],
-                mode="bilinear",
+                mode='bilinear',
                 align_corners=False,
             )
-        elif "img_h" in self.cfg:
+        elif 'img_h' in self.cfg:
             x = F.interpolate(
                 x,
                 size=[self.cfg.img_h, self.cfg.img_w],
-                mode="bilinear",
+                mode='bilinear',
                 align_corners=False,
             )
         else:
-            raise RuntimeError("img width does not in the cfg, check it")
+            raise RuntimeError('img width does not in the cfg, check it')
 
-        output = {"seg": x}
+        output = {'seg': x}
 
         return output

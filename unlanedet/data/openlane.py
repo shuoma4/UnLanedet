@@ -116,16 +116,17 @@ class OpenLane(BaseDataset):
             name_part = 'lane3d_1000'
         else:
             name_part = 'unknown'
-        
+
         # Use local cache directory to avoid permission issues and force regeneration
         local_cache_dir = '/data1/lxy_log/workspace/ms/UnLanedet/output/cache'
         import os
+
         os.makedirs(local_cache_dir, exist_ok=True)
         self.cache_path = osp.join(
             local_cache_dir,
-            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v2.pkl',
+            f'openlane_{name_part}_{split}_cuth-{self.cut_height}_{self.img_w}x{self.img_h}_cache_v4.pkl',
         )
-        
+
         self.data_infos = self.load_annotations(split)
         self.logger = logging.getLogger(__name__)
         self.logger.info(f'加载 {split} 数据集完成: {len(self.data_infos)} 个样本')
@@ -249,6 +250,9 @@ class OpenLane(BaseDataset):
                     sample['pose'] = np.array(pose, dtype=np.float32)
                 else:
                     sample['pose'] = None
+                parts = rel_file_path.split('/')
+                if len(parts) >= 2:
+                    sample['segment_name'] = parts[1]
                 data_infos.append(sample)
                 processed_count += 1
 
@@ -288,16 +292,16 @@ class OpenLane(BaseDataset):
         u_valid, v_valid, vis_valid = u[valid_mask], v[valid_mask], vis[valid_mask]
         if len(u_valid) < 2:  # 有效车道线点数少于两个
             return None, None
-        # 坐标转换
-        if self.use_preprocessed:
-            # 预处理图像：已经缩放，只需要调整坐标
-            v_transformed = (v_valid - self.cut_height) * self.h_scale
-            u_transformed = u_valid * self.w_scale
-        else:
-            # 原始图像：需要裁剪和缩放
-            v_transformed = v_valid - self.cut_height
-            u_transformed = u_valid
-        points = np.stack([u_transformed, v_transformed], axis=1)
+        # # 坐标转换
+        # if self.use_preprocessed:
+        #     # 预处理图像：已经缩放，只需要调整坐标
+        #     v_transformed = (v_valid - self.cut_height) * self.h_scale
+        #     u_transformed = u_valid * self.w_scale
+        # else:
+        #     # 原始图像：仅调整格式，不需要裁剪和缩放（交给transform处理）
+        #     v_transformed = v_valid
+        #     u_transformed = u_valid
+        points = np.stack([u_valid, v_valid], axis=1)
         sort_idx = points[:, 1].argsort()[::-1]
         return points[sort_idx], vis_valid[sort_idx]
 
@@ -335,14 +339,13 @@ class OpenLane(BaseDataset):
             idx = idx % len(self.data_infos)
         data_info = self.data_infos[idx]
         img = cv2.imread(data_info['img_path'])
-        # 裁剪天空区域（如果是原始图像），此处无需再resize
-        if not self.use_preprocessed:
-            img = img[self.cut_height :, :, :]
-        # 调整图像尺寸（如果是原始图像）
-        if not self.use_preprocessed and (img.shape[0] != self.img_h or img.shape[1] != self.img_w):
-            img = cv2.resize(img, (self.img_w, self.img_h))
-        # 生成分割掩码
-        mask = generate_lane_mask_binary(img, data_info['lanes'])
+        img = img[self.cut_height :, :, :]
+        lanes_for_mask = []
+        for lane in data_info['lanes']:
+            lane_shifted = lane.copy()
+            lane_shifted[:, 1] -= self.cut_height
+            lanes_for_mask.append(lane_shifted)
+        mask = generate_lane_mask_binary(img, lanes_for_mask)
         # 构建样本
         sample = {
             'img': img,

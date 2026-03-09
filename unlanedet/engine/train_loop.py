@@ -485,8 +485,7 @@ class AMPTrainer(SimpleTrainer):
         if grad_scaler is None:
             from torch.cuda.amp import GradScaler
 
-            # 【修复】设置 init_scale 为 1.0，防止训练初期 Loss 过大导致 backward 时 FP16 溢出
-            grad_scaler = GradScaler(init_scale=1.0)
+            grad_scaler = GradScaler(init_scale=1024)
         self.grad_scaler = grad_scaler
         self.precision = precision
         self.log_grad_scaler = log_grad_scaler
@@ -535,13 +534,6 @@ class AMPTrainer(SimpleTrainer):
             )
         else:
             self._write_metrics(loss_dict, data_time)
-
-        # === 【修改】手动梯度裁剪逻辑 ===
-        # 1. 解缩放梯度，使梯度回到 FP32 范围，以便正确计算 Norm
-        self.grad_scaler.unscale_(self.optimizer)
-        # 2. 裁剪梯度，防止梯度爆炸 (Max Norm = 35.0)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=35.0)
-        # ============================
 
         self.grad_scaler.step(self.optimizer)
         self.grad_scaler.update()

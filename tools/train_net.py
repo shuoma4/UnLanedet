@@ -1,3 +1,13 @@
+import imgaug.augmenters.color as iaa_color
+import numpy as np
+import sys
+import os
+sys.path.insert(0, os.getcwd())
+
+# if iaa_color.AddToHueAndSaturation._LUT_CACHE is None:
+#    iaa_color.AddToHueAndSaturation._LUT_CACHE = [np.arange(256, dtype=np.int16), np.arange(256, dtype=np.int16)]
+
+
 import copy
 import logging
 

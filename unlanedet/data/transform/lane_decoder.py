@@ -13,6 +13,7 @@ class LaneDecoder(nn.Module):
         self.img_w = cfg.img_w
         self.img_h = cfg.img_h
         self.num_points = cfg.num_points
+        self.decode_mode = getattr(cfg, 'lane_decode_mode', 'delta')
 
     # ------------------------------------------------
     # 纯几何解码（GPU / CPU 通用）
@@ -37,6 +38,27 @@ class LaneDecoder(nn.Module):
             valid_mask: (B, M, N)
         """
         device = reg.device
+
+        if self.decode_mode == 'abs_fixed_y':
+            # CLRNet mode: reg[..., 6:] are absolute normalized X coordinates
+            # Y coordinates are fixed linear space from 1 to 0
+            xs = reg[..., 6:] * (self.img_w - 1)
+            
+            if sample_ys is None:
+                # Default CLRNet Y priors: 1 -> 0
+                t = torch.linspace(1, 0, self.num_points, device=device)
+                if xs.ndim == 3:
+                    ys = t.view(1, 1, -1).expand(xs.shape) * (self.img_h - 1)
+                else:
+                    ys = t.view(1, -1).expand(xs.shape) * (self.img_h - 1)
+            else:
+                if xs.ndim == 3:
+                    ys = sample_ys.to(device).view(1, 1, -1).expand(xs.shape)
+                else:
+                    ys = sample_ys.to(device).view(1, -1).expand(xs.shape)
+            
+            valid_mask = (xs >= 0) & (xs < self.img_w)
+            return xs, ys, valid_mask
 
         start_y = reg[..., 2] * (self.img_h - 1)
         start_x = reg[..., 3] * (self.img_w - 1)

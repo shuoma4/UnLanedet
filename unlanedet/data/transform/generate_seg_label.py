@@ -40,7 +40,7 @@ def generate_lane_mask(image, lane_points_list, category_list, line_width=5):
     return mask
 
 
-def generate_lane_mask_binary(image, lane_points_list, line_width=11):
+def generate_lane_mask_binary(image, lane_points_list, line_width=15):
     h, w = image.shape[:2] if not isinstance(image, (tuple, list)) else image
     mask = np.zeros((h, w), dtype=np.uint8)
 

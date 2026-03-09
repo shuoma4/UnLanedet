@@ -1,7 +1,63 @@
 import math
 
 import imgaug.augmenters as iaa
+import imgaug.augmenters.color as color
+import imgaug.augmenters.meta as meta
 import numpy as np
+
+# Monkey patch to fix potential issue with LUT table size in imgaug and ensure cache init
+try:
+
+    def _generate_lut_table_patched(cls):
+        dtype = np.uint8
+        table = (np.zeros((256 * 2, 256), dtype=dtype), np.zeros((256 * 2, 256), dtype=dtype))
+        value_range = np.arange(0, 256, dtype=np.int16)
+        for i in range(-255, 255 + 1):
+            table_hue = np.mod(value_range + i, 180)
+            table_saturation = np.clip(value_range + i, 0, 255)
+            table[0][255 + i, :] = table_hue
+            table[1][255 + i, :] = table_saturation
+        return table
+
+    color.AddToHueAndSaturation._generate_lut_table = classmethod(_generate_lut_table_patched)
+    # Initialize cache immediately to ensure it exists in workers
+    color.AddToHueAndSaturation._LUT_CACHE = color.AddToHueAndSaturation._generate_lut_table()
+
+    # Monkey patch to fix np.bool deprecation in imgaug
+    def _get_augmenter_active_patched(self, nb_rows, random_state):
+        # pylint: disable=invalid-name
+        nn = self._get_n(nb_rows, random_state)
+        nn = [min(n, len(self)) for n in nn]
+        augmenter_active = np.zeros((nb_rows, len(self)), dtype=bool)
+        for row_idx, n_true in enumerate(nn):
+            if n_true > 0:
+                augmenter_active[row_idx, 0:n_true] = 1
+        for row in augmenter_active:
+            random_state.shuffle(row)
+        return augmenter_active
+
+    meta.Augmenter._get_augmenter_active = _get_augmenter_active_patched
+    # Also patch OneOf specifically as it might override or use the base implementation
+    # But since OneOf inherits from Augmenter (via SomeOf -> Augmenter), patching Augmenter might not be enough if OneOf overrides it.
+    # Checking imgaug source code, SomeOf (parent of OneOf) implements _get_augmenter_active.
+
+    def _get_augmenter_active_someof_patched(self, nb_rows, random_state):
+        # pylint: disable=invalid-name
+        nn = self._get_n(nb_rows, random_state)
+        nn = [min(n, len(self)) for n in nn]
+        augmenter_active = np.zeros((nb_rows, len(self)), dtype=bool)
+        for row_idx, n_true in enumerate(nn):
+            if n_true > 0:
+                augmenter_active[row_idx, 0:n_true] = 1
+        for row in augmenter_active:
+            random_state.shuffle(row)
+        return augmenter_active
+
+    meta.SomeOf._get_augmenter_active = _get_augmenter_active_someof_patched
+
+except Exception as e:
+    print(f'Warning: Failed to patch imgaug: {e}')
+
 from imgaug.augmentables.lines import LineString, LineStringsOnImage
 from imgaug.augmentables.segmaps import SegmentationMapsOnImage
 from imgaug.augmenters import Resize
@@ -25,11 +81,7 @@ def CLRTransforms(img_h, img_w):
         dict(name='HorizontalFlip', parameters=dict(p=1.0), p=0.5),
         dict(
             name='Affine',
-            parameters=dict(
-                translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)),
-                rotate=(-10, 10),
-                scale=(0.8, 1.2),
-            ),
+            parameters=dict(translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)), rotate=(-10, 10), scale=(0.8, 1.2)),
             p=0.7,
         ),
         dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
@@ -59,12 +111,7 @@ class GenerateLaneLine(object):
             for aug in transforms:
                 p = aug['p']
                 if aug['name'] != 'OneOf':
-                    img_transforms.append(
-                        iaa.Sometimes(
-                            p=p,
-                            then_list=getattr(iaa, aug['name'])(**aug['parameters']),
-                        )
-                    )
+                    img_transforms.append(iaa.Sometimes(p=p, then_list=getattr(iaa, aug['name'])(**aug['parameters'])))
                 else:
                     img_transforms.append(
                         iaa.Sometimes(
@@ -94,39 +141,26 @@ class GenerateLaneLine(object):
 
         # interpolate points inside domain
         assert len(points) > 1
+        interp = InterpolatedUnivariateSpline(y[::-1], x[::-1], k=min(3, len(points) - 1))
         domain_min_y = y.min()
         domain_max_y = y.max()
         sample_ys_inside_domain = sample_ys[(sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)]
         assert len(sample_ys_inside_domain) > 0
+        interp_xs = interp(sample_ys_inside_domain)
 
-        # Use np.interp for robust linear interpolation instead of Spline
-        # Note: np.interp expects xp to be increasing
-        # points are sorted by Y descending, so we reverse them for np.interp
-        interp_xs = np.interp(sample_ys_inside_domain, y[::-1], x[::-1], left=np.nan, right=np.nan)
-
-        # extrapolate lane to the bottom of the image with a straight line
-        # using the closest points (up to 5) to reduce noise sensitivity
-        n_extrap = min(5, len(points))
-        closest_points = points[:n_extrap]
-
-        # Linear fit (deg=1)
-        extrap = np.polyfit(closest_points[:, 1], closest_points[:, 0], deg=1)
+        # extrapolate lane to the bottom of the image with a straight line using the 2 points closest to the bottom
+        two_closest_points = points[:2]
+        extrap = np.polyfit(two_closest_points[:, 1], two_closest_points[:, 0], deg=1)
         extrap_ys = sample_ys[sample_ys > domain_max_y]
         extrap_xs = np.polyval(extrap, extrap_ys)
-
-        # Fill the remaining part (sample_ys < domain_min_y) with -1e5
-        # This ensures all_xs has the same length as sample_ys
-        remaining_ys_count = len(sample_ys) - len(extrap_xs) - len(interp_xs)
-        remaining_xs = np.ones(remaining_ys_count, dtype=np.float32) * -1e5
-
-        all_xs = np.hstack((extrap_xs, interp_xs, remaining_xs))
+        all_xs = np.hstack((extrap_xs, interp_xs))
 
         # separate between inside and outside points
-        # inside_mask = (all_xs >= 0) & (all_xs < self.img_w)
-        # xs_inside_image = all_xs[inside_mask]
-        # xs_outside_image = all_xs[~inside_mask]
+        inside_mask = (all_xs >= 0) & (all_xs < self.img_w)
+        xs_inside_image = all_xs[inside_mask]
+        xs_outside_image = all_xs[~inside_mask]
 
-        return all_xs
+        return xs_outside_image, xs_inside_image
 
     def filter_lane(self, lane):
         assert lane[-1][1] <= lane[0][1]
@@ -162,34 +196,25 @@ class GenerateLaneLine(object):
         # lanes are invalid by default
         lanes[:, 0] = 1
         lanes[:, 1] = 0
-        for lane_idx, lane in enumerate[list[list]](old_lanes):
+        for lane_idx, lane in enumerate(old_lanes):
             if lane_idx >= self.max_lanes:
                 break
 
             try:
-                all_xs = self.sample_lane(lane, self.offsets_ys)
+                xs_outside_image, xs_inside_image = self.sample_lane(lane, self.offsets_ys)
             except AssertionError:
                 continue
-
-            valid_mask = (all_xs >= 0) & (all_xs < self.img_w)
-            if valid_mask.sum() < 2:
+            if len(xs_inside_image) <= 1:
                 continue
-
-            valid_indices = np.where(valid_mask)[0]
-            start_index = valid_indices[0]
-            xs_inside = all_xs[valid_mask]
-
+            all_xs = np.hstack((xs_outside_image, xs_inside_image))
             lanes[lane_idx, 0] = 0
             lanes[lane_idx, 1] = 1
-            lanes[lane_idx, 2] = start_index / self.n_strips
-            lanes[lane_idx, 3] = xs_inside[0]
+            lanes[lane_idx, 2] = len(xs_outside_image) / self.n_strips
+            lanes[lane_idx, 3] = xs_inside_image[0]
 
             thetas = []
-            ys_inside = self.offsets_ys[valid_indices]
-            for i in range(1, len(xs_inside)):
-                dy = abs(ys_inside[i] - ys_inside[0])
-                dx = xs_inside[i] - xs_inside[0]
-                theta = math.atan(dy / (dx + 1e-5)) / math.pi
+            for i in range(1, len(xs_inside_image)):
+                theta = math.atan(i * self.strip_size / (xs_inside_image[i] - xs_inside_image[0] + 1e-5)) / math.pi
                 theta = theta if theta > 0 else 1 - abs(theta)
                 thetas.append(theta)
 
@@ -198,15 +223,10 @@ class GenerateLaneLine(object):
             # lanes[lane_idx,
             #       4] = (theta_closest + theta_far) / 2  # averaged angle
             lanes[lane_idx, 4] = theta_far
-            lanes[lane_idx, 5] = len(xs_inside)
-
-            # Fill coordinates with -1e5 for invalid/outside points
-            lane_points = np.ones_like(all_xs) * -1e5
-            lane_points[valid_mask] = xs_inside
-            lanes[lane_idx, 6 : 6 + len(all_xs)] = lane_points
-
-            lanes_endpoints[lane_idx, 0] = valid_indices[-1] / self.n_strips
-            lanes_endpoints[lane_idx, 1] = xs_inside[-1]
+            lanes[lane_idx, 5] = len(xs_inside_image)
+            lanes[lane_idx, 6 : 6 + len(all_xs)] = all_xs
+            lanes_endpoints[lane_idx, 0] = (len(all_xs) - 1) / self.n_strips
+            lanes_endpoints[lane_idx, 1] = xs_inside_image[-1]
 
         new_anno = {'label': lanes, 'old_anno': anno, 'lane_endpoints': lanes_endpoints}
         return new_anno
@@ -242,9 +262,7 @@ class GenerateLaneLine(object):
                 # print("line:",line_strings_org is None)
                 # print("mask_org:",mask_org is None)
                 img, line_strings, seg = self.transform(
-                    image=img_org.copy().astype(np.uint8),
-                    line_strings=line_strings_org,
-                    segmentation_maps=mask_org,
+                    image=img_org.copy().astype(np.uint8), line_strings=line_strings_org, segmentation_maps=mask_org
                 )
                 # print(44444)
                 # print("img+++:",(img_org is None, img is None ))
@@ -438,12 +456,7 @@ class GenerateLanePts(object):
             for aug in transforms:
                 p = aug['p']
                 if aug['name'] != 'OneOf':
-                    img_transforms.append(
-                        iaa.Sometimes(
-                            p=p,
-                            then_list=getattr(iaa, aug['name'])(**aug['parameters']),
-                        )
-                    )
+                    img_transforms.append(iaa.Sometimes(p=p, then_list=getattr(iaa, aug['name'])(**aug['parameters'])))
                 else:
                     img_transforms.append(
                         iaa.Sometimes(
@@ -614,9 +627,7 @@ class GenerateLanePts(object):
             if self.training:
                 mask_org = SegmentationMapsOnImage(sample['mask'], shape=img_org.shape)
                 img, line_strings, seg = self.transform(
-                    image=img_org.copy().astype(np.uint8),
-                    line_strings=line_strings_org,
-                    segmentation_maps=mask_org,
+                    image=img_org.copy().astype(np.uint8), line_strings=line_strings_org, segmentation_maps=mask_org
                 )
             else:
                 img, line_strings = self.transform(image=img_org.copy().astype(np.uint8), line_strings=line_strings_org)
@@ -667,12 +678,7 @@ class GenerateSRLaneLine(object):
             for aug in transforms:
                 p = aug['p']
                 if aug['name'] != 'OneOf':
-                    img_transforms.append(
-                        iaa.Sometimes(
-                            p=p,
-                            then_list=getattr(iaa, aug['name'])(**aug['parameters']),
-                        )
-                    )
+                    img_transforms.append(iaa.Sometimes(p=p, then_list=getattr(iaa, aug['name'])(**aug['parameters'])))
                 else:
                     img_transforms.append(
                         iaa.Sometimes(

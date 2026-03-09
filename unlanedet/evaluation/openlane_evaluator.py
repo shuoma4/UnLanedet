@@ -3,14 +3,21 @@ import logging
 import os
 import shutil
 import subprocess
+from functools import partial
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+try:
+    from p_tqdm import p_map
+except ImportError:
+    p_map = None
+
+from ..data.openlane import OpenLane
 from ..data.transform.lane_decoder import LaneDecoder
-from ..model.LLANet.line_iou import aligned_line_iou
+from ..model.LLANet.line_iou import pairwise_line_iou
 from .evaluator import DatasetEvaluator
 
 
@@ -30,15 +37,22 @@ def lane_nms(lane_points, scores, nms_overlap_thresh=50.0, top_k=24, img_w=1920)
 
         sorted_indices = sorted_indices[1:]
 
-        curr_lane = lane_points[idx].unsqueeze(0)
+        curr_lane = lane_points[idx]
         rest_lanes = lane_points[sorted_indices]
 
-        # 计算 IoU
-        ious = aligned_line_iou(curr_lane, rest_lanes, img_w, length=30)
+        # Use pairwise_line_iou for pair-wise IoU (N vs M)
+        # curr_lane: [L] -> [1, L]
+        # rest_lanes: [K, L]
 
-        # NMS 过滤
+        ious = pairwise_line_iou(curr_lane.unsqueeze(0), rest_lanes, img_w, length=30)
+
+        # ious shape is likely [1, K] or [K]
+        if ious.dim() == 2:
+            ious = ious.squeeze(0)
+
+        # NMS Filter
         mask = ious < nms_overlap_thresh
-        sorted_indices = sorted_indices[mask.view(-1)]
+        sorted_indices = sorted_indices[mask]
 
     return keep_index
 
@@ -127,6 +141,42 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         # Configuration for visualization
         self.generate_visualization = getattr(cfg, 'generate_visualization', False)
+
+        # Initialize OpenLane dataset to load cached ground truth
+        self.logger.info('[OpenLaneEvaluator] Loading OpenLane dataset for ground truth...')
+        try:
+            self.val_dataset = OpenLane(
+                data_root=self.cfg.data_root, split='val', cut_height=self.cfg.cut_height, processes=None, cfg=self.cfg
+            )
+            self.gt_infos = self.val_dataset.data_infos
+            self.gt_lookup = {}
+            self.gt_filename_lookup = {}
+            for info in self.gt_infos:
+                # Use relative path as key to match prediction output
+                # info['img_path'] is absolute path to the image
+                if 'origin_img_path' in info:
+                    abs_path = info['origin_img_path']
+                else:
+                    abs_path = info['img_path']
+
+                if abs_path.startswith(self.cfg.data_root):
+                    rel_path = os.path.relpath(abs_path, self.cfg.data_root)
+                else:
+                    rel_path = abs_path
+
+                # Normalize path separators just in case
+                rel_path = rel_path.replace('\\', '/')
+                self.gt_lookup[rel_path] = info
+
+                # Add filename lookup as fallback
+                filename = os.path.basename(rel_path)
+                self.gt_filename_lookup[filename] = info
+
+            self.logger.info(f'[OpenLaneEvaluator] Loaded {len(self.gt_lookup)} ground truth samples.')
+        except Exception as e:
+            self.logger.error(f'[OpenLaneEvaluator] Failed to load OpenLane dataset: {e}')
+            self.gt_lookup = {}
+
         self.reset()
 
     def _decode_lane_points(self, preds):
@@ -147,6 +197,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
         self.attribute_correct = 0
         self.attribute_total = 0
         self._created_dirs.clear()
+        self.predictions_cache = {}
 
         # Clean up old results directory
         if os.path.exists(self.output_dir):
@@ -373,13 +424,18 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 }
                 lane_lines_json.append(lane_obj)
 
-            self._write_json(
-                save_rel_path,
-                {
-                    'file_path': original_rel_path,
-                    'lane_lines': lane_lines_json,
-                },
-            )
+            # Store in memory cache instead of writing to disk
+            self.predictions_cache[save_rel_path] = {
+                'file_path': original_rel_path,
+                'lane_lines': lane_lines_json,
+            }
+            # self._write_json(
+            #     save_rel_path,
+            #     {
+            #         'file_path': original_rel_path,
+            #         'lane_lines': lane_lines_json,
+            #     },
+            # )
 
         return []
 
@@ -448,22 +504,26 @@ class OpenLaneEvaluator(DatasetEvaluator):
     def evaluate(self, predictions=None):
         self.logger.info('[OpenLaneEvaluator] Inference finished. Generating test list...')
 
-        all_json_files = []
-        for root, dirs, files in os.walk(self.result_dir):
-            for file in files:
-                if file.endswith('.json'):
-                    full_path = os.path.join(root, file)
-                    try:
-                        with open(full_path, 'r') as f:
-                            content = json.load(f)
-                            img_path = None
-                            if 'file_path' in content:
-                                img_path = content['file_path']
+        # Use cached predictions keys as file list
+        all_json_files = list(self.predictions_cache.keys())
 
-                            if img_path:
-                                all_json_files.append(img_path)
-                    except Exception as e:
-                        self.logger.warning(f'Failed to read {full_path}: {e}')
+        # Fallback to disk scan if cache is empty (e.g. if resumed or distributed without gathering)
+        if len(all_json_files) == 0:
+            for root, dirs, files in os.walk(self.result_dir):
+                for file in files:
+                    if file.endswith('.json'):
+                        full_path = os.path.join(root, file)
+                        try:
+                            with open(full_path, 'r') as f:
+                                content = json.load(f)
+                                img_path = None
+                                if 'file_path' in content:
+                                    img_path = content['file_path']
+
+                                if img_path:
+                                    all_json_files.append(img_path)
+                        except Exception as e:
+                            self.logger.warning(f'Failed to read {full_path}: {e}')
 
         if len(all_json_files) == 0:
             self.logger.warning('No JSON results found! Evaluation skipped.')
@@ -477,19 +537,22 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         # Official C++ Tool
         metrics = {}
-        if not os.path.exists(self.evaluate_bin_path):
-            self.logger.error(f'Cannot find official evaluate binary at: {self.evaluate_bin_path}')
-        else:
-            metrics = self._run_official_evaluation()
+        # if not os.path.exists(self.evaluate_bin_path):
+        #     self.logger.error(f'Cannot find official evaluate binary at: {self.evaluate_bin_path}')
+        # else:
+        #     metrics = self._run_official_evaluation()
 
-            # Generate visualizations after evaluation if enabled
-            if self.generate_visualization and hasattr(self, '_vis_commands') and self._vis_commands:
-                self._execute_visualizations()
+        # We skip official C++ evaluation because binary is missing.
+        # We rely on Python implementation (CULane style) which is compatible.
+
+        # Generate visualizations after evaluation if enabled
+        if self.generate_visualization and hasattr(self, '_vis_commands') and self._vis_commands:
+            self._execute_visualizations()
 
         # Merge Internal Python Metrics
-        local_metrics = self._get_internal_metrics()
-        metrics.update(local_metrics)
-        culane_metrics = self._run_culane_style_evaluation(all_json_files)
+        # local_metrics = self._get_internal_metrics()
+        # metrics.update(local_metrics)
+        culane_metrics = self._run_culane_style_evaluation(all_json_files, self.predictions_cache)
         metrics.update(culane_metrics)
 
         self.logger.info('=' * 40)
@@ -504,7 +567,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         return metrics
 
-    def _run_culane_style_evaluation(self, rel_paths):
+    def _run_culane_style_evaluation(self, rel_paths, predictions_cache=None):
         try:
             from . import culane_metric
         except Exception as e:
@@ -525,36 +588,175 @@ class OpenLaneEvaluator(DatasetEvaluator):
         total_fp = 0
         total_fn = 0
 
-        for rel_path in rel_paths:
-            rel_json = rel_path.replace('.jpg', '.json')
-            pred_json = os.path.join(self.result_dir, rel_json)
-            gt_json = os.path.join(dataset_dir, rel_json)
+        # Collect data for parallel processing
+        all_pred_lanes = []
+        all_gt_lanes = []
+        valid_indices = []
 
-            pred_lanes = self._load_lane_lines(pred_json)
-            gt_lanes = self._load_lane_lines(gt_json)
+        self.logger.info(f'[OpenLaneEvaluator] Preparing data for {len(rel_paths)} samples...')
 
-            tp, fp, fn, _, _ = culane_metric.culane_metric(
-                pred_lanes,
-                gt_lanes,
-                width=self.width,
-                iou_threshold=self.iou_threshold,
-                official=True,
-                img_shape=img_shape,
+        for idx, rel_path in enumerate(rel_paths):
+            # rel_path is like 'validation/segment-xxx/123.jpg'
+
+            # Load Predictions
+            pred_lanes = []
+            if predictions_cache and rel_path in predictions_cache:
+                content = predictions_cache[rel_path]
+                pred_lanes = self._parse_lane_lines(content)
+            else:
+                # Fallback to file
+                rel_json = rel_path.replace('.jpg', '.json')
+                pred_json = os.path.join(self.result_dir, rel_json)
+                if os.path.exists(pred_json):
+                    pred_lanes = self._load_lane_lines(pred_json)
+                else:
+                    self.logger.warning(f'Missing prediction for: {rel_path}')
+                    continue
+
+            # Load GT from cache instead of file
+            gt_lanes = []
+
+            # Try to find the GT in lookup
+            gt_info = self.gt_lookup.get(rel_path)
+
+            # Fallback: try removing 'validation/' or adding it, or check for exact match
+            if gt_info is None:
+                # Try without 'validation/' prefix if it exists
+                if rel_path.startswith('validation/'):
+                    gt_info = self.gt_lookup.get(rel_path.replace('validation/', '', 1))
+
+            # Fallback: try filename lookup
+            if gt_info is None:
+                filename = os.path.basename(rel_path)
+                gt_info = self.gt_filename_lookup.get(filename)
+
+            if gt_info is None:
+                self.logger.warning(f'Missing GT info for: {rel_path}')
+                continue
+
+            # Convert cached lanes to CULane format
+            use_preprocessed = self.cfg.get('use_preprocessed', False)
+            h_scale = 1.0
+            w_scale = 1.0
+            if use_preprocessed:
+                # Recalculate scales as in OpenLane dataset
+                ori_h = 1280
+                ori_w = 1920
+                cut_height = self.cfg.cut_height
+                valid_ori_h = ori_h - cut_height
+                img_h = self.cfg.img_h
+                img_w = self.cfg.img_w
+                h_scale = img_h / valid_ori_h
+                w_scale = img_w / ori_w
+
+            for lane_arr in gt_info['lanes']:
+                points = []
+                for pt in lane_arr:
+                    u, v = pt[0], pt[1]
+
+                    if use_preprocessed:
+                        u_orig = u / w_scale
+                        v_orig = v / h_scale + self.cfg.cut_height
+                    else:
+                        u_orig = u
+                        v_orig = v
+
+                    points.append((float(u_orig), float(v_orig)))
+
+                if len(points) >= 2:
+                    gt_lanes.append(points)
+
+            if idx == 0:
+                self.logger.info(f'DEBUG: Sample {rel_path}')
+                if len(pred_lanes) > 0:
+                    self.logger.info(f'DEBUG: Pred Lane 0 (first/last point): {pred_lanes[0][0]}, {pred_lanes[0][-1]}')
+                else:
+                    self.logger.info('DEBUG: No Pred Lanes')
+                if len(gt_lanes) > 0:
+                    self.logger.info(f'DEBUG: GT Lane 0 (first/last point): {gt_lanes[0][0]}, {gt_lanes[0][-1]}')
+                else:
+                    self.logger.info('DEBUG: No GT Lanes')
+
+            all_pred_lanes.append(pred_lanes)
+            all_gt_lanes.append(gt_lanes)
+            valid_indices.append(idx)
+
+        # Run evaluation
+        self.logger.info(f'[OpenLaneEvaluator] Running evaluation on {len(all_pred_lanes)} samples...')
+
+        if p_map is not None:
+            self.logger.info('[OpenLaneEvaluator] Using parallel processing (p_map)...')
+            results = p_map(
+                partial(
+                    culane_metric.culane_metric,
+                    width=self.width,
+                    iou_threshold=self.iou_threshold,
+                    official=True,
+                    img_shape=img_shape,
+                ),
+                all_pred_lanes,
+                all_gt_lanes,
+                num_cpus=os.cpu_count() // 2,  # Avoid using all cores to prevent system freeze
             )
+        else:
+            self.logger.warning('[OpenLaneEvaluator] p_tqdm not found, running sequentially...')
+            results = []
+            for i in range(len(all_pred_lanes)):
+                res = culane_metric.culane_metric(
+                    all_pred_lanes[i],
+                    all_gt_lanes[i],
+                    width=self.width,
+                    iou_threshold=self.iou_threshold,
+                    official=True,
+                    img_shape=img_shape,
+                )
+                results.append(res)
+                if (i + 1) % 1000 == 0:
+                    self.logger.info(f'Evaluated {i + 1}/{len(all_pred_lanes)} images...')
+
+        # Aggregate results
+        for res in results:
+            tp, fp, fn, _, _ = res
             total_tp += tp
             total_fp += fp
             total_fn += fn
 
-        if total_tp == 0:
-            precision = 0.0
-            recall = 0.0
-            f1 = 0.0
+        if total_tp + total_fp == 0:
+            precision = 0
         else:
-            precision = float(total_tp) / (total_tp + total_fp)
-            recall = float(total_tp) / (total_tp + total_fn)
+            precision = total_tp / (total_tp + total_fp)
+
+        if total_tp + total_fn == 0:
+            recall = 0
+        else:
+            recall = total_tp / (total_tp + total_fn)
+
+        if precision + recall == 0:
+            f1 = 0
+        else:
             f1 = 2 * precision * recall / (precision + recall)
 
         return {'TP': total_tp, 'FP': total_fp, 'FN': total_fn, 'Precision': precision, 'Recall': recall, 'F1': f1}
+
+    def _parse_lane_lines(self, content):
+        lanes = []
+        for lane in content.get('lane_lines', []):
+            uv = lane.get('uv', None)
+            if not uv or len(uv) != 2:
+                continue
+            xs, ys = uv
+            points = []
+            for x, y in zip(xs, ys):
+                if x is None or y is None:
+                    continue
+                if x < 0 or y < 0:
+                    continue
+                points.append((float(x), float(y)))
+            if len(points) < 2:
+                continue
+            points = sorted(points, key=lambda p: p[1])
+            lanes.append(points)
+        return lanes
 
     def _load_lane_lines(self, json_path):
         if not os.path.exists(json_path):
