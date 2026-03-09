@@ -33,26 +33,29 @@ def distance_cost(predictions: torch.Tensor,
     """
     Mean absolute x-coordinate distance between every (prior, gt) pair.
 
-    Original implementation used ``repeat_interleave`` + ``torch.cat`` which
-    created two (Np*Nt, Nr) copies.  Here we use broadcasting to avoid those
-    intermediate allocations.
-
     Args:
         predictions : (num_priors,  D)  full prediction tensor
         targets     : (num_targets, D)  full target tensor
     Returns:
         distances   : (num_priors, num_targets)
+
+    Bug fix: the original draft used boolean-index assignment
+        distances[invalid_masks] = 0.0
+    where ``invalid_masks`` has shape (1, Nt, Nr) but ``distances`` has shape
+    (Np, Nt, Nr).  PyTorch boolean indexing does NOT auto-broadcast at index 0,
+    so this raised an IndexError.  We now use element-wise multiplication with
+    a float mask instead, which supports full broadcasting.
     """
     pred_xs   = predictions[..., 6:]   # (Np, Nr)
     target_xs = targets[..., 6:]       # (Nt, Nr)
 
-    # Validity is determined by target coordinates only (same as original)
-    # broadcast to (Np, Nt, Nr)
-    invalid_masks = (target_xs[None] < 0) | (target_xs[None] >= img_w)
-    lengths   = (~invalid_masks).sum(dim=-1).float()                     # (Np, Nt)
+    # valid_mask shape: (1, Nt, Nr) — broadcasts safely against (Np, Nt, Nr)
+    valid_mask = ((target_xs[None] >= 0) & (target_xs[None] < img_w)).float()
+
+    lengths   = valid_mask.sum(dim=-1)                                   # (1, Nt) — broadcasts
     distances = (pred_xs[:, None, :] - target_xs[None, :, :]).abs()      # (Np, Nt, Nr)
-    distances[invalid_masks] = 0.0
-    distances = distances.sum(dim=-1) / (lengths + 1e-9)                 # (Np, Nt)
+    # Mask invalid positions via multiplication (broadcasting-safe)
+    distances = (distances * valid_mask).sum(dim=-1) / (lengths + 1e-9)  # (Np, Nt)
     return distances
 
 
