@@ -1,8 +1,13 @@
 """
 Vectorized Line IoU — functionally identical to CLRNet/line_iou.py.
-All ops were already tensor-wise; this module re-exports them under the
-fCLRNet namespace and adds minor clarity improvements (pairwise uses
-cleaner broadcasting).
+
+Bug fix (pairwise mode):
+    The original draft used boolean-index assignment
+        ovr[invalid_masks] = 0.0
+    where ``invalid_masks`` has shape (1, Nt, Nr) but ``ovr`` has shape
+    (Np, Nt, Nr).  PyTorch boolean indexing does NOT auto-broadcast at index 0,
+    which would raise an IndexError for Np > 1.  We now use element-wise
+    multiplication with a float validity mask instead.
 """
 import torch
 
@@ -29,20 +34,24 @@ def line_iou(pred: torch.Tensor,
     tx2 = target + length
 
     if aligned:
-        # ── aligned: shapes match exactly ────────────────────────────────
+        # ── aligned: shapes match exactly ─────────────────────────────────────
         ovr   = torch.min(px2, tx2) - torch.max(px1, tx1)
         union = torch.max(px2, tx2) - torch.min(px1, tx1)
-        invalid_masks = (target < 0) | (target >= img_w)
+        # valid_mask shape: same as target (N, Nr) — no broadcasting issue
+        valid_mask = ((target >= 0) & (target < img_w)).float()
+        ovr   = ovr   * valid_mask
+        union = union * valid_mask
     else:
-        # ── pairwise: broadcast (Np,1,Nr) vs (1,Nt,Nr) ───────────────────
+        # ── pairwise: broadcast (Np,1,Nr) vs (1,Nt,Nr) → (Np,Nt,Nr) ─────────
         ovr   = torch.min(px2[:, None, :], tx2[None, :, :]) \
               - torch.max(px1[:, None, :], tx1[None, :, :])
         union = torch.max(px2[:, None, :], tx2[None, :, :]) \
               - torch.min(px1[:, None, :], tx1[None, :, :])
-        invalid_masks = (target[None, :, :] < 0) | (target[None, :, :] >= img_w)
+        # valid_mask shape: (1, Nt, Nr) — broadcasting-safe via multiplication
+        valid_mask = ((target[None, :, :] >= 0) & (target[None, :, :] < img_w)).float()
+        ovr   = ovr   * valid_mask
+        union = union * valid_mask
 
-    ovr  [invalid_masks] = 0.0
-    union[invalid_masks] = 0.0
     iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
     return iou
 
@@ -76,9 +85,9 @@ class CLRNetIoULoss(torch.nn.Module):
         ovr   = torch.min(px2, tx2) - torch.max(px1, tx1)
         union = torch.max(px2, tx2) - torch.min(px1, tx1)
 
-        invalid_masks = (target < 0) | (target >= 1.0)
-        ovr  [invalid_masks] = 0.0
-        union[invalid_masks] = 0.0
+        valid_mask = ((target >= 0) & (target < 1.0)).float()
+        ovr   = ovr   * valid_mask
+        union = union * valid_mask
         return ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
