@@ -1,20 +1,16 @@
 import math
 
-import cv2
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...layers import Conv2d, get_norm
-from ..module.core.lane import Lane
-from ..module.losses import FocalLoss
-from ..module.head import PlainDecoder
 from ...layers.ops import nms
-
-from .roi_gather import ROIGather, LinearModule
+from ..module.core.lane import Lane
+from ..module.head import PlainDecoder
+from ..module.losses import FocalLoss
 from .dynamic_assign import assign
 from .line_iou import liou_loss
+from .roi_gather import LinearModule, ROIGather
 
 
 class CLRHead(nn.Module):
@@ -41,31 +37,20 @@ class CLRHead(nn.Module):
         self.fc_hidden_dim = fc_hidden_dim
 
         self.register_buffer(
-            name="sample_x_indexs",
-            tensor=(
-                torch.linspace(0, 1, steps=self.sample_points, dtype=torch.float32)
-                * self.n_strips
-            ).long(),
+            name='sample_x_indexs',
+            tensor=(torch.linspace(0, 1, steps=self.sample_points, dtype=torch.float32) * self.n_strips).long(),
         )
         self.register_buffer(
-            name="prior_feat_ys",
-            tensor=torch.flip(
-                (1 - self.sample_x_indexs.float() / self.n_strips), dims=[-1]
-            ),
+            name='prior_feat_ys', tensor=torch.flip((1 - self.sample_x_indexs.float() / self.n_strips), dims=[-1])
         )
-        self.register_buffer(
-            name="prior_ys",
-            tensor=torch.linspace(1, 0, steps=self.n_offsets, dtype=torch.float32),
-        )
+        self.register_buffer(name='prior_ys', tensor=torch.linspace(1, 0, steps=self.n_offsets, dtype=torch.float32))
 
         self.prior_feat_channels = prior_feat_channels
 
         self._init_prior_embeddings()
-        init_priors, priors_on_featmap = (
-            self.generate_priors_from_embeddings()
-        )  # None, None
-        self.register_buffer(name="priors", tensor=init_priors)
-        self.register_buffer(name="priors_on_featmap", tensor=priors_on_featmap)
+        init_priors, priors_on_featmap = self.generate_priors_from_embeddings()  # None, None
+        self.register_buffer(name='priors', tensor=init_priors)
+        self.register_buffer(name='priors_on_featmap', tensor=priors_on_featmap)
 
         # generate xys for feature map
         self.seg_decoder = PlainDecoder(cfg)
@@ -79,11 +64,7 @@ class CLRHead(nn.Module):
         self.cls_modules = nn.ModuleList(cls_modules)
 
         self.roi_gather = ROIGather(
-            self.prior_feat_channels,
-            self.num_priors,
-            self.sample_points,
-            self.fc_hidden_dim,
-            self.refine_layers,
+            self.prior_feat_channels, self.num_priors, self.sample_points, self.fc_hidden_dim, self.refine_layers
         )
 
         self.reg_layers = nn.Linear(
@@ -93,9 +74,7 @@ class CLRHead(nn.Module):
 
         weights = torch.ones(self.cfg.num_classes)
         weights[0] = self.cfg.bg_weight
-        self.criterion = torch.nn.NLLLoss(
-            ignore_index=self.cfg.ignore_label, weight=weights
-        )
+        self.criterion = torch.nn.NLLLoss(ignore_index=self.cfg.ignore_label, weight=weights)
 
         # init the weights here
         self.init_weights()
@@ -119,34 +98,25 @@ class CLRHead(nn.Module):
         batch_size = batch_features.shape[0]
 
         prior_xs = prior_xs.view(batch_size, num_priors, -1, 1)
-        prior_ys = self.prior_feat_ys.repeat(batch_size * num_priors).view(
-            batch_size, num_priors, -1, 1
-        )
+        prior_ys = self.prior_feat_ys.repeat(batch_size * num_priors).view(batch_size, num_priors, -1, 1)
 
         prior_xs = prior_xs * 2.0 - 1.0
         prior_ys = prior_ys * 2.0 - 1.0
         grid = torch.cat((prior_xs, prior_ys), dim=-1)
-        feature = F.grid_sample(batch_features, grid, align_corners=True).permute(
-            0, 2, 1, 3
-        )
+        feature = F.grid_sample(batch_features, grid, align_corners=True).permute(0, 2, 1, 3)
 
-        feature = feature.reshape(
-            batch_size * num_priors, self.prior_feat_channels, self.sample_points, 1
-        )
+        feature = feature.reshape(batch_size * num_priors, self.prior_feat_channels, self.sample_points, 1)
         return feature
 
     def generate_priors_from_embeddings(self):
         predictions = self.prior_embeddings.weight  # (num_prop, 3)
 
         # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, 72 coordinates, score[0] = negative prob, score[1] = positive prob
-        priors = predictions.new_zeros(
-            (self.num_priors, 2 + 2 + 2 + self.n_offsets), device=predictions.device
-        )
+        priors = predictions.new_zeros((self.num_priors, 2 + 2 + 2 + self.n_offsets), device=predictions.device)
 
         priors[:, 2:5] = predictions.clone()
         priors[:, 6:] = (
-            priors[:, 3].unsqueeze(1).clone().repeat(1, self.n_offsets)
-            * (self.img_w - 1)
+            priors[:, 3].unsqueeze(1).clone().repeat(1, self.n_offsets) * (self.img_w - 1)
             + (
                 (
                     1
@@ -154,11 +124,7 @@ class CLRHead(nn.Module):
                     - priors[:, 2].unsqueeze(1).clone().repeat(1, self.n_offsets)
                 )
                 * self.img_h
-                / torch.tan(
-                    priors[:, 4].unsqueeze(1).clone().repeat(1, self.n_offsets)
-                    * math.pi
-                    + 1e-5
-                )
+                / torch.tan(priors[:, 4].unsqueeze(1).clone().repeat(1, self.n_offsets) * math.pi + 1e-5)
             )
         ) / (self.img_w - 1)
 
@@ -179,27 +145,19 @@ class CLRHead(nn.Module):
         for i in range(left_priors_nums):
             nn.init.constant_(self.prior_embeddings.weight[i, 0], (i // 2) * strip_size)
             nn.init.constant_(self.prior_embeddings.weight[i, 1], 0.0)
-            nn.init.constant_(
-                self.prior_embeddings.weight[i, 2], 0.16 if i % 2 == 0 else 0.32
-            )
+            nn.init.constant_(self.prior_embeddings.weight[i, 2], 0.16 if i % 2 == 0 else 0.32)
 
         for i in range(left_priors_nums, left_priors_nums + bottom_priors_nums):
             nn.init.constant_(self.prior_embeddings.weight[i, 0], 0.0)
-            nn.init.constant_(
-                self.prior_embeddings.weight[i, 1],
-                ((i - left_priors_nums) // 4 + 1) * bottom_strip_size,
-            )
+            nn.init.constant_(self.prior_embeddings.weight[i, 1], ((i - left_priors_nums) // 4 + 1) * bottom_strip_size)
             nn.init.constant_(self.prior_embeddings.weight[i, 2], 0.2 * (i % 4 + 1))
 
         for i in range(left_priors_nums + bottom_priors_nums, self.num_priors):
             nn.init.constant_(
-                self.prior_embeddings.weight[i, 0],
-                ((i - left_priors_nums - bottom_priors_nums) // 2) * strip_size,
+                self.prior_embeddings.weight[i, 0], ((i - left_priors_nums - bottom_priors_nums) // 2) * strip_size
             )
             nn.init.constant_(self.prior_embeddings.weight[i, 1], 1.0)
-            nn.init.constant_(
-                self.prior_embeddings.weight[i, 2], 0.68 if i % 2 == 0 else 0.84
-            )
+            nn.init.constant_(self.prior_embeddings.weight[i, 2], 0.68 if i % 2 == 0 else 0.84)
 
     # forward function here
     def forward(self, x, **kwargs):
@@ -219,9 +177,10 @@ class CLRHead(nn.Module):
         if self.training:
             self.priors, self.priors_on_featmap = self.generate_priors_from_embeddings()
 
-        priors, priors_on_featmap = self.priors.repeat(
-            batch_size, 1, 1
-        ), self.priors_on_featmap.repeat(batch_size, 1, 1)
+        priors, priors_on_featmap = (
+            self.priors.repeat(batch_size, 1, 1),
+            self.priors_on_featmap.repeat(batch_size, 1, 1),
+        )
 
         predictions_lists = []
 
@@ -231,14 +190,10 @@ class CLRHead(nn.Module):
             num_priors = priors_on_featmap.shape[1]
             prior_xs = torch.flip(priors_on_featmap, dims=[2])
 
-            batch_prior_features = self.pool_prior_features(
-                batch_features[stage], num_priors, prior_xs
-            )
+            batch_prior_features = self.pool_prior_features(batch_features[stage], num_priors, prior_xs)
             prior_features_stages.append(batch_prior_features)
 
-            fc_features = self.roi_gather(
-                prior_features_stages, batch_features[stage], stage
-            )
+            fc_features = self.roi_gather(prior_features_stages, batch_features[stage], stage)
 
             fc_features = fc_features.view(num_priors, batch_size, -1).reshape(
                 batch_size * num_priors, self.fc_hidden_dim
@@ -254,9 +209,7 @@ class CLRHead(nn.Module):
             cls_logits = self.cls_layers(cls_features)
             reg = self.reg_layers(reg_features)
 
-            cls_logits = cls_logits.reshape(
-                batch_size, -1, cls_logits.shape[1]
-            )  # (B, num_priors, 2)
+            cls_logits = cls_logits.reshape(batch_size, -1, cls_logits.shape[1])  # (B, num_priors, 2)
             reg = reg.reshape(batch_size, -1, reg.shape[1])
 
             predictions = priors.clone()
@@ -271,11 +224,7 @@ class CLRHead(nn.Module):
             predictions[..., 6:] = (
                 tran_tensor(predictions[..., 3]) * (self.img_w - 1)
                 + (
-                    (
-                        1
-                        - self.prior_ys.repeat(batch_size, num_priors, 1)
-                        - tran_tensor(predictions[..., 2])
-                    )
+                    (1 - self.prior_ys.repeat(batch_size, num_priors, 1) - tran_tensor(predictions[..., 2]))
                     * self.img_h
                     / torch.tan(tran_tensor(predictions[..., 4]) * math.pi + 1e-5)
                 )
@@ -297,7 +246,7 @@ class CLRHead(nn.Module):
                     F.interpolate(
                         feature,
                         size=[batch_features[-1].shape[2], batch_features[-1].shape[3]],
-                        mode="bilinear",
+                        mode='bilinear',
                         align_corners=False,
                     )
                     for feature in batch_features
@@ -305,7 +254,7 @@ class CLRHead(nn.Module):
                 dim=1,
             )
             seg = self.seg_decoder(seg_features)
-            output = {"predictions_lists": predictions_lists}
+            output = {'predictions_lists': predictions_lists}
             output.update(**seg)
             return output
 
@@ -320,9 +269,7 @@ class CLRHead(nn.Module):
         lanes = []
         for lane in predictions:
             lane_xs = lane[6:]  # normalized value
-            start = min(
-                max(0, int(round(lane[2].item() * self.n_strips))), self.n_strips
-            )
+            start = min(max(0, int(round(lane[2].item() * self.n_strips))), self.n_strips)
             length = int(round(lane[5].item()))
             end = start + length - 1
             end = min(end, len(self.prior_ys) - 1)
@@ -330,12 +277,7 @@ class CLRHead(nn.Module):
             # if the prediction does not start at the bottom of the image,
             # extend its prediction until the x is outside the image
             mask = ~(
-                (
-                    ((lane_xs[:start] >= 0.0) & (lane_xs[:start] <= 1.0))
-                    .cpu()
-                    .numpy()[::-1]
-                    .cumprod()[::-1]
-                ).astype(np.bool)
+                (((lane_xs[:start] >= 0.0) & (lane_xs[:start] <= 1.0)).cpu().numpy()[::-1].cumprod()[::-1]).astype(bool)
             )
             lane_xs[end + 1 :] = -2
             lane_xs[:start][mask] = -2
@@ -344,42 +286,26 @@ class CLRHead(nn.Module):
             lane_xs = lane_xs.flip(0).double()
             lane_ys = lane_ys.flip(0)
 
-            lane_ys = (
-                lane_ys * (self.cfg.ori_img_h - self.cfg.cut_height)
-                + self.cfg.cut_height
-            ) / self.cfg.ori_img_h
+            lane_ys = (lane_ys * (self.cfg.ori_img_h - self.cfg.cut_height) + self.cfg.cut_height) / self.cfg.ori_img_h
             if len(lane_xs) <= 1:
                 continue
-            points = torch.stack(
-                (lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1
-            ).squeeze(2)
-            lane = Lane(
-                points=points.cpu().numpy(),
-                metadata={"start_x": lane[3], "start_y": lane[2], "conf": lane[1]},
-            )
+            points = torch.stack((lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1).squeeze(2)
+            lane = Lane(points=points.cpu().numpy(), metadata={'start_x': lane[3], 'start_y': lane[2], 'conf': lane[1]})
             lanes.append(lane)
         return lanes
 
-    def loss(
-        self,
-        output,
-        batch,
-        cls_loss_weight=2.0,
-        xyt_loss_weight=0.5,
-        iou_loss_weight=2.0,
-        seg_loss_weight=1.0,
-    ):
-        if "cls_loss_weight" in self.cfg:
+    def loss(self, output, batch, cls_loss_weight=2.0, xyt_loss_weight=0.5, iou_loss_weight=2.0, seg_loss_weight=1.0):
+        if 'cls_loss_weight' in self.cfg:
             cls_loss_weight = self.cfg.cls_loss_weight
-        if "xyt_loss_weight" in self.cfg:
+        if 'xyt_loss_weight' in self.cfg:
             xyt_loss_weight = self.cfg.xyt_loss_weight
-        if "iou_loss_weight" in self.cfg:
+        if 'iou_loss_weight' in self.cfg:
             iou_loss_weight = self.cfg.iou_loss_weight
-        if "seg_loss_weight" in self.cfg:
+        if 'seg_loss_weight' in self.cfg:
             seg_loss_weight = self.cfg.seg_loss_weight
 
-        predictions_lists = output["predictions_lists"]
-        targets = batch["lane_line"].clone()
+        predictions_lists = output['predictions_lists']
+        targets = batch['lane_line'].clone()
         cls_criterion = FocalLoss(alpha=0.25, gamma=2.0)
         cls_loss = torch.tensor(0.0).to(self.priors.device)
         reg_xytl_loss = torch.tensor(0.0).to(self.priors.device)
@@ -398,9 +324,7 @@ class CLRHead(nn.Module):
                     continue
 
                 with torch.no_grad():
-                    matched_row_inds, matched_col_inds = assign(
-                        predictions, target, self.img_w, self.img_h
-                    )
+                    matched_row_inds, matched_col_inds = assign(predictions, target, self.img_w, self.img_h)
 
                 # classification targets
                 cls_target = predictions.new_zeros(predictions.shape[0]).long()
@@ -423,40 +347,22 @@ class CLRHead(nn.Module):
 
                 with torch.no_grad():
                     predictions_starts = torch.clamp(
-                        (predictions[matched_row_inds, 2] * self.n_strips)
-                        .round()
-                        .long(),
-                        0,
-                        self.n_strips,
+                        (predictions[matched_row_inds, 2] * self.n_strips).round().long(), 0, self.n_strips
                     )  # ensure the predictions starts is valid
-                    target_starts = (
-                        (target[matched_col_inds, 2] * self.n_strips).round().long()
-                    )
-                    target_yxtl[:, -1] -= (
-                        predictions_starts - target_starts
-                    )  # reg length
+                    target_starts = (target[matched_col_inds, 2] * self.n_strips).round().long()
+                    target_yxtl[:, -1] -= predictions_starts - target_starts  # reg length
 
                 # Loss calculation
-                cls_loss = (
-                    cls_loss
-                    + cls_criterion(cls_pred, cls_target).sum() / target.shape[0]
-                )
+                cls_loss = cls_loss + cls_criterion(cls_pred, cls_target).sum() / target.shape[0]
 
                 target_yxtl[:, 0] *= self.n_strips
                 target_yxtl[:, 2] *= 180
-                reg_xytl_loss = (
-                    reg_xytl_loss
-                    + F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction="none").mean()
-                )
+                reg_xytl_loss = reg_xytl_loss + F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction='none').mean()
 
-                iou_loss = iou_loss + liou_loss(
-                    reg_pred, reg_targets, self.img_w, length=15
-                )
+                iou_loss = iou_loss + liou_loss(reg_pred, reg_targets, self.img_w, length=15)
 
         # extra segmentation loss
-        seg_loss = self.criterion(
-            F.log_softmax(output["seg"], dim=1), batch["seg"].long()
-        )
+        seg_loss = self.criterion(F.log_softmax(output['seg'], dim=1), batch['seg'].long())
 
         cls_loss /= len(targets) * self.refine_layers
         reg_xytl_loss /= len(targets) * self.refine_layers
@@ -466,10 +372,10 @@ class CLRHead(nn.Module):
         #     + seg_loss * seg_loss_weight + iou_loss * iou_loss_weight
 
         return_value = {
-            "cls_loss": cls_loss * cls_loss_weight,
-            "reg_xytl_loss": reg_xytl_loss * xyt_loss_weight,
-            "seg_loss": seg_loss * seg_loss_weight,
-            "iou_loss": iou_loss * iou_loss_weight,
+            'cls_loss': cls_loss * cls_loss_weight,
+            'reg_xytl_loss': reg_xytl_loss * xyt_loss_weight,
+            'seg_loss': seg_loss * seg_loss_weight,
+            'iou_loss': iou_loss * iou_loss_weight,
         }
 
         return return_value
@@ -493,17 +399,12 @@ class CLRHead(nn.Module):
                 decoded.append([])
                 continue
             nms_predictions = predictions.detach().clone()
-            nms_predictions = torch.cat(
-                [nms_predictions[..., :4], nms_predictions[..., 5:]], dim=-1
-            )
+            nms_predictions = torch.cat([nms_predictions[..., :4], nms_predictions[..., 5:]], dim=-1)
             nms_predictions[..., 4] = nms_predictions[..., 4] * self.n_strips
             nms_predictions[..., 5:] = nms_predictions[..., 5:] * (self.img_w - 1)
 
             keep, num_to_keep, _ = nms(
-                nms_predictions,
-                scores,
-                overlap=self.cfg.test_parameters.nms_thres,
-                top_k=self.cfg.max_lanes,
+                nms_predictions, scores, overlap=self.cfg.test_parameters.nms_thres, top_k=self.cfg.max_lanes
             )
             keep = keep[:num_to_keep]
             predictions = predictions[keep]

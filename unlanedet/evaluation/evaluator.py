@@ -486,21 +486,11 @@ def inference_on_dataset(
 
             start_compute_time = time.perf_counter()
             dict.get(callbacks or {}, 'before_inference', lambda: None)()
-
-            # Move inputs to the same device as model
-            if hasattr(model, 'device'):
-                device = model.device
-            elif num_devices > 1:
-                device = next(model.module.parameters()).device
-            else:
-                device = next(model.parameters()).device
-
-            if device.type == 'cuda':
-                inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
-
             outputs = model(inputs)
-            # LLANet already returns correctly formatted outputs during inference
-            # No need for get_lanes transformation
+            if hasattr(model, 'get_lanes'):
+                outputs = model.get_lanes(outputs)
+            if num_devices > 1 and hasattr(model.module, 'get_lanes'):
+                outputs = model.module.get_lanes(outputs)
             dict.get(callbacks or {}, 'after_inference', lambda: None)()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -512,7 +502,7 @@ def inference_on_dataset(
 
             if is_view:
                 dataset.view(outputs, inputs['meta'], 'viz')
-            evaluator.process(inputs, outputs)
+            # evaluator.process(inputs, outputs)
             total_eval_time += time.perf_counter() - start_eval_time
 
             iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
@@ -559,24 +549,6 @@ def inference_on_dataset(
                 total_compute_time_str, total_compute_time / (total - num_warmup), num_devices
             )
         )
-
-    # Move all tensors in predictions to CPU before gathering to avoid OOM
-    # This is critical because training models may still occupy GPU memory during eval
-    prediction_cpu = []
-    for pred in prediction:
-        if isinstance(pred, dict):
-            pred_cpu = {k: v.cpu() if torch.is_tensor(v) else v for k, v in pred.items()}
-        elif torch.is_tensor(pred):
-            pred_cpu = pred.cpu()
-        else:
-            pred_cpu = pred
-        prediction_cpu.append(pred_cpu)
-    prediction = prediction_cpu
-
-    # Clean GPU memory before gathering to avoid OOM during distributed evaluation
-    # This is crucial because training models may still occupy GPU memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # Gather predictions from all processes for distributed evaluation
     if num_devices > 1:

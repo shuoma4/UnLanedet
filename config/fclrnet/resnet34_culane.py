@@ -103,7 +103,6 @@ train_process = [
                 ),
                 p=0.7,
             ),
-            dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
         ],
         cfg=param_config,
     ),
@@ -127,13 +126,21 @@ dataloader.train.dataset.data_root = data_root
 dataloader.train.dataset.cut_height = cut_height
 dataloader.train.dataset.cfg = param_config
 dataloader.train.total_batch_size = batch_size
+dataloader.train.num_workers = 8
+dataloader.train.persistent_workers = True
+dataloader.train.pin_memory = True
+dataloader.train.prefetch_factor = 4
+
 dataloader.test.dataset.processes = val_process
 dataloader.test.dataset.data_root = data_root
 dataloader.test.dataset.cut_height = cut_height
 dataloader.test.dataset.cfg = param_config
 dataloader.test.total_batch_size = batch_size
+dataloader.test.num_workers = 4
 
 # Evaluation config
 dataloader.evaluator.data_root = data_root
-dataloader.evaluator.output_basedir = './output/fclrnet_resnet34/'
+dataloader.evaluator.output_basedir = './output/culane/fclrnet_resnet34/val'
 dataloader.evaluator.cfg = param_config
+
+train.amp.enabled = True

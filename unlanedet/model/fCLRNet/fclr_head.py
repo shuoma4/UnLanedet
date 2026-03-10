@@ -12,23 +12,23 @@ Optimisations vs CLRHead.loss()
 2. ``distance_cost`` (f_dynamic_assign.py) — repeat_interleave/cat replaced
    by direct broadcasting; avoids two large intermediate copies.
 
-3. Loss batching — matched (pred, target) pairs from ALL samples within a
-   stage are cat-ed and their regression / IoU losses computed in a **single**
-   kernel call instead of once per sample.
+3. Loss batching — Assignments and losses are computed for the entire batch
+   in parallel using Batched Assignment and index-based aggregation.
+   Kernel launches are reduced by factor of B (Batch Size).
 
-4. FocalLoss — still computed per sample (needed for correct normalisation)
-   but uses the vectorised assign result.
+4. FocalLoss — computed on batched tensors.
 
 The public interface (loss signature, return dict keys) is identical to
 CLRHead so trainers require no changes.
 """
+
 import torch
 import torch.nn.functional as F
 
 from ..CLRNet.clr_head import CLRHead
 from ..module.losses import FocalLoss
 from .f_dynamic_assign import assign
-from .f_line_iou import liou_loss
+from .f_line_iou import line_iou
 
 
 class FCLRHead(CLRHead):
@@ -41,143 +41,136 @@ class FCLRHead(CLRHead):
         self,
         output,
         batch,
-        cls_loss_weight:  float = 2.0,
-        xyt_loss_weight:  float = 0.5,
-        iou_loss_weight:  float = 2.0,
-        seg_loss_weight:  float = 1.0,
+        cls_loss_weight: float = 2.0,
+        xyt_loss_weight: float = 0.5,
+        iou_loss_weight: float = 2.0,
+        seg_loss_weight: float = 1.0,
     ):
         # ── Weight overrides from config ─────────────────────────────────────
         cfg = self.cfg
-        if "cls_loss_weight"  in cfg: cls_loss_weight  = cfg.cls_loss_weight
-        if "xyt_loss_weight"  in cfg: xyt_loss_weight  = cfg.xyt_loss_weight
-        if "iou_loss_weight"  in cfg: iou_loss_weight  = cfg.iou_loss_weight
-        if "seg_loss_weight"  in cfg: seg_loss_weight  = cfg.seg_loss_weight
+        if 'cls_loss_weight' in cfg:
+            cls_loss_weight = cfg.cls_loss_weight
+        if 'xyt_loss_weight' in cfg:
+            xyt_loss_weight = cfg.xyt_loss_weight
+        if 'iou_loss_weight' in cfg:
+            iou_loss_weight = cfg.iou_loss_weight
+        if 'seg_loss_weight' in cfg:
+            seg_loss_weight = cfg.seg_loss_weight
 
-        predictions_lists = output["predictions_lists"]
-        targets           = batch["lane_line"].clone()
-        batch_size        = targets.shape[0]
-        device            = self.priors.device
+        predictions_lists = output['predictions_lists']
+        targets = batch['lane_line'].clone()
+        batch_size = targets.shape[0]
+        device = self.priors.device
 
         cls_criterion = FocalLoss(alpha=0.25, gamma=2.0)
-        cls_loss      = torch.tensor(0.0, device=device)
+        cls_loss = torch.tensor(0.0, device=device)
         reg_xytl_loss = torch.tensor(0.0, device=device)
-        iou_loss      = torch.tensor(0.0, device=device)
+        iou_loss = torch.tensor(0.0, device=device)
 
-        # Pre-filter valid GT lanes for every sample  (list of tensors, may be empty)
-        targets_valid = [t[t[:, 1] == 1] for t in targets]
+        valid_mask = targets[..., 1] == 1
+        num_gt_per_img = valid_mask.sum(dim=1).float()
+        num_gt_per_img[num_gt_per_img == 0] = 1.0
 
-        # ─────────────────────────────────────────────────────────────────────
-        # Stage loop  (3 stages — fusing across stages is not possible because
-        # each stage has its own set of refined priors)
-        # ─────────────────────────────────────────────────────────────────────
         for stage in range(self.refine_layers):
             predictions_list = predictions_lists[stage]  # (B, num_priors, D)
+            num_priors = predictions_list.shape[1]
 
-            # Accumulators for batched loss computation
-            cls_preds_list   = []   # (num_priors, 2) per sample
-            cls_targets_list = []   # (num_priors,)  long  per sample
-            cls_norm_list    = []   # normalisation denominator per sample
+            # ── Batched Assignment ───────────────────────────────────────────
+            with torch.no_grad():
+                # matching_matrix: (B, Np, Nt)
+                matching_matrix = assign(predictions_list, targets, self.img_w, self.img_h, valid_mask=valid_mask)
 
-            reg_yxtl_list = []      # matched regression predictions
-            tgt_yxtl_list = []      # matched regression targets
-            reg_pred_list = []      # matched x-coord predictions
-            reg_tgt_list  = []      # matched x-coord targets
+            # Extract matched indices: (N_match, 3) -> (b, p, t)
+            matched_indices = matching_matrix.nonzero(as_tuple=False)
+            batch_idx = matched_indices[:, 0]
+            prior_idx = matched_indices[:, 1]
+            gt_idx = matched_indices[:, 2]
 
-            # ── Per-sample assignment ─────────────────────────────────────────
-            # Cannot be fully fused: each sample has a variable number of GTs.
-            for i in range(batch_size):
-                predictions = predictions_list[i]   # (num_priors, D)
-                target      = targets_valid[i]       # (num_valid_i, D)
-                num_priors  = predictions.shape[0]
-                cls_pred    = predictions[:, :2]     # (num_priors, 2)
+            # ── Classification Loss ──────────────────────────────────────────
+            # Construct target tensor (B, Np)
+            cls_target = torch.zeros((batch_size, num_priors), dtype=torch.long, device=device)
+            cls_target[batch_idx, prior_idx] = 1
 
-                if len(target) == 0:
-                    # All-negative sample — only cls loss, no reg/iou
-                    cls_preds_list.append(cls_pred)
-                    cls_targets_list.append(predictions.new_zeros(num_priors).long())
-                    cls_norm_list.append(1.0)
-                    continue
+            # Predictions: (B, Np, 2) -> (B, 2, Np) for FocalLoss
+            cls_pred = predictions_list[..., :2].permute(0, 2, 1)
 
-                # ── Vectorised assignment ─────────────────────────────────
-                with torch.no_grad():
-                    matched_row_inds, matched_col_inds = assign(
-                        predictions, target, self.img_w, self.img_h
-                    )
+            # FocalLoss returns (B, Np) with reduction='none'
+            focal_loss = cls_criterion(cls_pred, cls_target)
 
-                # Classification
-                cls_target = predictions.new_zeros(num_priors).long()
-                cls_target[matched_row_inds] = 1
-                cls_preds_list.append(cls_pred)
-                cls_targets_list.append(cls_target)
-                cls_norm_list.append(float(target.shape[0]))
+            # Sum over priors per image, then normalize by num_gt_per_img, then sum over batch
+            # This matches CLRNet's per-image normalization logic
+            cls_loss_stage = (focal_loss.sum(dim=1) / num_gt_per_img).sum()
+            cls_loss += cls_loss_stage
 
-                # Regression — collect matched pairs for batched loss later
-                reg_yxtl = predictions[matched_row_inds, 2:6].clone()
+            # ── Regression & IoU Loss ────────────────────────────────────────
+            if len(batch_idx) > 0:
+                # Extract matched predictions and targets
+                matched_preds = predictions_list[batch_idx, prior_idx]  # (N_match, D)
+                matched_targets = targets[batch_idx, gt_idx]  # (N_match, D)
+
+                # 1. Reg XYTL
+                reg_yxtl = matched_preds[:, 2:6].clone()
                 reg_yxtl[:, 0] *= self.n_strips
                 reg_yxtl[:, 1] *= self.img_w - 1
                 reg_yxtl[:, 2] *= 180
                 reg_yxtl[:, 3] *= self.n_strips
 
-                tgt_yxtl = target[matched_col_inds, 2:6].clone()
+                tgt_yxtl = matched_targets[:, 2:6].clone()
 
-                # Length correction (no-grad)
+                # Length correction
                 with torch.no_grad():
-                    pred_starts = (
-                        (predictions[matched_row_inds, 2] * self.n_strips)
-                        .round().long().clamp(0, self.n_strips)
-                    )
-                    tgt_starts = (
-                        (target[matched_col_inds, 2] * self.n_strips).round().long()
-                    )
-                    tgt_yxtl[:, -1] -= (pred_starts - tgt_starts)
+                    pred_starts = (matched_preds[:, 2] * self.n_strips).round().long().clamp(0, self.n_strips)
+                    tgt_starts = (matched_targets[:, 2] * self.n_strips).round().long()
+                    tgt_yxtl[:, -1] -= pred_starts - tgt_starts
 
                 tgt_yxtl[:, 0] *= self.n_strips
                 tgt_yxtl[:, 2] *= 180
 
-                reg_pred    = predictions[matched_row_inds, 6:].clone() * (self.img_w - 1)
-                reg_targets = target[matched_col_inds, 6:].clone()
+                # Smooth L1 Loss (N_match, 4) -> Mean over 4 params -> (N_match,)
+                loss_reg = F.smooth_l1_loss(reg_yxtl, tgt_yxtl, reduction='none').mean(dim=1)
 
-                reg_yxtl_list.append(reg_yxtl)
-                tgt_yxtl_list.append(tgt_yxtl)
-                reg_pred_list.append(reg_pred)
-                reg_tgt_list.append(reg_targets)
+                # 2. IoU Loss
+                reg_pred_xs = matched_preds[:, 6:].clone() * (self.img_w - 1)
+                reg_target_xs = matched_targets[:, 6:].clone()
 
-            # ── Focal loss for this stage (per-sample, correct normalisation) ─
-            for cls_pred, cls_target, norm in zip(
-                cls_preds_list, cls_targets_list, cls_norm_list
-            ):
-                cls_loss = cls_loss + cls_criterion(cls_pred, cls_target).sum() / norm
+                # line_iou returns (N_match,)
+                iou_score = line_iou(reg_pred_xs, reg_target_xs, self.img_w, length=15, aligned=True)
+                loss_iou = 1.0 - iou_score
 
-            # ── Batched regression + IoU loss for this stage ──────────────────
-            # Cat all matched pairs from every sample → single GPU kernel
-            if reg_yxtl_list:
-                batch_reg_yxtl = torch.cat(reg_yxtl_list, dim=0)  # (M, 4)
-                batch_tgt_yxtl = torch.cat(tgt_yxtl_list, dim=0)
-                batch_reg_pred = torch.cat(reg_pred_list, dim=0)   # (M, Nr)
-                batch_reg_tgt  = torch.cat(reg_tgt_list,  dim=0)
+                # 3. Aggregate per image (Sum of Means)
+                # We calculate mean loss for each image separately to match CLRNet behavior
+                # count_per_img[b] = Count(matches in image b)
+                count_per_img = torch.bincount(batch_idx, minlength=batch_size).float()
 
-                reg_xytl_loss = reg_xytl_loss + F.smooth_l1_loss(
-                    batch_reg_yxtl, batch_tgt_yxtl, reduction="none"
-                ).mean()
+                sum_reg_loss = torch.zeros(batch_size, device=device)
+                sum_reg_loss.index_add_(0, batch_idx, loss_reg)
 
-                iou_loss = iou_loss + liou_loss(
-                    batch_reg_pred, batch_reg_tgt, self.img_w, length=15
-                )
+                sum_iou_loss = torch.zeros(batch_size, device=device)
+                sum_iou_loss.index_add_(0, batch_idx, loss_iou)
+
+                # Handle images with 0 matches (avoid division by zero)
+                valid_img_mask = count_per_img > 0
+
+                if valid_img_mask.any():
+                    reg_loss_stage = (sum_reg_loss[valid_img_mask] / count_per_img[valid_img_mask]).sum()
+                    iou_loss_stage = (sum_iou_loss[valid_img_mask] / count_per_img[valid_img_mask]).sum()
+
+                    reg_xytl_loss += reg_loss_stage
+                    iou_loss += iou_loss_stage
 
         # ── Segmentation loss (unchanged) ─────────────────────────────────────
-        seg_loss = self.criterion(
-            F.log_softmax(output["seg"], dim=1), batch["seg"].long()
-        )
+        seg_loss = self.criterion(F.log_softmax(output['seg'], dim=1), batch['seg'].long())
 
         # ── Normalise ─────────────────────────────────────────────────────────
+        # Normalize by batch_size * refine_layers to get average loss per image per stage
         norm = float(batch_size * self.refine_layers)
-        cls_loss      /= norm
+        cls_loss /= norm
         reg_xytl_loss /= norm
-        iou_loss      /= norm
+        iou_loss /= norm
 
         return {
-            "cls_loss":      cls_loss      * cls_loss_weight,
-            "reg_xytl_loss": reg_xytl_loss * xyt_loss_weight,
-            "seg_loss":      seg_loss      * seg_loss_weight,
-            "iou_loss":      iou_loss      * iou_loss_weight,
+            'cls_loss': cls_loss * cls_loss_weight,
+            'reg_xytl_loss': reg_xytl_loss * xyt_loss_weight,
+            'seg_loss': seg_loss * seg_loss_weight,
+            'iou_loss': iou_loss * iou_loss_weight,
         }

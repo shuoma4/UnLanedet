@@ -28,7 +28,7 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 192
 num_classes = 1 + 1  # openlane seg label
-data_root = '/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_300'
+data_root = '/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_1000'
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight
@@ -65,12 +65,12 @@ model = L(FCLRNet)(
 train = get_config('config/common/train.py').train
 epochs = 15
 batch_size = 48
-epoch_per_iter = 45903 // batch_size + 1
+epoch_per_iter = 142226 // batch_size + 1
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
-train.eval_period = epoch_per_iter * 2
-train.output_dir = 'output/openlane/llanet_resnet34'
+train.eval_period = epoch_per_iter
+train.output_dir = 'output/openlane/1000d/llanet_resnet34'
 
 optimizer = get_config('config/common/optim.py').AdamW
 optimizer.lr = 2.6e-4
@@ -120,6 +120,7 @@ val_process = [
 ]
 
 dataloader = get_config('config/common/openlane.py').dataloader
+dataloader.train.dataset.data_root = data_root
 dataloader.train.dataset.processes = train_process
 dataloader.train.dataset.cut_height = cut_height
 dataloader.train.dataset.cfg = param_config
@@ -129,6 +130,7 @@ dataloader.train.persistent_workers = True
 dataloader.train.pin_memory = True
 dataloader.train.prefetch_factor = 4
 
+dataloader.test.dataset.data_root = data_root
 dataloader.test.dataset.processes = val_process
 dataloader.test.dataset.cut_height = cut_height
 dataloader.test.dataset.cfg = param_config
@@ -136,7 +138,7 @@ dataloader.test.total_batch_size = batch_size
 dataloader.test.num_workers = 4
 
 # Evaluation config
-dataloader.evaluator.output_dir = './output/openlane/llanet_resnet34/val'
+dataloader.evaluator.output_dir = './output/openlane/1000d/llanet_resnet34/val'
 dataloader.evaluator.cfg = param_config
 
 train.amp.enabled = True

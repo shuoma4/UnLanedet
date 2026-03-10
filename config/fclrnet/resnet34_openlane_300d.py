@@ -120,6 +120,7 @@ val_process = [
 ]
 
 dataloader = get_config('config/common/openlane.py').dataloader
+dataloader.train.dataset.data_root = data_root
 dataloader.train.dataset.processes = train_process
 dataloader.train.dataset.cut_height = cut_height
 dataloader.train.dataset.cfg = param_config
@@ -129,6 +130,7 @@ dataloader.train.persistent_workers = True
 dataloader.train.pin_memory = True
 dataloader.train.prefetch_factor = 4
 
+dataloader.test.dataset.data_root = data_root
 dataloader.test.dataset.processes = val_process
 dataloader.test.dataset.cut_height = cut_height
 dataloader.test.dataset.cfg = param_config
