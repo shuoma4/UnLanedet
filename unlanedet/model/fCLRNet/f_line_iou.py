@@ -9,12 +9,22 @@ Bug fix (pairwise mode):
     which would raise an IndexError for Np > 1.  We now use element-wise
     multiplication with a float validity mask instead.
 
-Bug fix (clamp):
+Bug fix (clamp ovr/union at 0):
     ``ovr`` and ``union`` can be negative when lanes do not overlap at all.
-    Summing negative ovr values reduces the IoU numerator below zero, which
-    produces IoU > 1 after dividing by a small union and then causes the
-    dynamic-k topk to select wrong priors.  Clamping at 0 is physically
-    correct: negative overlap means no overlap.
+    Summing negative ovr values reduces the IoU numerator below zero.
+    Clamping at 0 is physically correct: negative overlap means no overlap.
+
+Bug fix (AMP / FP16 NaN in DivBackward0):
+    With AMP enabled (FP16), the epsilon ``1e-9`` underflows to exactly 0.0
+    in half-precision arithmetic.  When union_sum is also near-zero in FP16,
+    the backward gradient  d(a/b)/db = -a/b^2  becomes NaN (DivBackward0
+    crash observed at ~8000 iters).
+
+    Fix: clamp the denominator to a minimum of 1.0 (pixel units) before
+    dividing, then use torch.where to zero-out IoU for the all-invalid case.
+    This keeps the full autograd graph intact — unlike in-place mask
+    assignment on a zeros_like() tensor, which silently detaches from the
+    graph and produces zero IoU gradients everywhere.
 """
 
 import torch
@@ -44,7 +54,7 @@ def line_iou(
     tx2 = target + length
 
     if aligned:
-        # ── aligned: shapes match exactly ──────────────────────────────────────
+        # ── aligned: shapes match exactly ─────────────────────────────────────
         ovr = torch.min(px2, tx2) - torch.max(px1, tx1)
         union = torch.max(px2, tx2) - torch.min(px1, tx1)
         # valid_mask shape: same as target (..., Nr)
@@ -70,7 +80,20 @@ def line_iou(
         ovr = torch.clamp(ovr, min=0.0) * valid_mask
         union = torch.clamp(union, min=0.0) * valid_mask
 
-    iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
+    ovr_sum = ovr.sum(dim=-1)
+    union_sum = union.sum(dim=-1)
+
+    # ── NaN-safe division (AMP/FP16 compatible) ─────────────────────────────
+    # 1e-9 underflows to 0 in FP16, causing DivBackward0 NaN when union_sum
+    # is also near-zero.  clamp(min=1.0) is safe because a single valid
+    # point contributes union >= 2*length = 30 pixels; it only activates for
+    # the degenerate all-invalid case.
+    # torch.where keeps both branches in the computation graph so gradients
+    # flow correctly through the valid entries.
+    safe_union = union_sum.clamp(min=1.0)
+    iou_raw = ovr_sum / safe_union
+    # Zero out entries where the lane is entirely outside the image.
+    iou = torch.where(union_sum > 0, iou_raw, torch.zeros_like(iou_raw))
     return iou
 
 
@@ -107,7 +130,12 @@ class CLRNetIoULoss(torch.nn.Module):
         valid_mask = ((target >= 0) & (target < 1.0)).float()
         ovr = torch.clamp(ovr, min=0.0) * valid_mask
         union = torch.clamp(union, min=0.0) * valid_mask
-        return ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
+
+        ovr_sum = ovr.sum(dim=-1)
+        union_sum = union.sum(dim=-1)
+        safe_union = union_sum.clamp(min=1.0)
+        iou_raw = ovr_sum / safe_union
+        return torch.where(union_sum > 0, iou_raw, torch.zeros_like(iou_raw))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         assert (
