@@ -15,6 +15,7 @@ from .generate_lane_line import (
     GenerateLanePts,
     GenerateSRLaneLine,
 )
+from .openlane_generator import OpenLaneGenerator
 from .generate_seg_label import generate_lane_mask, generate_lane_mask_binary
 from .lane_decoder import LaneDecoder
 from .lane_encoder import LaneEncoder

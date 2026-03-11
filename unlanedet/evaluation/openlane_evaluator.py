@@ -1,242 +1,169 @@
+import json
 import logging
 import os
+import os.path as osp
+from functools import partial
 
 import numpy as np
+from p_tqdm import p_map
 from tqdm import tqdm
-
-try:
-    from p_tqdm import p_map
-except ImportError:
-    p_map = None
 
 from . import culane_metric
 from .evaluator import DatasetEvaluator
 
 
-def robust_interp(points, n=5):
-    """
-    Linear interpolation to avoid spline oscillations with jittery GT.
-    Resamples the polyline to increase point density.
-    n: multiplier for number of points (similar to original interp logic)
-    """
+def _linear_interp(points, n=5):
+    """用线性插值替代 spline，避免 OpenLane GT 点分布不均时 splprep 崩溃。"""
     if len(points) < 2:
         return np.array(points)
-
-    points = np.array(points)
-    # Calculate cumulative distance
-    dists = np.sqrt(np.sum(np.diff(points, axis=0) ** 2, axis=1))
-    cum_dists = np.concatenate(([0], np.cumsum(dists)))
-    total_dist = cum_dists[-1]
-
-    if total_dist == 0:
-        return np.array([points[0]] * 50)
-
-    # Determine target number of points
-    # Use a fixed density or multiplier. Let's use multiplier to match CULane logic.
-    target_num = max(50, len(points) * n)
-
-    # Uniform sample distances
-    target_dists = np.linspace(0, total_dist, int(target_num))
-
-    # Interpolate X and Y
-    x_interp = np.interp(target_dists, cum_dists, points[:, 0])
-    y_interp = np.interp(target_dists, cum_dists, points[:, 1])
-
-    return np.stack([x_interp, y_interp], axis=1)
+    pts = np.array(points)
+    dists = np.sqrt(np.sum(np.diff(pts, axis=0) ** 2, axis=1))
+    cum_d = np.concatenate(([0], np.cumsum(dists)))
+    total = cum_d[-1]
+    if total == 0:
+        return np.tile(pts[0], (50, 1))
+    target_n = max(50, len(pts) * n)
+    td = np.linspace(0, total, int(target_n))
+    xi = np.interp(td, cum_d, pts[:, 0])
+    yi = np.interp(td, cum_d, pts[:, 1])
+    return np.stack([xi, yi], axis=1)
 
 
-# Monkey patch culane_metric.interp
-culane_metric.interp = robust_interp
+# 替换 culane_metric 中的 interp，避免 OpenLane GT 不规则点导致的 spline 失败
+culane_metric.interp = _linear_interp
+
+
+def _openlane_metric_per_sample(
+    pred_pts, gt_pts, width=30, iou_threshold=0.5, img_shape=(1280, 1920, 3)
+):
+    tp, fp, fn, _, _ = culane_metric.culane_metric(
+        pred_pts,
+        gt_pts,
+        width=width,
+        iou_threshold=iou_threshold,
+        official=True,
+        img_shape=img_shape,
+    )
+    return tp, fp, fn
 
 
 class OpenLaneEvaluator(DatasetEvaluator):
-    def __init__(self, data_root=None, cfg=None, **kwargs):
+    """
+    OpenLane 数据集的 IoU-based 评估器（与 CULane 同一套 IoU 逻辑）。
+
+    流程：
+      1. 预测: Lane.to_array(cfg) -> (N, 2) 原始像素坐标 [x, y]
+         要求 cfg.sample_y 为原始图像空间的 y 采样序列（如 range(1279, 270, -8)）
+      2. 真值: data_infos[i]['lanes'] 中的 numpy 数组，已在原始图像坐标系 (u, v)
+      3. 在 (ori_img_h × ori_img_w) 画布上用宽度 width 绘制车道线，计算 IoU
+
+    self.data_infos 由 inference_on_dataset 从 dataset.data_infos 注入，无需手动传入。
+    """
+
+    def __init__(
+        self,
+        cfg=None,
+        output_dir=None,
+        iou_threshold=0.5,
+        width=30,
+        metric="F1",
+        **kwargs,  # 兼容旧 config 中的多余参数（如 evaluate_bin_path）
+    ):
         self.cfg = cfg
-        self.data_root = data_root or (cfg.data_root if cfg and hasattr(cfg, 'data_root') else None)
-
-        if self.data_root is None:
-            raise ValueError('data_root must be provided either as argument or in cfg')
-
+        self.output_dir = output_dir
+        self.iou_threshold = iou_threshold
+        self.width = width
+        self.metric = metric
         self.logger = logging.getLogger(__name__)
+        self.data_infos = None  # 由 inference_on_dataset 注入
 
-        # Determine validation directory
-        if os.path.basename(self.data_root) == 'lane3d_300':
-            self.val_dir = os.path.join(self.data_root, 'validation')
-        else:
-            self.val_dir = os.path.join(self.data_root, 'lane3d_300', 'validation')
+        self.ori_img_w = getattr(cfg, "ori_img_w", 1920) if cfg else 1920
+        self.ori_img_h = getattr(cfg, "ori_img_h", 1280) if cfg else 1280
 
-        if not os.path.exists(self.val_dir):
-            self.val_dir = os.path.join(self.data_root, 'validation')
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
-        if not os.path.exists(self.val_dir):
-            raise ValueError(f'Validation directory not found in {self.data_root}')
+    def _pred_lane_to_pts(self, lane):
+        """Lane 对象 -> list of [x, y]（原始像素空间）"""
+        arr = lane.to_array(
+            self.cfg
+        )  # (N, 2), x in [0, ori_img_w), y in [cut_h, ori_img_h)
+        return arr.tolist() if len(arr) >= 2 else []
 
-        self.ori_img_w = cfg.ori_img_w if cfg else 1920
-        self.ori_img_h = cfg.ori_img_h if cfg else 1280
-
-        # Evaluation in original space
-        self.img_w = self.ori_img_w
-        self.img_h = self.ori_img_h
-
-    def get_prediction_lanes(self, output):
-        pred_lanes = []
-        for lane in output:
-            # HACK: Force correct sample_y for OpenLane
-            if not hasattr(self.cfg, 'sample_y_corrected'):
-                self.cfg.sample_y = list(range(270, 1280, 10))
-                self.cfg.sample_y_corrected = True
-
-            pred_lanes.append(lane.to_array(self.cfg))
-        return pred_lanes
+    def _gt_lane_to_pts(self, lane):
+        """GT numpy 数组 (N,2) [u,v] -> list of [x, y]"""
+        arr = np.array(lane) if not isinstance(lane, np.ndarray) else lane
+        return arr.tolist() if len(arr) >= 2 else []
 
     def evaluate(self, predictions):
-        self.logger.info('Evaluating...')
+        self.logger.info("OpenLane evaluation start...")
 
-        if not hasattr(self, 'data_infos') or not self.data_infos:
-            self.logger.warning('data_infos not found or empty. Evaluation might fail.')
+        if not self.data_infos:
+            self.logger.warning("data_infos 为空，无法评估。")
             return {}
 
-        all_pred_lanes = []
-        all_gt_lanes = []
+        img_shape = (self.ori_img_h, self.ori_img_w, 3)
+        pred_collection = []
+        gt_collection = []
 
-        # GT seems to be in 800x320 space (Max Y ~300)
-        # We need to scale GT to 1920x1280
-        # W Scale: 1920 / 800 = 2.4
-        # H Scale: (1280 - 270) / 320 = 3.156
-
-        gt_w = 800
-        gt_h = 320
-        w_scale = self.ori_img_w / gt_w
-        cut_height = self.cfg.cut_height if hasattr(self.cfg, 'cut_height') else 270
-        h_scale = (self.ori_img_h - cut_height) / gt_h
-
-        for i, pred in enumerate(tqdm(predictions, desc='Processing predictions')):
+        for i, pred_lanes in enumerate(tqdm(predictions, desc="Computing IoU")):
             if i >= len(self.data_infos):
                 break
 
-            # Get Prediction Points (In original space)
-            pred_lanes = self.get_prediction_lanes(pred)
+            pred_pts = [self._pred_lane_to_pts(l) for l in pred_lanes]
+            pred_pts = [p for p in pred_pts if len(p) >= 2]
 
-            all_pred_lanes.append(pred_lanes)
+            gt_pts = [self._gt_lane_to_pts(l) for l in self.data_infos[i]["lanes"]]
+            gt_pts = [g for g in gt_pts if len(g) >= 2]
 
-            # Get GT Points
-            raw_gt_lanes = self.data_infos[i]['lanes']
-            track_ids = self.data_infos[i].get('lane_track_ids', [])
+            pred_collection.append(pred_pts)
+            gt_collection.append(gt_pts)
 
-            # DEBUG: Check track IDs for Sample 2
-            if i == 2:
-                print(f'Sample 2 Track IDs: {track_ids}')
+        self.logger.info("Computing OpenLane IoU in parallel...")
+        results = p_map(
+            partial(
+                _openlane_metric_per_sample,
+                width=self.width,
+                iou_threshold=self.iou_threshold,
+                img_shape=img_shape,
+            ),
+            pred_collection,
+            gt_collection,
+        )
 
-            gt_lanes = []
+        total_tp = sum(tp for tp, _, _ in results)
+        total_fp = sum(fp for _, fp, _ in results)
+        total_fn = sum(fn for _, _, fn in results)
 
-            for gtl in raw_gt_lanes:
-                lane_arr = np.array(gtl) if not isinstance(gtl, np.ndarray) else gtl
-                if len(lane_arr) == 0:
-                    continue
+        precision = (
+            total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        )
+        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
 
-                # GT is already in original space (1920x1280) because we disabled preprocessing
-                points = lane_arr.tolist()
-
-                points.sort(key=lambda p: p[1])
-                gt_lanes.append(points)
-
-            all_gt_lanes.append(gt_lanes)
-
-        # Run Metric in original space
-        img_shape = (self.ori_img_h, self.ori_img_w, 3)
-        width = 30
-        iou_threshold = 0.5
-        official = False
-
-        # Custom Distance-based Metric
-        tp_gt = 0
-        tp_pred = 0
-        total_pred = 0
-        total_gt = 0
-
-        dist_th = 50.0  # pixels
-
-        # DEBUG: Check first valid sample overlap manually
-        checked = False
-        for idx in range(len(all_pred_lanes)):
-            p0 = all_pred_lanes[idx]
-            g0 = all_gt_lanes[idx]
-
-            # Count totals
-            total_pred += len(p0)
-            total_gt += len(g0)
-
-            # Match GTs (Recall)
-            for gl in g0:
-                gl_arr = np.array(gl)
-                matched = False
-                for pl in p0:
-                    pl_arr = np.array(pl)
-                    if len(pl_arr) == 0 or len(gl_arr) == 0:
-                        continue
-                    # Calc min dist between any points
-                    dists = np.sqrt(((pl_arr[:, None, :] - gl_arr[None, :, :]) ** 2).sum(axis=2))
-                    if dists.min() < dist_th:
-                        matched = True
-                        break
-                if matched:
-                    tp_gt += 1
-
-            # Match Preds (Precision)
-            for pl in p0:
-                pl_arr = np.array(pl)
-                matched = False
-                for gl in g0:
-                    gl_arr = np.array(gl)
-                    if len(pl_arr) == 0 or len(gl_arr) == 0:
-                        continue
-                    dists = np.sqrt(((pl_arr[:, None, :] - gl_arr[None, :, :]) ** 2).sum(axis=2))
-                    if dists.min() < dist_th:
-                        matched = True
-                        break
-                if matched:
-                    tp_pred += 1
-
-            if len(p0) > 0 and len(g0) > 0 and not checked:
-                print(f'DEBUG: Checking overlap for Sample {idx}')
-                # ... (existing debug print)
-                # Check overlap for ALL pairs
-                matched = False
-                for i, pl in enumerate(p0):
-                    for j, gl in enumerate(g0):
-                        # Calculate min distance
-                        pl_arr = np.array(pl)
-                        gl_arr = np.array(gl)
-                        # simple brute force min distance
-                        dists = np.sqrt(((pl_arr[:, None, :] - gl_arr[None, :, :]) ** 2).sum(axis=2))
-                        min_dist = dists.min()
-
-                        img_p = culane_metric.draw_lane(np.array(pl), img_shape=img_shape, width=width)
-                        img_g = culane_metric.draw_lane(np.array(gl), img_shape=img_shape, width=width)
-                        overlap = (img_p > 0) & (img_g > 0)
-                        union = (img_p > 0) | (img_g > 0)
-                        iou = np.sum(overlap) / np.sum(union) if np.sum(union) > 0 else 0
-
-                        print(f'  P{i}-G{j}: Min Dist={min_dist:.2f}, IOU={iou:.4f}')
-
-                        if iou > 0.01:
-                            # print(f"  Match P{i}-G{j}: IOU={iou:.4f}")
-                            matched = True
-
-                checked = True
-
-        # Calculate Custom Metrics
-        precision = tp_pred / total_pred if total_pred > 0 else 0
-        recall = tp_gt / total_gt if total_gt > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-        print(f'Custom Distance Metric (th={dist_th}): P={precision:.4f}, R={recall:.4f}, F1={f1:.4f}')
-
-        return {
-            'TP': tp_gt,
-            'FP': total_pred - tp_pred,
-            'FN': total_gt - tp_gt,
-            'Precision': precision,
-            'Recall': recall,
-            'F1': f1,
+        result = {
+            "TP": total_tp,
+            "FP": total_fp,
+            "FN": total_fn,
+            "Precision": precision,
+            "Recall": recall,
+            "F1": f1,
         }
+
+        self.logger.info("=== OpenLane Evaluation Results ===")
+        for k, v in result.items():
+            self.logger.info(
+                f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}"
+            )
+
+        if self.output_dir:
+            save_path = osp.join(self.output_dir, "openlane_eval_results.json")
+            with open(save_path, "w") as f:
+                json.dump(result, f, indent=2)
+            self.logger.info(f"结果已保存至 {save_path}")
+
+        return result

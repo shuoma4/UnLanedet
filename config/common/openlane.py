@@ -15,8 +15,8 @@ dataloader = OmegaConf.create()
 
 dataloader.train = L(build_batch_data_loader)(
     dataset=L(OpenLane)(
-        data_root='/data1/lxy_log/workspace/ms/OpenLane/dataset/raw',
-        split='train',
+        data_root="/data1/lxy_log/workspace/ms/OpenLane/dataset/raw",
+        split="train",
         cut_height=cut_height,
         processes=None,
     ),
@@ -27,8 +27,8 @@ dataloader.train = L(build_batch_data_loader)(
 
 dataloader.test = L(build_batch_data_loader)(
     dataset=L(OpenLane)(
-        data_root='/data1/lxy_log/workspace/ms/OpenLane/dataset/raw',
-        split='val',
+        data_root="/data1/lxy_log/workspace/ms/OpenLane/dataset/raw",
+        split="val",
         cut_height=cut_height,
         processes=None,
     ),
@@ -39,9 +39,9 @@ dataloader.test = L(build_batch_data_loader)(
 )
 
 dataloader.evaluator = L(OpenLaneEvaluator)(
-    cfg='${...dataloader.test.dataset.processes[0].cfg}',
-    evaluate_bin_path='unlanedet/evaluation/openlane/evaluate',
+    cfg="${...dataloader.test.dataset.processes[0].cfg}",
+    evaluate_bin_path="unlanedet/evaluation/openlane/evaluate",
     iou_threshold=0.5,
     width=30,
-    metric='F1',
+    metric="F1",
 )

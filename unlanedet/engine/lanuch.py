@@ -55,25 +55,21 @@ def launch(
         # TODO prctl in spawned processes
 
         if dist_url == "auto":
-            assert (
-                num_machines == 1
-            ), "dist_url=auto not supported in multi-machine jobs."
-
+            assert num_machines == 1, "dist_url=auto not supported in multi-machine jobs."
+            
             # 添加重试逻辑，处理端口冲突
             for attempt in range(max_retries):
                 try:
                     import subprocess
                     import time
-
+                    
                     # 清理可能占用端口的进程
                     port = _find_free_port()
                     dist_url = f"tcp://127.0.0.1:{port}"
-
+                    
                     logger = logging.getLogger(__name__)
-                    logger.info(
-                        f"尝试启动分布式训练，使用端口: {port} (尝试 {attempt+1}/{max_retries})"
-                    )
-
+                    logger.info(f"尝试启动分布式训练，使用端口: {port} (尝试 {attempt+1}/{max_retries})")
+                    
                     # 尝试启动训练
                     mp.start_processes(
                         _distributed_worker,
@@ -93,25 +89,16 @@ def launch(
                 except Exception as e:
                     error_msg = str(e)
                     logger = logging.getLogger(__name__)
-
-                    if (
-                        "Address already in use" in error_msg
-                        and attempt < max_retries - 1
-                    ):
-                        logger.warning(
-                            f"端口冲突，{3}秒后重试... (尝试 {attempt+1}/{max_retries})"
-                        )
+                    
+                    if "Address already in use" in error_msg and attempt < max_retries - 1:
+                        logger.warning(f"端口冲突，{3}秒后重试... (尝试 {attempt+1}/{max_retries})")
                         time.sleep(3)
-
+                        
                         # 尝试清理可能占用端口的相关进程
                         try:
                             # 查找并杀死可能占用该端口的Python进程
-                            subprocess.run(
-                                f"lsof -ti:{port} | xargs -r kill -9",
-                                shell=True,
-                                capture_output=True,
-                                text=True,
-                            )
+                            subprocess.run(f"lsof -ti:{port} | xargs -r kill -9", shell=True, 
+                                       capture_output=True, text=True)
                         except:
                             pass
                         continue
@@ -127,69 +114,21 @@ def launch(
                 "file:// is not a reliable init_method in multi-machine jobs. Prefer tcp://"
             )
         else:
-            try:
-                mp.start_processes(
-                    _distributed_worker,
-                    nprocs=num_gpus_per_machine,
-                    args=(
-                        main_func,
-                        world_size,
-                        num_gpus_per_machine,
-                        machine_rank,
-                        dist_url,
-                        args,
-                        timeout,
-                    ),
-                    daemon=False,
-                )
-            except Exception as e:
-                import time
-                import subprocess
-
-                logger = logging.getLogger(__name__)
-                msg = str(e)
-                if "Address already in use" in msg:
-                    for attempt in range(max_retries):
-                        try:
-                            port = _find_free_port()
-                            dist_url = f"tcp://127.0.0.1:{port}"
-                            logger.warning(
-                                f"端口占用，切换到新端口: {port} (尝试 {attempt+1}/{max_retries})"
-                            )
-                            mp.start_processes(
-                                _distributed_worker,
-                                nprocs=num_gpus_per_machine,
-                                args=(
-                                    main_func,
-                                    world_size,
-                                    num_gpus_per_machine,
-                                    machine_rank,
-                                    dist_url,
-                                    args,
-                                    timeout,
-                                ),
-                                daemon=False,
-                            )
-                            break
-                        except Exception as e2:
-                            if (
-                                attempt < max_retries - 1
-                                and "Address already in use" in str(e2)
-                            ):
-                                time.sleep(3)
-                                try:
-                                    subprocess.run(
-                                        f"lsof -ti:{port} | xargs -r kill -9",
-                                        shell=True,
-                                        capture_output=True,
-                                        text=True,
-                                    )
-                                except:
-                                    pass
-                                continue
-                            raise
-                else:
-                    raise
+            # 如果用户指定了dist_url，直接使用
+            mp.start_processes(
+                _distributed_worker,
+                nprocs=num_gpus_per_machine,
+                args=(
+                    main_func,
+                    world_size,
+                    num_gpus_per_machine,
+                    machine_rank,
+                    dist_url,
+                    args,
+                    timeout,
+                ),
+                daemon=False,
+            )
     else:
         main_func(*args)
 

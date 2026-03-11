@@ -1,20 +1,7 @@
-import imgaug.augmenters.color as iaa_color
-import numpy as np
-import sys
-import os
-sys.path.insert(0, os.getcwd())
-
-# if iaa_color.AddToHueAndSaturation._LUT_CACHE is None:
-#    iaa_color.AddToHueAndSaturation._LUT_CACHE = [np.arange(256, dtype=np.int16), np.arange(256, dtype=np.int16)]
-
-
-import copy
 import logging
+import copy
 
-import cv2
-import torch
-
-from unlanedet.checkpoint import BestCheckPointer, Checkpointer
+from unlanedet.checkpoint import Checkpointer,BestCheckPointer
 from unlanedet.config import LazyConfig, instantiate
 from unlanedet.engine import (
     AMPTrainer,
@@ -29,38 +16,22 @@ from unlanedet.engine.defaults import create_ddp_model
 from unlanedet.evaluation import inference_on_dataset, print_csv_format
 from unlanedet.utils import comm
 
-logger = logging.getLogger('unlanedet')
 
-
-def init_cv():
-    cv2.setNumThreads(0)
-    cv2.ocl.setUseOpenCL(False)
-    logger.info('OpenCV threads set to 0 and OpenCL disabled')
-
-
-init_cv()
-# debug
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# torch.autograd.set_detect_anomaly(True)  # 开启自动梯度检测，用于调试
+logger = logging.getLogger("unlanedet")
 
 
 def do_test(cfg, model):
-    # Ensure model is on correct device before inference
-    device = cfg.train.device
-    logger.info(f'Moving model to device: {device}')
-    model = model.to(device)
-
-    # Debug: check model parameters device
-    for name, param in list(model.named_parameters())[:3]:
-        logger.info(f'Parameter {name} device: {param.device}')
-
-    if 'evaluator' in cfg.dataloader:
+    if "evaluator" in cfg.dataloader:
+        # Convert to SyncBatchNorm if in distributed mode and not already converted
         if comm.get_world_size() > 1:
-            has_sync_bn = any(isinstance(module, torch.nn.SyncBatchNorm) for module in model.modules())
+            import torch
+            # Check if model already has SyncBatchNorm modules
+            has_sync_bn = any(isinstance(module, torch.nn.SyncBatchNorm) 
+                            for module in model.modules())
             if not has_sync_bn:
-                logger.info('Converting model to use SyncBatchNorm for evaluation')
+                logger.info("Converting model to use SyncBatchNorm for evaluation")
                 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
+        
         ret = inference_on_dataset(
             model,
             instantiate(cfg.dataloader.test),
@@ -71,13 +42,32 @@ def do_test(cfg, model):
 
 
 def do_train(args, cfg):
+    """
+    Args:
+        cfg: an object with the following attributes:
+            model: instantiate to a module
+            dataloader.{train,test}: instantiate to dataloaders
+            dataloader.evaluator: instantiate to evaluator for test set
+            optimizer: instantaite to an optimizer
+            lr_multiplier: instantiate to a fvcore scheduler
+            train: other misc config defined in `configs/common/train.py`, including:
+                output_dir (str)
+                init_checkpoint (str)
+                amp.enabled (bool)
+                max_iter (int)
+                eval_period, log_period (int)
+                device (str)
+                checkpointer (dict)
+                ddp (dict)
+    """
     model = instantiate(cfg.model)
-    logger = logging.getLogger('unlanedet')
-    logger.info('Model:\n{}'.format(model))
+    logger = logging.getLogger("unlanedet")
+    logger.info("Model:\n{}".format(model))
     model.to(cfg.train.device)
 
     if comm.get_world_size() > 1:
-        logger.info('Converting model to use SyncBatchNorm')
+        import torch
+        logger.info("Converting model to use SyncBatchNorm")
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     cfg_copy = copy.deepcopy(cfg)
     cfg_copy.optimizer.params.model = model
@@ -97,14 +87,15 @@ def do_train(args, cfg):
             hooks.IterationTimer(),
             hooks.SetEpochHook(train_loader),
             hooks.LRScheduler(scheduler=instantiate(cfg.lr_multiplier)),
-            (hooks.PeriodicCheckpointer(checkpointer, **cfg.train.checkpointer) if comm.is_main_process() else None),
-            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
             (
-                hooks.BestCheckpointer(
-                    checkpointer=checkpointer,
-                    eval_period=cfg.train.eval_period,
-                    val_metric=cfg.dataloader.evaluator.metric,
-                )
+                hooks.PeriodicCheckpointer(checkpointer, **cfg.train.checkpointer)
+                if comm.is_main_process()
+                else None
+            ),
+            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
+            # Save the model achieving the best result.
+            (
+                hooks.BestCheckpointer(checkpointer=checkpointer,eval_period=cfg.train.eval_period,val_metric=cfg.dataloader.evaluator.metric)
                 if comm.is_main_process()
                 else None
             ),
@@ -121,6 +112,8 @@ def do_train(args, cfg):
 
     checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=args.resume)
     if args.resume and checkpointer.has_checkpoint():
+        # The checkpoint stores the training iteration that just finished, thus we start
+        # at the next iteration
         start_iter = trainer.iter + 1
     else:
         start_iter = 0
@@ -128,43 +121,15 @@ def do_train(args, cfg):
 
 
 def main(args):
-    # === 核心优化：开启 CuDNN Benchmark ===
-    # 针对固定输入尺寸加速卷积运算
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-    # ====================================
-
     cfg = LazyConfig.load(args.config_file)
     cfg = LazyConfig.apply_overrides(cfg, args.opts)
     default_setup(cfg, args)
 
     if args.eval_only:
         model = instantiate(cfg.model)
-        logger.info(f'Instantiated model, initial device of first param: {next(model.parameters()).device}')
         model.to(cfg.train.device)
-        logger.info(f'Moved model to {cfg.train.device}, first param device now: {next(model.parameters()).device}')
         model = create_ddp_model(model)
-        if cfg.train.init_checkpoint:
-            logger.info(f'Loading checkpoint from: {cfg.train.init_checkpoint}')
-            Checkpointer(model).load(cfg.train.init_checkpoint)
-
-            # SANITIZE BN STATS
-            logger.info('Sanitizing BN stats...')
-            count_fixed = 0
-            for name, m in model.named_modules():
-                if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
-                    if m.running_var is not None:
-                        # Fix negative variance
-                        if (m.running_var < 1e-5).any():
-                            # logger.warning(f"Fixed small/negative running_var in {name}")
-                            m.running_var.data.clamp_(min=1e-5)
-                            count_fixed += 1
-            logger.info(f'Fixed BN running_var in {count_fixed} modules.')
-
-            # Ensure model is on correct device after loading checkpoint
-            model.to(cfg.train.device)
-            logger.info(f'After loading checkpoint, first param device: {next(model.parameters()).device}')
-        model.eval()
+        Checkpointer(model).load(cfg.train.init_checkpoint)
         print(do_test(cfg, model))
     else:
         do_train(args, cfg)
@@ -182,5 +147,5 @@ def invoke_main() -> None:
     )
 
 
-if __name__ == '__main__':
-    invoke_main()
+if __name__ == "__main__":
+    invoke_main()  # pragma: no cover

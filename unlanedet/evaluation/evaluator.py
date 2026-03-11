@@ -1,27 +1,29 @@
-import datetime
-import json
-import logging
 import os
+from tqdm import tqdm
+import datetime
+import logging
 import time
+import json
+import numpy as np
 from collections import OrderedDict, abc
 from contextlib import ExitStack, contextmanager
 from typing import List, Union
-
-import numpy as np
 import torch
-import yaml
 from torch import nn
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
-
-from ..model.module.core.lane import Lane
-from ..utils.comm import get_world_size, is_main_process
-from ..utils.logger import log_every_n_seconds
+import json
+import subprocess
+import shutil
+import logging
+import os
+import yaml
 from . import culane_metric
 from .tusimple_metric import LaneEval
-from .vil_metric import LaneEval as VILLaneEval
-from .vil_metric import eval_predictions
+from .vil_metric import eval_predictions, LaneEval as VILLaneEval
 from .vil_utils import RES_MAPPING
+from ..utils.comm import get_world_size, is_main_process
+from ..utils.logger import log_every_n_seconds
+from ..model.module.core.lane import Lane
 
 
 class DatasetEvaluator:
@@ -80,7 +82,9 @@ class TusimpleEvaluator(DatasetEvaluator):
     Evaluator of the Tusimple dataset
     """
 
-    def __init__(self, ori_img_h, ori_img_w, test_json_file, output_basedir='', metric=None):
+    def __init__(
+        self, ori_img_h, ori_img_w, test_json_file, output_basedir="", metric=None
+    ):
         self.ori_img_h = ori_img_h
         self.h_samples = list(range(160, 720, 10))
         self.ori_img_w = ori_img_w
@@ -120,9 +124,9 @@ class TusimpleEvaluator(DatasetEvaluator):
 
     def pred2tusimpleformat(self, idx, pred, runtime):
         runtime *= 1000.0  # s to ms
-        img_name = self.data_infos[idx]['img_name']
+        img_name = self.data_infos[idx]["img_name"]
         lanes = self.pred2lanes(pred)
-        output = {'raw_file': img_name, 'lanes': lanes, 'run_time': runtime}
+        output = {"raw_file": img_name, "lanes": lanes, "run_time": runtime}
         return json.dumps(output)
 
     def save_tusimple_predictions(self, predictions, filename, runtimes=None):
@@ -132,14 +136,14 @@ class TusimpleEvaluator(DatasetEvaluator):
         for idx, (prediction, runtime) in enumerate(zip(predictions, runtimes)):
             line = self.pred2tusimpleformat(idx, prediction, runtime)
             lines.append(line)
-        with open(filename, 'w') as output_file:
-            output_file.write('\n'.join(lines))
+        with open(filename, "w") as output_file:
+            output_file.write("\n".join(lines))
 
     def process(self, inputs, outputs):
         return super().process(inputs, outputs)
 
     def evaluate(self, predictions, runtimes=None):
-        pred_filename = os.path.join(self.output_basedir, 'tusimple_predictions.json')
+        pred_filename = os.path.join(self.output_basedir, "tusimple_predictions.json")
         self.save_tusimple_predictions(predictions, pred_filename, runtimes)
         result, acc = LaneEval.bench_one_submit(pred_filename, self.test_json_file)
         print(result)
@@ -151,23 +155,25 @@ class CULaneEvaluator(DatasetEvaluator):
     Evaluator of the CULane dataset
     """
 
-    def __init__(self, data_root, ori_img_h, ori_img_w, output_basedir='', cfg=None, metric=None):
+    def __init__(
+        self, data_root, ori_img_h, ori_img_w, output_basedir="", cfg=None, metric=None
+    ):
         self.logger = logging.getLogger(__name__)
         self.data_root = data_root
         self.ori_img_w = ori_img_w
         self.ori_img_h = ori_img_h
         self.output_basedir = output_basedir
         LIST_FILE = {
-            'train': 'list/train_gt.txt',
-            'val': 'list/test.txt',
-            'test': 'list/test.txt',
+            "train": "list/train_gt.txt",
+            "val": "list/test.txt",
+            "test": "list/test.txt",
         }
-        self.list_path = os.path.join(data_root, LIST_FILE['test'])
+        self.list_path = os.path.join(data_root, LIST_FILE["test"])
         self.cfg = cfg
         self.load_annotations()
 
     def load_annotations(self):
-        self.logger.info('Loading CULane annotations for evaluation...')
+        self.logger.info("Loading CULane annotations for evaluation...")
         self.data_infos = []
         with open(self.list_path) as list_file:
             for line in list_file:
@@ -177,32 +183,38 @@ class CULaneEvaluator(DatasetEvaluator):
     def load_annotation(self, line):
         infos = {}
         img_line = line[0]
-        img_line = img_line[1 if img_line[0] == '/' else 0 : :]
+        img_line = img_line[1 if img_line[0] == "/" else 0 : :]
         img_path = os.path.join(self.data_root, img_line)
-        infos['img_name'] = img_line
-        infos['img_path'] = img_path
+        infos["img_name"] = img_line
+        infos["img_path"] = img_path
         if len(line) > 1:
             mask_line = line[1]
-            mask_line = mask_line[1 if mask_line[0] == '/' else 0 : :]
+            mask_line = mask_line[1 if mask_line[0] == "/" else 0 : :]
             mask_path = os.path.join(self.data_root, mask_line)
-            infos['mask_path'] = mask_path
+            infos["mask_path"] = mask_path
 
         if len(line) > 2:
             exist_list = [int(l) for l in line[2:]]
-            infos['lane_exist'] = np.array(exist_list)
+            infos["lane_exist"] = np.array(exist_list)
 
-        anno_path = img_path[:-3] + 'lines.txt'  # remove sufix jpg and add lines.txt
-        with open(anno_path, 'r') as anno_file:
+        anno_path = img_path[:-3] + "lines.txt"  # remove sufix jpg and add lines.txt
+        with open(anno_path, "r") as anno_file:
             data = [list(map(float, line.split())) for line in anno_file.readlines()]
         lanes = [
-            [(lane[i], lane[i + 1]) for i in range(0, len(lane), 2) if lane[i] >= 0 and lane[i + 1] >= 0]
+            [
+                (lane[i], lane[i + 1])
+                for i in range(0, len(lane), 2)
+                if lane[i] >= 0 and lane[i + 1] >= 0
+            ]
             for lane in data
         ]
         lanes = [list(set(lane)) for lane in lanes]  # remove duplicated points
-        lanes = [lane for lane in lanes if len(lane) > 3]  # remove lanes with less than 2 points
+        lanes = [
+            lane for lane in lanes if len(lane) > 3
+        ]  # remove lanes with less than 2 points
 
         lanes = [sorted(lane, key=lambda x: x[1]) for lane in lanes]  # sort by y
-        infos['lanes'] = lanes
+        infos["lanes"] = lanes
 
         return infos
 
@@ -216,22 +228,30 @@ class CULaneEvaluator(DatasetEvaluator):
             lane_xs = xs[valid_mask]
             lane_ys = ys[valid_mask] * self.ori_img_h
             lane_xs, lane_ys = lane_xs[::-1], lane_ys[::-1]
-            lane_str = ' '.join(['{:.5f} {:.5f}'.format(x, y) for x, y in zip(lane_xs, lane_ys)])
-            if lane_str != '':
+            lane_str = " ".join(
+                ["{:.5f} {:.5f}".format(x, y) for x, y in zip(lane_xs, lane_ys)]
+            )
+            if lane_str != "":
                 out.append(lane_str)
 
-        return '\n'.join(out)
+        return "\n".join(out)
 
     def evaluate(self, predictions):
-        print('Generating prediction output...')
+        print("Generating prediction output...")
         for idx, pred in enumerate(tqdm(predictions)):
-            output_dir = os.path.join(self.output_basedir, os.path.dirname(self.data_infos[idx]['img_name']))
-            output_filename = os.path.basename(self.data_infos[idx]['img_name'])[:-3] + 'lines.txt'
+            output_dir = os.path.join(
+                self.output_basedir, os.path.dirname(self.data_infos[idx]["img_name"])
+            )
+            output_filename = (
+                os.path.basename(self.data_infos[idx]["img_name"])[:-3] + "lines.txt"
+            )
             os.makedirs(output_dir, exist_ok=True)
             output = self.get_prediction_string(pred)
-            with open(os.path.join(output_dir, output_filename), 'w') as out_file:
+            with open(os.path.join(output_dir, output_filename), "w") as out_file:
                 out_file.write(output)
-        result = culane_metric.eval_predictions(self.output_basedir, self.data_root, self.list_path, official=True)
+        result = culane_metric.eval_predictions(
+            self.output_basedir, self.data_root, self.list_path, official=True
+        )
         return result
 
 
@@ -239,10 +259,10 @@ class VILEvaluator(DatasetEvaluator):
     def __init__(self, output_basedir, data_root, split, metric=None):
         super().__init__()
         self.output_basedir = output_basedir
-        dbfile = os.path.join(data_root, 'data', 'db_info.yaml')
-        self.imgdir = os.path.join(data_root, 'JPEGImages')
-        self.annodir = os.path.join(data_root, 'Annotations')
-        self.jsondir = os.path.join(data_root, 'Json')
+        dbfile = os.path.join(data_root, "data", "db_info.yaml")
+        self.imgdir = os.path.join(data_root, "JPEGImages")
+        self.annodir = os.path.join(data_root, "Annotations")
+        self.jsondir = os.path.join(data_root, "Json")
         self.root = data_root
         self.data_infos = []
         self.folder_all_list = []
@@ -250,55 +270,57 @@ class VILEvaluator(DatasetEvaluator):
         self.max_lane = 0
         self.data_root = data_root
 
-        with open(dbfile, 'r') as f:
-            db = yaml.load(f, Loader=yaml.Loader)['sequences']
+        with open(dbfile, "r") as f:
+            db = yaml.load(f, Loader=yaml.Loader)["sequences"]
             self.info = db
-            self.videos = [info['name'] for info in db if info['set'] == split]
+            self.videos = [info["name"] for info in db if info["set"] == split]
         self.load_annotations()
 
     def get_json_path(self, vid_path):
         json_paths = []
         for root, _, files in os.walk(vid_path):
             for file in files:
-                if file.endswith('.json'):
+                if file.endswith(".json"):
                     json_paths.append(os.path.join(root, file))
         return json_paths
 
     def load_annotations(self):
         json_paths = []
         self.all_file_name = []
-        print('Searching annotation files...')
+        print("Searching annotation files...")
         for vid in self.videos:
             json_paths.extend(self.get_json_path(os.path.join(self.jsondir, vid)))
-        print('Found {} annotations'.format(len(json_paths)))
+        print("Found {} annotations".format(len(json_paths)))
         for json_path in tqdm(json_paths):
-            with open(json_path, 'r') as jfile:
+            with open(json_path, "r") as jfile:
                 data = json.load(jfile)
             self.load_annotation(data)
-            self.all_file_name.append(json_path.replace(self.jsondir + '/', '')[:-9] + '.lines.txt')
-        print('Max lane: {}'.format(self.max_lane))
+            self.all_file_name.append(
+                json_path.replace(self.jsondir + "/", "")[:-9] + ".lines.txt"
+            )
+        print("Max lane: {}".format(self.max_lane))
         # print(self.mapping)
 
     def load_annotation(self, data):
         points = []
         lane_id_pool = []
-        image_path = data['info']['image_path']
+        image_path = data["info"]["image_path"]
         # width,height = cv2.imread(os.path.join(self.imgdir,image_path)).shape[:2]
-        mask_path = image_path.split('.')[0] + '.png'
-        for lane in data['annotations']['lane']:
+        mask_path = image_path.split(".")[0] + ".png"
+        for lane in data["annotations"]["lane"]:
             # if lane['lane_id'] not in lane_id_pool:
-            points.append(lane['points'])
+            points.append(lane["points"])
             # lane_id_pool.append(lane['lane_id'])
         self.data_infos.append(
             dict(
-                img_name=os.path.join('JPEGImages', image_path),
+                img_name=os.path.join("JPEGImages", image_path),
                 # img_size = [width,height],
                 img_path=os.path.join(self.imgdir, image_path),
                 mask_path=os.path.join(self.annodir, mask_path),
                 lanes=points,
             )
         )
-        sub_folder = image_path.split('/')[0]
+        sub_folder = image_path.split("/")[0]
         if sub_folder not in self.sub_folder_name:
             self.sub_folder_name.append(sub_folder)
             # self.mapping.update({sub_folder:[width,height]})
@@ -320,10 +342,12 @@ class VILEvaluator(DatasetEvaluator):
             lane_xs = xs[valid_mask]
             lane_ys = ys[valid_mask] * ori_img_h
             lane_xs, lane_ys = lane_xs[::-1], lane_ys[::-1]
-            lane_str = ' '.join(['{:.5f} {:.5f}'.format(x, y) for x, y in zip(lane_xs, lane_ys)])
-            if lane_str != '':
+            lane_str = " ".join(
+                ["{:.5f} {:.5f}".format(x, y) for x, y in zip(lane_xs, lane_ys)]
+            )
+            if lane_str != "":
                 out.append(lane_str)
-        return '\n'.join(out)
+        return "\n".join(out)
 
     def save_tusimple_predictions(self, idx, prediction, sub_name, runtime):
         line = self.pred2tusimpleformat(idx, prediction, runtime, sub_name)
@@ -331,9 +355,9 @@ class VILEvaluator(DatasetEvaluator):
 
     def pred2tusimpleformat(self, idx, pred, runtime, sub_name):
         runtime *= 1000.0  # s to ms
-        img_name = self.data_infos[idx]['img_name']
+        img_name = self.data_infos[idx]["img_name"]
         lanes = self.pred2lanes(pred, sub_name)
-        output = {'raw_file': img_name, 'lanes': lanes, 'run_time': runtime}
+        output = {"raw_file": img_name, "lanes": lanes, "run_time": runtime}
         return json.dumps(output)
 
     def pred2lanes(self, pred, sub_name):
@@ -350,23 +374,245 @@ class VILEvaluator(DatasetEvaluator):
         return lanes
 
     def evaluate(self, predictions):
-        print('Generating prediction output...')
-        output_basedir = os.path.join(self.output_basedir, 'preds')
+        print("Generating prediction output...")
+        output_basedir = os.path.join(self.output_basedir, "preds")
         os.makedirs(output_basedir, exist_ok=True)
         for idx, pred in enumerate(tqdm(predictions)):
-            sub_name = self.data_infos[idx]['img_name'].split('/')[1]
+            sub_name = self.data_infos[idx]["img_name"].split("/")[1]
             output_dir = os.path.join(output_basedir, sub_name)
-            output_filename = os.path.basename(self.data_infos[idx]['img_name'])[:-3] + 'lines.txt'
+            output_filename = (
+                os.path.basename(self.data_infos[idx]["img_name"])[:-3] + "lines.txt"
+            )
             os.makedirs(output_dir, exist_ok=True)
             output = self.get_prediction_string(pred, sub_name)
-            with open(os.path.join(output_dir, output_filename), 'w') as out_file:
+            with open(os.path.join(output_dir, output_filename), "w") as out_file:
                 out_file.write(output)
-        txt_path = os.path.join(self.data_root, 'anno_txt')
+        txt_path = os.path.join(self.data_root, "anno_txt")
         # output_basedir = '/home/xly/SPGnet/pred_txt'
         accuracy, fp, fn = VILLaneEval.calculate_return(output_basedir, self.jsondir)
-        result = eval_predictions(output_basedir, txt_path, self.all_file_name, official=False, iou_thresholds=[0.5])
+        result = eval_predictions(
+            output_basedir,
+            txt_path,
+            self.all_file_name,
+            official=False,
+            iou_thresholds=[0.5],
+        )
 
         return result[0.5]
+
+
+class OpenLane2DEvaluator(DatasetEvaluator):
+    """
+    Base Evaluator for OpenLane to handle Official C++ Tool interaction.
+    It handles:
+    1. Coordinate restoration (Resize/Crop -> Original 1920x1280)
+    2. JSON dumping in OpenLane format
+    3. Running the official ./evaluate binary
+    """
+
+    def __init__(self, cfg, output_dir=None):
+        self.cfg = cfg
+        self.logger = logging.getLogger(__name__)
+
+        # Output setup
+        if output_dir is None:
+            if hasattr(cfg, "train") and hasattr(cfg.train, "output_dir"):
+                self.output_dir = os.path.join(cfg.train.output_dir, "eval_results")
+            else:
+                self.output_dir = "./output/eval_results"
+        else:
+            self.output_dir = output_dir
+
+        self.result_dir = os.path.join(self.output_dir, "results")
+        self.test_list_path = os.path.join(self.output_dir, "test_list.txt")
+
+        # OpenLane Official Category Mapping (0-14 -> Official IDs)
+        self.id_to_openlane_cat = {
+            0: 0,
+            1: 1,
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 7,
+            8: 8,
+            9: 9,
+            10: 10,
+            11: 11,
+            12: 12,
+            13: 20,  # Left Curbside
+            14: 21,  # Right Curbside
+        }
+
+    def reset(self):
+        self.results_buffer = []
+        self.image_rel_paths = []
+
+        # Clean up old results
+        if os.path.exists(self.output_dir):
+            try:
+                shutil.rmtree(self.output_dir)
+            except:
+                pass
+        os.makedirs(self.result_dir, exist_ok=True)
+
+    def process_native_format(self, inputs, outputs):
+        """
+        Process logic to prepare data for Official Evaluation.
+        Can be called by child classes.
+        """
+        for i, (input_data, output_data) in enumerate(zip(inputs, outputs)):
+            # 1. Get Image Info
+            rel_path = input_data["meta"][
+                "img_name"
+            ]  # e.g., validation/segment-xxx/xxx.jpg
+            self.image_rel_paths.append(rel_path)
+
+            # 2. Parse Predictions
+            pred_lines = output_data["lane_lines"].detach().cpu().numpy()
+            pred_cats_logits = output_data.get("category", None)
+
+            # 3. Valid Mask
+            conf_threshold = self.cfg.test_parameters.conf_threshold
+            valid_mask = pred_lines[:, 1] > conf_threshold
+            valid_preds = pred_lines[valid_mask]
+
+            if pred_cats_logits is not None:
+                valid_cats = (
+                    torch.argmax(pred_cats_logits[valid_mask], dim=1).cpu().numpy()
+                )
+            else:
+                valid_cats = np.zeros(len(valid_preds))
+
+            # 4. Decode Coordinates (Restore to Original 1920x1280)
+            decoded_lanes = self.decode_lanes(
+                valid_preds,
+                self.cfg.img_w,
+                self.cfg.img_h,
+                self.cfg.ori_img_w,
+                self.cfg.ori_img_h,
+                self.cfg.num_points,
+            )
+
+            # 5. Build JSON
+            lane_lines_json = []
+            for j, lane_points in enumerate(decoded_lanes):
+                if len(lane_points) < 2:
+                    continue
+
+                xs = [float(p[0]) for p in lane_points]
+                ys = [float(p[1]) for p in lane_points]
+                uv = [xs, ys]
+
+                model_cat_id = valid_cats[j]
+                official_cat_id = self.id_to_openlane_cat.get(model_cat_id, 0)
+
+                lane_entry = {"category": int(official_cat_id), "uv": uv}
+                lane_lines_json.append(lane_entry)
+
+            json_content = {"file_path": rel_path, "lane_lines": lane_lines_json}
+            self.results_buffer.append(json_content)
+
+    def process(self, inputs, outputs):
+        self.process_native_format(inputs, outputs)
+
+    def evaluate(self):
+        """Run the official evaluation script."""
+        self.logger.info(
+            f"[OpenLane2DEvaluator] Writing {len(self.results_buffer)} results to disk..."
+        )
+
+        # 1. Write JSONs
+        for res in self.results_buffer:
+            rel_path = res["file_path"]
+            json_rel_path = rel_path.replace(".jpg", ".json")
+            save_path = os.path.join(self.result_dir, json_rel_path)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "w") as f:
+                json.dump(res, f)
+
+        # 2. Write test_list.txt
+        with open(self.test_list_path, "w") as f:
+            for path in self.image_rel_paths:
+                f.write(path + "\n")
+
+        # 3. Run Official Tool
+        evaluate_bin = "./tools/lane2d/evaluate"
+        if not os.path.exists(evaluate_bin):
+            self.logger.warning(
+                f"Official evaluator not found at {evaluate_bin}. Skipping official metrics."
+            )
+            return {}
+
+        dataset_dir = self.cfg.data_root
+        image_dir = os.path.join(self.cfg.data_root, "images")
+        output_file = os.path.join(self.output_dir, "official_metrics.txt")
+
+        cmd = [
+            evaluate_bin,
+            "-a",
+            dataset_dir,
+            "-d",
+            self.result_dir,
+            "-i",
+            image_dir,
+            "-l",
+            self.test_list_path,
+            "-w",
+            "30",
+            "-t",
+            "0.5",
+            "-o",
+            output_file,
+        ]
+
+        metrics = {}
+        try:
+            self.logger.info(f"Running Official Tool: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            self.logger.info("Official Tool Output:\n" + result.stdout)
+
+            if os.path.exists(output_file):
+                with open(output_file, "r") as f:
+                    metrics["official_output"] = f.read()
+
+            # Try parsing F-score from stdout if possible
+            for line in result.stdout.split("\n"):
+                if "F-measure" in line or "F1" in line:
+                    metrics["Official_F1"] = line.strip()
+
+        except Exception as e:
+            self.logger.error(f"Failed to run official evaluator: {e}")
+
+        return metrics
+
+    def decode_lanes(self, preds, img_w, img_h, ori_img_w, ori_img_h, num_points):
+        decoded = []
+        cut_height = self.cfg.cut_height
+        strip_size = img_h / (num_points - 1)
+
+        for lane in preds:
+            xs = lane[6:]  # Normalized X
+            lane_points = []
+            for i, x in enumerate(xs):
+                if x <= 0 or x >= 1:
+                    continue
+
+                # Restore to training input size (800x320)
+                x_train = x * img_w
+                y_train = img_h - 1 - i * strip_size
+
+                # Restore to Original Crop (adding cut_height)
+                # Note: Assuming standard resize-after-crop augmentation
+                orig_crop_h = ori_img_h - cut_height
+
+                y_orig = (y_train / img_h) * orig_crop_h + cut_height
+                x_orig = (x_train / img_w) * ori_img_w
+
+                lane_points.append((x_orig, y_orig))
+            decoded.append(lane_points)
+        return decoded
 
 
 class DatasetEvaluators(DatasetEvaluator):
@@ -399,7 +645,11 @@ class DatasetEvaluators(DatasetEvaluator):
             result = evaluator.evaluate()
             if is_main_process() and result is not None:
                 for k, v in result.items():
-                    assert k not in results, 'Different evaluators produce results with the same key {}'.format(k)
+                    assert (
+                        k not in results
+                    ), "Different evaluators produce results with the same key {}".format(
+                        k
+                    )
                     results[k] = v
         return results
 
@@ -433,7 +683,14 @@ def inference_on_dataset(
         The return value of `evaluator.evaluate()`
     """
     # Import comm functions for distributed support
-    from ..utils.comm import gather, get_rank, is_main_process, synchronize
+    from ..utils.comm import (
+        get_world_size,
+        get_rank,
+        is_main_process,
+        all_gather,
+        gather,
+        synchronize,
+    )
 
     num_devices = get_world_size()
     current_rank = get_rank()
@@ -441,7 +698,7 @@ def inference_on_dataset(
 
     # Only log from main process to avoid duplicate logs
     if is_main_process():
-        logger.info('Start inference on {} batches'.format(len(data_loader)))
+        logger.info("Start inference on {} batches".format(len(data_loader)))
 
     total = len(data_loader)  # inference data loader must have a fixed length
     if evaluator is None:
@@ -454,7 +711,7 @@ def inference_on_dataset(
     batch_sampler = data_loader.batch_sampler
     evaluator.data_infos = dataset.data_infos
     evaluator.reset()
-    is_view = evaluator.view if hasattr(evaluator, 'view') else False
+    is_view = evaluator.view if hasattr(evaluator, "view") else False
 
     num_warmup = min(5, total - 1)
     start_time = time.perf_counter()
@@ -473,7 +730,7 @@ def inference_on_dataset(
         stack.enter_context(torch.no_grad())
 
         start_data_time = time.perf_counter()
-        dict.get(callbacks or {}, 'on_start', lambda: None)()
+        dict.get(callbacks or {}, "on_start", lambda: None)()
 
         # Iterate through data_loader with batch indices
         for idx, (batch_indices, inputs) in enumerate(zip(batch_sampler, data_loader)):
@@ -485,13 +742,13 @@ def inference_on_dataset(
                 total_eval_time = 0
 
             start_compute_time = time.perf_counter()
-            dict.get(callbacks or {}, 'before_inference', lambda: None)()
+            dict.get(callbacks or {}, "before_inference", lambda: None)()
             outputs = model(inputs)
-            if hasattr(model, 'get_lanes'):
+            if hasattr(model, "get_lanes"):
                 outputs = model.get_lanes(outputs)
-            if num_devices > 1 and hasattr(model.module, 'get_lanes'):
+            if num_devices > 1 and hasattr(model.module, "get_lanes"):
                 outputs = model.module.get_lanes(outputs)
-            dict.get(callbacks or {}, 'after_inference', lambda: None)()
+            dict.get(callbacks or {}, "after_inference", lambda: None)()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             total_compute_time += time.perf_counter() - start_compute_time
@@ -501,7 +758,7 @@ def inference_on_dataset(
             prediction_indices.extend(batch_indices)  # Store batch indices
 
             if is_view:
-                dataset.view(outputs, inputs['meta'], 'viz')
+                dataset.view(outputs, inputs["meta"], "viz")
             # evaluator.process(inputs, outputs)
             total_eval_time += time.perf_counter() - start_eval_time
 
@@ -509,25 +766,31 @@ def inference_on_dataset(
             data_seconds_per_iter = total_data_time / iters_after_start
             compute_seconds_per_iter = total_compute_time / iters_after_start
             eval_seconds_per_iter = total_eval_time / iters_after_start
-            total_seconds_per_iter = (time.perf_counter() - start_time) / iters_after_start
+            total_seconds_per_iter = (
+                time.perf_counter() - start_time
+            ) / iters_after_start
 
             # Only log from main process to reduce log spam
-            if is_main_process() and (idx >= num_warmup * 2 or compute_seconds_per_iter > 5):
-                eta = datetime.timedelta(seconds=int(total_seconds_per_iter * (total - idx - 1)))
+            if is_main_process() and (
+                idx >= num_warmup * 2 or compute_seconds_per_iter > 5
+            ):
+                eta = datetime.timedelta(
+                    seconds=int(total_seconds_per_iter * (total - idx - 1))
+                )
                 log_every_n_seconds(
                     logging.INFO,
                     (
-                        f'Inference done {idx + 1}/{total}. '
-                        f'Dataloading: {data_seconds_per_iter:.4f} s/iter. '
-                        f'Inference: {compute_seconds_per_iter:.4f} s/iter. '
-                        f'Eval: {eval_seconds_per_iter:.4f} s/iter. '
-                        f'Total: {total_seconds_per_iter:.4f} s/iter. '
-                        f'ETA={eta}'
+                        f"Inference done {idx + 1}/{total}. "
+                        f"Dataloading: {data_seconds_per_iter:.4f} s/iter. "
+                        f"Inference: {compute_seconds_per_iter:.4f} s/iter. "
+                        f"Eval: {eval_seconds_per_iter:.4f} s/iter. "
+                        f"Total: {total_seconds_per_iter:.4f} s/iter. "
+                        f"ETA={eta}"
                     ),
                     n=5,
                 )
             start_data_time = time.perf_counter()
-        dict.get(callbacks or {}, 'on_end', lambda: None)()
+        dict.get(callbacks or {}, "on_end", lambda: None)()
 
     # Synchronize all processes before gathering results
     synchronize()
@@ -539,14 +802,18 @@ def inference_on_dataset(
     # Only log from main process
     if is_main_process():
         logger.info(
-            'Total inference time: {} ({:.6f} s / iter per device, on {} devices)'.format(
+            "Total inference time: {} ({:.6f} s / iter per device, on {} devices)".format(
                 total_time_str, total_time / (total - num_warmup), num_devices
             )
         )
-        total_compute_time_str = str(datetime.timedelta(seconds=int(total_compute_time)))
+        total_compute_time_str = str(
+            datetime.timedelta(seconds=int(total_compute_time))
+        )
         logger.info(
-            'Total inference pure compute time: {} ({:.6f} s / iter per device, on {} devices)'.format(
-                total_compute_time_str, total_compute_time / (total - num_warmup), num_devices
+            "Total inference pure compute time: {} ({:.6f} s / iter per device, on {} devices)".format(
+                total_compute_time_str,
+                total_compute_time / (total - num_warmup),
+                num_devices,
             )
         )
 
@@ -562,7 +829,9 @@ def inference_on_dataset(
 
             if is_main_process():
                 # Flatten and create index-prediction pairs
-                flat_predictions = [pred for pred_list in all_predictions for pred in pred_list]
+                flat_predictions = [
+                    pred for pred_list in all_predictions for pred in pred_list
+                ]
                 flat_indices = [idx for idx_list in all_indices for idx in idx_list]
 
                 # Reorder predictions according to original dataset order
@@ -577,14 +846,14 @@ def inference_on_dataset(
 
             if is_main_process():
                 logger.info(
-                    f'Distributed evaluation: gathered and reordered {len(prediction)} predictions from {num_devices} processes'
+                    f"Distributed evaluation: gathered and reordered {len(prediction)} predictions from {num_devices} processes"
                 )
         else:
             # Without DistributedSampler: all processes have same data, causing duplication
             logger.warning(
-                'Distributed training detected but DistributedSampler not used! '
-                'This will cause data duplication and incorrect evaluation results. '
-                'Consider using DistributedSampler for proper distributed evaluation.'
+                "Distributed training detected but DistributedSampler not used! "
+                "This will cause data duplication and incorrect evaluation results. "
+                "Consider using DistributedSampler for proper distributed evaluation."
             )
             # Only use predictions from main process to avoid duplication
             if not is_main_process():
@@ -596,7 +865,7 @@ def inference_on_dataset(
                     indexed_predictions.sort(key=lambda x: x[0])
                     prediction = [pred for idx, pred in indexed_predictions]
                 logger.info(
-                    f'Using predictions from main process only to avoid duplication: {len(prediction)} predictions'
+                    f"Using predictions from main process only to avoid duplication: {len(prediction)} predictions"
                 )
     else:
         # Single process: reorder predictions according to batch indices
@@ -609,7 +878,7 @@ def inference_on_dataset(
     synchronize()
 
     # for evaluation - only evaluate on main process or if evaluator supports distributed evaluation
-    if is_main_process() or getattr(evaluator, '_distributed', False):
+    if is_main_process() or getattr(evaluator, "_distributed", False):
         results = evaluator.evaluate(prediction)
     else:
         results = None

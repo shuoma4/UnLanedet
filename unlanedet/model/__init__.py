@@ -5,3 +5,4 @@ from .CLRNet import *
 from .RESA import *
 from .CondlaneNet import *
 from .LLANet import *
+from .llanetv1 import *
