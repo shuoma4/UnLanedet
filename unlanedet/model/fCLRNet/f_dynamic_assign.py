@@ -237,11 +237,34 @@ def assign(
     predictions[..., 6:] *= img_w - 1
     targets = targets.detach().clone()
 
+    # ── Safe-guard: prepare invalid target slots to be harmless ──────────────
+    # Invalid (padding) targets must not contaminate cost normalisation.
+    # Two rules:
+    #   1. xs (indices 6:) set to -1.0 so distance_cost's own validity check
+    #      (xs >= 0 & xs < img_w) correctly masks them out → dist = 0.
+    #   2. start_y/x, theta, length (indices 2:6) set to 0.0 so torch.cdist
+    #      produces finite, moderate distances rather than exploding with the
+    #      original padding values (which could be ±1e5 after scaling).
+    # The cost matrix for invalid columns will be set to +inf afterwards, so
+    # the exact value here only matters for normalisation.
+    if is_batch and valid_mask is not None:
+        invalid = ~valid_mask  # (B, Nt)
+        if invalid.any():
+            targets[invalid, 2:6] = 0.0   # start_y, start_x, theta, length
+            targets[invalid, 6:] = -1.0   # x-coords: will be masked by distance_cost
+
     # ── Distance cost ────────────────────────────────────────────────────────
     dist_scores = distance_cost(predictions, targets, img_w)
+    # Normalise using max over VALID target columns only to prevent invalid
+    # padding rows from inflating the denominator and squashing valid signal.
     if is_batch:
-        max_dist = dist_scores.flatten(1).max(dim=1).values.view(-1, 1, 1)
-        dist_scores = 1.0 - (dist_scores / (max_dist + 1e-9)) + 1e-2
+        if valid_mask is not None:
+            # valid_mask: (B, Nt) -> (B, 1, Nt)
+            vexp = valid_mask.unsqueeze(1).expand_as(dist_scores)  # (B, Np, Nt)
+            max_dist = dist_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+        else:
+            max_dist = dist_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+        dist_scores = 1.0 - (dist_scores / max_dist) + 1e-2
     else:
         dist_scores = 1.0 - (dist_scores / (dist_scores.max() + 1e-9)) + 1e-2
 
@@ -256,29 +279,38 @@ def assign(
 
     # cdist supports batch
     start_scores = torch.cdist(pred_start, target_start, p=2)
+    # Normalise over valid target columns only
     if is_batch:
-        max_start = start_scores.flatten(1).max(dim=1).values.view(-1, 1, 1)
-        start_scores = 1.0 - (start_scores / (max_start + 1e-9)) + 1e-2
+        if valid_mask is not None:
+            vexp = valid_mask.unsqueeze(1).expand_as(start_scores)
+            max_start = start_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+        else:
+            max_start = start_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+        start_scores = 1.0 - (start_scores / max_start) + 1e-2
     else:
         start_scores = 1.0 - (start_scores / (start_scores.max() + 1e-9)) + 1e-2
 
     # ── Theta cost ───────────────────────────────────────────────────────────
     # (..., Np, 1) vs (..., Nt, 1)
     theta_scores = torch.cdist(predictions[..., 4:5], targets[..., 4:5], p=1) * 180.0
+    # Normalise over valid target columns only
     if is_batch:
-        max_theta = theta_scores.flatten(1).max(dim=1).values.view(-1, 1, 1)
-        theta_scores = 1.0 - (theta_scores / (max_theta + 1e-9)) + 1e-2
+        if valid_mask is not None:
+            vexp = valid_mask.unsqueeze(1).expand_as(theta_scores)
+            max_theta = theta_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+        else:
+            max_theta = theta_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+        theta_scores = 1.0 - (theta_scores / max_theta) + 1e-2
     else:
         theta_scores = 1.0 - (theta_scores / (theta_scores.max() + 1e-9)) + 1e-2
 
     # ── Combined cost ────────────────────────────────────────────────────────
     cost = -((dist_scores * start_scores * theta_scores) ** 2) * distance_cost_weight + cls_scores * cls_cost_weight
 
-    # ── Masking (Batched only) ───────────────────────────────────────────────
+    # ── Masking (Batched only): set invalid target columns to +inf ────────────
     if is_batch and valid_mask is not None:
         # valid_mask: (B, Nt) -> (B, 1, Nt)
         # cost: (B, Np, Nt)
-        # Set cost of invalid targets to infinity
         mask_expanded = valid_mask.unsqueeze(1).expand_as(cost)
         cost[~mask_expanded] = float('inf')
 
