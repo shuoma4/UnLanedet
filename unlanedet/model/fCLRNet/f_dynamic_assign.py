@@ -60,42 +60,19 @@ def focal_cost(
     neg_cost = -(1 - p + eps).log() * (1 - alpha) * p.pow(gamma)
     pos_cost = -(p + eps).log() * alpha * (1 - p).pow(gamma)
 
-    # cls_pred: (..., Np, C)
-    # gt_labels: (..., Nt)
-    # We want cost[..., p, t] using gt_labels[..., t]
-
-    # Expand gt_labels to (..., Np, Nt, 1) to gather from pos_cost (..., Np, C)
-    # gt_labels has shape (..., Nt).
-    # Unsqueeze(-2) -> (..., 1, Nt). Expand -> (..., Np, Nt). Unsqueeze(-1) -> (..., Np, Nt, 1)
-
     target_shape = gt_labels.shape
     Np = cls_pred.shape[-2]
 
-    # Careful with broadcasting.
-    # gt_labels: (B, Nt) or (Nt,)
     if gt_labels.ndim == 1:
         # Single image case: (Nt,)
-        # pos_cost: (Np, C)
         return pos_cost[:, gt_labels] - neg_cost[:, gt_labels]
     else:
         # Batched case: (B, Nt)
-        # pos_cost: (B, Np, C)
         gt_labels_expand = gt_labels.unsqueeze(-2).expand(*target_shape[:-1], Np, target_shape[-1])
         indices = gt_labels_expand.unsqueeze(-1)  # (B, Np, Nt, 1)
 
-        # pos_cost needs to be expanded to (B, Np, Nt, C) before gather?
-        # No, gather on dim -1 does not require expanding other dims if they match.
-        # But here other dims don't match: pos_cost has (B, Np, C), indices has (B, Np, Nt, 1).
-        # We need pos_cost to be (B, Np, Nt, C) to gather along C.
-        # Wait, gather requires input and index to have same number of dimensions.
-        # pos_cost: (B, Np, C). Index: (B, Np, Nt, 1) -> 4 dims vs 3 dims.
-
-        # Correct approach for Batched:
-        # We want out[b, i, j] = pos_cost[b, i, gt_labels[b, j]]
-        # We can expand pos_cost to (B, Np, Nt, C) then gather.
         pos_cost_exp = pos_cost.unsqueeze(2).expand(*pos_cost.shape[:-1], target_shape[-1], pos_cost.shape[-1])
         neg_cost_exp = neg_cost.unsqueeze(2).expand(*neg_cost.shape[:-1], target_shape[-1], neg_cost.shape[-1])
-        # pos_cost_exp: (B, Np, Nt, C)
 
         indices = indices.long()
         pos_gather = pos_cost_exp.gather(-1, indices).squeeze(-1)
@@ -162,12 +139,9 @@ def dynamic_k_assign_batched(cost: torch.Tensor, pair_wise_ious: torch.Tensor, v
     matching_matrix = torch.zeros_like(cost)
     matching_matrix.scatter_(1, sorted_idx, topk_mask)
 
-    # 4. Mask Invalid Targets (CRITICAL FIX)
+    # 4. Mask Invalid Targets
     if valid_mask is not None:
-        # valid_mask: (B, Nt)
-        # matching_matrix: (B, Np, Nt)
-        # Set invalid target columns to 0.0
-        invalid_mask = ~valid_mask
+        invalid_mask = ~valid_mask  # (B, Nt)
         if invalid_mask.any():
             invalid_mask_exp = invalid_mask.unsqueeze(1).expand_as(matching_matrix)
             matching_matrix[invalid_mask_exp] = 0.0
@@ -177,29 +151,11 @@ def dynamic_k_assign_batched(cost: torch.Tensor, pair_wise_ious: torch.Tensor, v
     conflict_mask = matched_gt_count > 1  # (B, Np)
 
     if conflict_mask.any():
-        # Mask cost where not matched to avoid selecting non-matched columns
-        # (Though unmatched columns are usually high cost, but safe to be sure)
-        # Actually we want min cost among the *currently matched* ones.
-        # But simplest is to take min cost among all columns for that prior,
-        # assuming the 'true' match has lowest cost.
-        # A safer way:
         cost_masked = cost.clone()
-        # Set non-matched entries to infinity so they are not picked
         cost_masked[matching_matrix == 0] = float('inf')
-
         cost_argmin = cost_masked.argmin(dim=2)  # (B, Np)
-
-        # Create resolved matches
         resolved = torch.zeros_like(matching_matrix)
         resolved.scatter_(2, cost_argmin.unsqueeze(2), 1.0)
-
-        # Apply only to conflicts
-        # We need to expand conflict_mask to (B, Np, Nt) to index matching_matrix?
-        # No, boolean indexing matching_matrix[conflict_mask] selects (N_conflicts, Nt) rows.
-        # But conflict_mask is (B, Np).
-
-        # Let's use where
-        # mask needs to be (B, Np, Nt)
         c_mask_exp = conflict_mask.unsqueeze(2).expand_as(matching_matrix)
         matching_matrix = torch.where(c_mask_exp, resolved, matching_matrix)
 
@@ -225,7 +181,9 @@ def assign(
         predictions : (num_priors, 78) or (B, num_priors, 78)
         targets     : (num_targets, 78) or (B, num_targets, 78)
         valid_mask  : (B, num_targets) boolean mask, True for valid targets.
-                      Only used in batched mode.
+                      Only used in batched mode.  If its Nt dimension differs
+                      from targets.shape[1] (e.g. due to different dataset
+                      padding strategies), it is recomputed from targets.
     Returns:
         If single: (matched_row_inds, matched_col_inds)
         If batched: matching_matrix (B, num_priors, num_targets)
@@ -237,29 +195,39 @@ def assign(
     predictions[..., 6:] *= img_w - 1
     targets = targets.detach().clone()
 
-    # ── Safe-guard: prepare invalid target slots to be harmless ──────────────
+    # ── Reconcile valid_mask with actual targets shape ───────────────────────
+    # valid_mask passed from fclr_head is computed from batch['lane_line'],
+    # which may have a different Nt than targets here if the dataset class
+    # pads to a different number than param_config.max_lanes.  To be safe,
+    # always derive valid_mask from the targets tensor that we actually have.
+    if is_batch:
+        valid_mask = (targets[..., 1] == 1)  # (B, Nt_actual)
+
+    # ── Safe-guard: neutralise invalid target slots with torch.where ────────
     # Invalid (padding) targets must not contaminate cost normalisation.
-    # Two rules:
-    #   1. xs (indices 6:) set to -1.0 so distance_cost's own validity check
-    #      (xs >= 0 & xs < img_w) correctly masks them out → dist = 0.
-    #   2. start_y/x, theta, length (indices 2:6) set to 0.0 so torch.cdist
-    #      produces finite, moderate distances rather than exploding with the
-    #      original padding values (which could be ±1e5 after scaling).
-    # The cost matrix for invalid columns will be set to +inf afterwards, so
-    # the exact value here only matters for normalisation.
+    # Rules:
+    #   xs  (idx 6:)  → -1.0  so distance_cost's validity check (xs >= 0)
+    #                          correctly masks them out → contribution = 0.
+    #   yxtl (idx 2:6) →  0.0  so torch.cdist produces moderate distances
+    #                          instead of exploding with original padding values.
+    # Using torch.where instead of boolean-index assignment avoids the
+    # IndexError that arises when valid_mask.shape[1] != targets.shape[1],
+    # and is correct across all PyTorch versions.
     if is_batch and valid_mask is not None:
         invalid = ~valid_mask  # (B, Nt)
         if invalid.any():
-            targets[invalid, 2:6] = 0.0   # start_y, start_x, theta, length
-            targets[invalid, 6:] = -1.0   # x-coords: will be masked by distance_cost
+            inv_exp = invalid.unsqueeze(-1)  # (B, Nt, 1) – broadcasts over D
+            # Build a "safe" replacement for invalid rows
+            safe = torch.zeros_like(targets)         # cls + yxtl = 0
+            safe[..., 6:] = -1.0                     # xs = -1 (will be masked)
+            targets = torch.where(inv_exp.expand_as(targets), safe, targets)
 
-    # ── Distance cost ────────────────────────────────────────────────────────
+    # ── Distance cost ─────────────────────────────────────────────────────
     dist_scores = distance_cost(predictions, targets, img_w)
-    # Normalise using max over VALID target columns only to prevent invalid
-    # padding rows from inflating the denominator and squashing valid signal.
+    # Normalise using max over VALID target columns only to prevent padding
+    # rows from inflating the denominator and squashing valid signal.
     if is_batch:
         if valid_mask is not None:
-            # valid_mask: (B, Nt) -> (B, 1, Nt)
             vexp = valid_mask.unsqueeze(1).expand_as(dist_scores)  # (B, Np, Nt)
             max_dist = dist_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
         else:
@@ -277,9 +245,7 @@ def assign(
     pred_start[..., 0] *= img_h - 1
     target_start[..., 0] *= img_h - 1
 
-    # cdist supports batch
     start_scores = torch.cdist(pred_start, target_start, p=2)
-    # Normalise over valid target columns only
     if is_batch:
         if valid_mask is not None:
             vexp = valid_mask.unsqueeze(1).expand_as(start_scores)
@@ -291,9 +257,7 @@ def assign(
         start_scores = 1.0 - (start_scores / (start_scores.max() + 1e-9)) + 1e-2
 
     # ── Theta cost ───────────────────────────────────────────────────────────
-    # (..., Np, 1) vs (..., Nt, 1)
     theta_scores = torch.cdist(predictions[..., 4:5], targets[..., 4:5], p=1) * 180.0
-    # Normalise over valid target columns only
     if is_batch:
         if valid_mask is not None:
             vexp = valid_mask.unsqueeze(1).expand_as(theta_scores)
@@ -307,10 +271,8 @@ def assign(
     # ── Combined cost ────────────────────────────────────────────────────────
     cost = -((dist_scores * start_scores * theta_scores) ** 2) * distance_cost_weight + cls_scores * cls_cost_weight
 
-    # ── Masking (Batched only): set invalid target columns to +inf ────────────
+    # ── Masking: set invalid target columns cost to +inf ─────────────────────
     if is_batch and valid_mask is not None:
-        # valid_mask: (B, Nt) -> (B, 1, Nt)
-        # cost: (B, Np, Nt)
         mask_expanded = valid_mask.unsqueeze(1).expand_as(cost)
         cost[~mask_expanded] = float('inf')
 
