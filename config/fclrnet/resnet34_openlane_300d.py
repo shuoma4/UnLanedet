@@ -28,7 +28,7 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 192
 num_classes = 1 + 1  # openlane seg label
-data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_300d"
+data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_300"
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight
@@ -145,7 +145,7 @@ val_process = [
     L(ToTensor)(keys=["img"]),
 ]
 
-dataloader = get_config("config/common/openlane_old.py").dataloader
+dataloader = get_config("config/common/openlane.py").dataloader
 dataloader.train.dataset.data_root = data_root
 dataloader.train.dataset.processes = train_process
 dataloader.train.dataset.cut_height = cut_height

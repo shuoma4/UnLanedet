@@ -1,6 +1,5 @@
 from .transform import *
-from .tusimple import TuSimple,BiazerTusimple
+from .tusimple import TuSimple, BiazerTusimple
 from .culane import CULane
 from .vil import VIL100
 from .openlane import OpenLane
-from .openlane_old import OpenLaneOld
