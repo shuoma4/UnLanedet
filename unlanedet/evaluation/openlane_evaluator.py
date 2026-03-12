@@ -34,15 +34,15 @@ culane_metric.interp = _linear_interp
 
 
 def _openlane_metric_per_sample(
-    pred_pts, gt_pts, width=30, iou_threshold=0.5, img_shape=(1280, 1920, 3)
+    pred_pts, gt_pts, width=30, iou_threshold=0.5, img_shape=(1280, 1920)
 ):
     tp, fp, fn, _, _ = culane_metric.culane_metric(
         pred_pts,
         gt_pts,
         width=width,
         iou_threshold=iou_threshold,
-        official=True,
-        img_shape=img_shape,
+        official=True,  # Back to discrete math but optimized with BBox Crops
+        img_shape=(img_shape[0], img_shape[1]), 
     )
     return tp, fp, fn
 
@@ -119,17 +119,31 @@ class OpenLaneEvaluator(DatasetEvaluator):
             pred_collection.append(pred_pts)
             gt_collection.append(gt_pts)
 
-        self.logger.info("Computing OpenLane IoU in parallel...")
-        results = p_map(
-            partial(
-                _openlane_metric_per_sample,
-                width=self.width,
-                iou_threshold=self.iou_threshold,
-                img_shape=img_shape,
-            ),
-            pred_collection,
-            gt_collection,
+        import multiprocessing
+        num_workers = min(32, multiprocessing.cpu_count() or 8)
+        self.logger.info(f"Computing OpenLane IoU with {num_workers} workers...")
+        
+        # Prevent Thread Contentions in OpenCV and Numpy
+        import cv2
+        import multiprocessing
+        import os
+        cv2.setNumThreads(0)
+        os.environ["OMP_NUM_THREADS"] = "1"
+
+        partial_func = partial(
+            _openlane_metric_per_sample,
+            width=self.width,
+            iou_threshold=self.iou_threshold,
+            img_shape=img_shape,
         )
+
+        with multiprocessing.Pool(num_workers) as p:
+            # starmap will automatically unpack the zipped tuple into the two arguments
+            results = p.starmap(
+                partial_func, 
+                zip(pred_collection, gt_collection), 
+                chunksize=100
+            )
 
         total_tp = sum(tp for tp, _, _ in results)
         total_fp = sum(fp for _, fp, _ in results)

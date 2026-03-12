@@ -307,33 +307,80 @@ class OpenLane(BaseDataset):
             idx = idx % len(self.data_infos)
         data_info = self.data_infos[idx]
 
-        img = cv2.imread(data_info["img_path"])
-        img = img[self.cut_height :, :, :]
+        use_offline = getattr(self.cfg, "use_offline_resized", False)
 
-        # mask 生成时坐标需减去 cut_height，与裁剪后的 img 对齐
-        lanes_for_mask = []
-        for lane in data_info["lanes"]:
-            lane_shifted = lane.copy()
-            lane_shifted[:, 1] -= self.cut_height
-            lanes_for_mask.append(lane_shifted)
-        mask = generate_lane_mask_binary(img, lanes_for_mask)
+        img_path = data_info["img_path"]
+        segment_idx = img_path.find("segment-")
+        if segment_idx == -1:
+            parts = img_path.split(os.sep)
+            rel_path = os.path.join(parts[-2], parts[-1])
+        else:
+            rel_path = img_path[segment_idx:]
 
-        sample = {
-            "img": img,
-            "lanes": data_info[
-                "lanes"
-            ],  # v 坐标保留原始坐标系，下游 transform 统一减 cut_height
-            "mask": mask,  # 已与裁剪后 img 对齐，供 transform 同步增强
-            "lane_vis": data_info["lane_vis"],
-            "lane_categories": data_info["lane_categories"],
-            "lane_attributes": data_info["lane_attributes"],
-            "lane_track_ids": data_info["lane_track_ids"],
+        if use_offline:
+            # 模式2：读取离线裁剪并等比缩放的 800x320 图和 mask
+            base_dir = os.path.dirname(self.data_root)
+            if "training" in img_path:
+                resized_img_path = os.path.join(base_dir, "training_resized_800_320", rel_path)
+            else:
+                resized_img_path = os.path.join(base_dir, "validation_resized_800_320", rel_path)
+            
+            img = cv2.imread(resized_img_path)
+
+            mask_path = os.path.join(base_dir, "mask_resized_800_320", rel_path).replace(".jpg", ".png")
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+            # 由于原 pkl 中的 lane 属于 1920x1280 坐标系，这里离线图片已经缩放到 800x320
+            # 所以我们需要把 lane 等比例转化到 800x320 坐标系，并用 cut_height=0 压制下游处理
+            lanes = []
+            for lane in data_info["lanes"]:
+                lane_scaled = lane.copy().astype(np.float32)
+                lane_scaled[:, 0] *= (800.0 / 1920.0)
+                lane_scaled[:, 1] = (lane_scaled[:, 1] - self.cut_height) * (320.0 / (1280.0 - self.cut_height))
+                lanes.append(lane_scaled)
+
+            sample = {
+                "img": img,
+                "lanes": lanes,
+                "mask": mask,
+                "cut_height": 0, # 防止 GenerateLaneLine 发生二次减移
+            }
+        else:
+            # 模式1：直接读原图在线裁剪
+            img = cv2.imread(data_info["img_path"])
+            img = img[self.cut_height :, :, :]
+
+            # 读取离线生成的1010x1920的mask
+            mask_path = os.path.join(os.path.dirname(self.data_root), "mask", rel_path).replace(".jpg", ".png")
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+            # Fallback 防止文件没生成完
+            if mask is None:
+                lanes_for_mask = []
+                for lane in data_info["lanes"]:
+                    lane_shifted = lane.copy()
+                    lane_shifted[:, 1] -= self.cut_height
+                    lanes_for_mask.append(lane_shifted)
+                mask = generate_lane_mask_binary(img, lanes_for_mask)
+
+            sample = {
+                "img": img,
+                "lanes": data_info["lanes"],  # v 坐标保留原始坐标系，下游 transform 统一减 cut_height
+                "mask": mask,
+            }
+
+        # 恢复由于离线模式误删的字段，保持完全向下兼容
+        sample.update({
             "img_path": data_info["img_path"],
             "origin_img_path": data_info["origin_img_path"],
             "intrinsic": data_info["intrinsic"],
             "extrinsic": data_info["extrinsic"],
             "pose": data_info["pose"],
-        }
+            "lane_vis": data_info["lane_vis"],
+            "lane_categories": data_info["lane_categories"],
+            "lane_attributes": data_info["lane_attributes"],
+            "lane_track_ids": data_info["lane_track_ids"],
+        })
 
         if self.enable_3d and "lanes_3d" in data_info:
             sample["lanes_3d"] = data_info["lanes_3d"]

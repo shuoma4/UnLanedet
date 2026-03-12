@@ -48,6 +48,9 @@ def line_iou(
         aligned: True  → element-wise IoU, shape (N,)
                  False → pairwise  IoU, shape (Np, Nt)
     """
+    pred = pred.float()
+    target = target.float()
+    
     px1 = pred - length
     px2 = pred + length
     tx1 = target - length

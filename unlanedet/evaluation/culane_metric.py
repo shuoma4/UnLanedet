@@ -16,22 +16,59 @@ def draw_lane(lane, img=None, img_shape=None, width=30):
         img = np.zeros(img_shape, dtype=np.uint8)
     lane = lane.astype(np.int32)
     for p1, p2 in zip(lane[:-1], lane[1:]):
-        cv2.line(img, tuple(p1), tuple(p2), color=(255, 255, 255), thickness=width)
+        cv2.line(img, tuple(p1), tuple(p2), color=1, thickness=width)
     return img
 
+def get_crop_mask(lane, img_shape, width=30):
+    lane_int = lane.astype(np.int32)
+    min_x = max(0, np.min(lane_int[:, 0]) - width)
+    max_x = min(img_shape[1], np.max(lane_int[:, 0]) + width)
+    min_y = max(0, np.min(lane_int[:, 1]) - width)
+    max_y = min(img_shape[0], np.max(lane_int[:, 1]) + width)
+    
+    w = max_x - min_x
+    h = max_y - min_y
+    if w <= 0 or h <= 0:
+        return np.zeros((1,1), dtype=np.uint8), (0,0,0,0)
+    
+    img = np.zeros((h, w), dtype=np.uint8)
+    shifted_lane = lane_int - np.array([min_x, min_y])
+    for p1, p2 in zip(shifted_lane[:-1], shifted_lane[1:]):
+        cv2.line(img, tuple(p1), tuple(p2), color=1, thickness=width)
+    return img, (min_y, max_y, min_x, max_x)
 
-def discrete_cross_iou(xs, ys, width=30, img_shape=(590, 1640, 3)):
-    xs = [draw_lane(lane, img_shape=img_shape, width=width) > 0 for lane in xs]
-    ys = [draw_lane(lane, img_shape=img_shape, width=width) > 0 for lane in ys]
+
+def discrete_cross_iou(xs, ys, width=30, img_shape=(590, 1640)):
+    xs_crops = [get_crop_mask(lane, img_shape, width) for lane in xs]
+    ys_crops = [get_crop_mask(lane, img_shape, width) for lane in ys]
+
+    xs_sum = [int(m.sum()) for m, _ in xs_crops]
+    ys_sum = [int(m.sum()) for m, _ in ys_crops]
 
     ious = np.zeros((len(xs), len(ys)))
-    for i, x in enumerate(xs):
-        for j, y in enumerate(ys):
-            ious[i, j] = (x & y).sum() / (x | y).sum()
+    for i, (m_x, bbox_x) in enumerate(xs_crops):
+        for j, (m_y, bbox_y) in enumerate(ys_crops):
+            rmin_x, rmax_x, cmin_x, cmax_x = bbox_x
+            rmin_y, rmax_y, cmin_y, cmax_y = bbox_y
+            
+            rmin = max(rmin_x, rmin_y)
+            rmax = min(rmax_x, rmax_y)
+            cmin = max(cmin_x, cmin_y)
+            cmax = min(cmax_x, cmax_y)
+            
+            if rmin >= rmax or cmin >= cmax:
+                inter = 0
+            else:
+                crop_x = m_x[rmin - rmin_x:rmax - rmin_x, cmin - cmin_x:cmax - cmin_x]
+                crop_y = m_y[rmin - rmin_y:rmax - rmin_y, cmin - cmin_y:cmax - cmin_y]
+                inter = int((crop_x & crop_y).sum())
+                
+            union = xs_sum[i] + ys_sum[j] - inter
+            ious[i, j] = inter / union if union > 0 else 0.0
     return ious
 
 
-def continuous_cross_iou(xs, ys, width=30, img_shape=(590, 1640, 3)):
+def continuous_cross_iou(xs, ys, width=30, img_shape=(590, 1640)):
     h, w, _ = img_shape
     image = Polygon([(0, 0), (0, h - 1), (w - 1, h - 1), (w - 1, 0)])
     xs = [LineString(lane).buffer(distance=width / 2., cap_style=1, join_style=2).intersection(image) for lane in xs]
@@ -54,7 +91,7 @@ def interp(points, n=50):
     return np.array(splev(u, tck)).T
 
 
-def culane_metric(pred, anno, width=30, iou_threshold=0.5, official=True, img_shape=(590, 1640, 3)):
+def culane_metric(pred, anno, width=30, iou_threshold=0.5, official=True, img_shape=(590, 1640)):
     if len(pred) == 0:
         return 0, 0, len(anno), np.zeros(len(pred)), np.zeros(len(pred), dtype=bool)
     if len(anno) == 0:

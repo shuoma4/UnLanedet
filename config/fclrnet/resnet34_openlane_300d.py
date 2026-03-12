@@ -50,6 +50,7 @@ param_config.bg_weight = bg_weight
 param_config.featuremap_out_channel = featuremap_out_channel
 param_config.num_classes = num_classes
 param_config.data_root = data_root
+param_config.use_offline_resized = True
 
 model = L(FCLRNet)(
     backbone=L(ResNetWrapper)(
@@ -72,7 +73,7 @@ model = L(FCLRNet)(
 
 train = get_config("config/common/train.py").train
 epochs = 15
-batch_size = 48
+batch_size = 100
 epoch_per_iter = 45903 // batch_size + 1
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
@@ -81,7 +82,7 @@ train.eval_period = epoch_per_iter * 2
 train.output_dir = "output/openlane/300d/llanet_resnet34"
 
 optimizer = get_config("config/common/optim.py").AdamW
-optimizer.lr = 2.6e-4
+optimizer.lr = 0.6e-3
 optimizer.weight_decay = 0.01
 
 lr_multiplier = L(CosineParamScheduler)(start_value=1.0, end_value=0.001)

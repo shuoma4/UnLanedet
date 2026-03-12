@@ -16,7 +16,7 @@ xyt_loss_weight = 0.2
 seg_loss_weight = 1.0
 num_points = 72
 max_lanes = 12  # openlane max lanes
-sample_y = range(589, 230, -20)
+sample_y = range(1279, 270, -10)
 test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
 ori_img_w = 1920
 ori_img_h = 1280
@@ -37,7 +37,7 @@ param_config.xyt_loss_weight = xyt_loss_weight
 param_config.seg_loss_weight = seg_loss_weight
 param_config.num_points = num_points
 param_config.max_lanes = max_lanes
-param_config.sample_y = [i for i in range(589, 230, -20)]
+param_config.sample_y = [i for i in range(1279, 270, -10)]
 param_config.test_parameters = test_parameters
 param_config.ori_img_w = ori_img_w
 param_config.ori_img_h = ori_img_h
@@ -50,6 +50,7 @@ param_config.bg_weight = bg_weight
 param_config.featuremap_out_channel = featuremap_out_channel
 param_config.num_classes = num_classes
 param_config.data_root = data_root
+param_config.use_offline_resized = True
 
 model = L(FCLRNet)(
     backbone=L(ResNetWrapper)(
