@@ -28,7 +28,7 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 192
 num_classes = 1 + 1  # openlane seg label
-data_root = '/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_1000'
+data_root = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_1000"
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight
@@ -54,26 +54,34 @@ param_config.use_offline_resized = True
 
 model = L(FCLRNet)(
     backbone=L(ResNetWrapper)(
-        resnet='resnet34',
+        resnet="resnet34",
         pretrained=True,
         replace_stride_with_dilation=[False, False, False],
         out_conv=False,
     ),
-    neck=L(FPN)(in_channels=[128, 256, 512], out_channels=64, num_outs=3, attention=False),
-    head=L(FCLRHead)(num_priors=192, refine_layers=3, fc_hidden_dim=64, sample_points=36, cfg=param_config),
+    neck=L(FPN)(
+        in_channels=[128, 256, 512], out_channels=64, num_outs=3, attention=False
+    ),
+    head=L(FCLRHead)(
+        num_priors=192,
+        refine_layers=3,
+        fc_hidden_dim=64,
+        sample_points=36,
+        cfg=param_config,
+    ),
 )
 
-train = get_config('config/common/train.py').train
+train = get_config("config/common/train.py").train
 epochs = 15
-batch_size = 48
+batch_size = 120
 epoch_per_iter = 142226 // batch_size + 1
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter
-train.output_dir = 'output/openlane/1000d/llanet_resnet34'
+train.output_dir = "output/openlane/1000d/llanet_resnet34"
 
-optimizer = get_config('config/common/optim.py').AdamW
+optimizer = get_config("config/common/optim.py").AdamW
 optimizer.lr = 2.6e-4
 optimizer.weight_decay = 0.01
 
@@ -82,45 +90,63 @@ lr_multiplier = L(CosineParamScheduler)(start_value=1.0, end_value=0.001)
 train_process = [
     L(GenerateLaneLine)(
         transforms=[
-            dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
-            dict(name='HorizontalFlip', parameters=dict(p=1.0), p=0.5),
-            dict(name='ChannelShuffle', parameters=dict(p=1.0), p=0.1),
-            dict(name='MultiplyAndAddToBrightness', parameters=dict(mul=(0.85, 1.15), add=(-10, 10)), p=0.6),
-            dict(name='AddToHueAndSaturation', parameters=dict(value=(-10, 10)), p=0.7),
             dict(
-                name='OneOf',
+                name="Resize",
+                parameters=dict(size=dict(height=img_h, width=img_w)),
+                p=1.0,
+            ),
+            dict(name="HorizontalFlip", parameters=dict(p=1.0), p=0.5),
+            dict(name="ChannelShuffle", parameters=dict(p=1.0), p=0.1),
+            dict(
+                name="MultiplyAndAddToBrightness",
+                parameters=dict(mul=(0.85, 1.15), add=(-10, 10)),
+                p=0.6,
+            ),
+            dict(name="AddToHueAndSaturation", parameters=dict(value=(-10, 10)), p=0.7),
+            dict(
+                name="OneOf",
                 transforms=[
-                    dict(name='MotionBlur', parameters=dict(k=(3, 5))),
-                    dict(name='MedianBlur', parameters=dict(k=(3, 5))),
+                    dict(name="MotionBlur", parameters=dict(k=(3, 5))),
+                    dict(name="MedianBlur", parameters=dict(k=(3, 5))),
                 ],
                 p=0.2,
             ),
             dict(
-                name='Affine',
+                name="Affine",
                 parameters=dict(
-                    translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)), rotate=(-10, 10), scale=(0.8, 1.2)
+                    translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)),
+                    rotate=(-10, 10),
+                    scale=(0.8, 1.2),
                 ),
                 p=0.7,
             ),
-            dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
+            dict(
+                name="Resize",
+                parameters=dict(size=dict(height=img_h, width=img_w)),
+                p=1.0,
+            ),
         ],
         cfg=param_config,
     ),
-    L(ToTensor)(keys=['img', 'lane_line', 'seg']),
+    L(ToTensor)(keys=["img", "lane_line", "seg"]),
 ]
 
 val_process = [
     L(GenerateLaneLine)(
         transforms=[
-            dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
+            dict(
+                name="Resize",
+                parameters=dict(size=dict(height=img_h, width=img_w)),
+                p=1.0,
+            ),
         ],
         training=False,
         cfg=param_config,
     ),
-    L(ToTensor)(keys=['img']),
+    L(ToTensor)(keys=["img"]),
 ]
 
-dataloader = get_config('config/common/openlane.py').dataloader
+dataloader = get_config("config/common/openlane.py").dataloader
 dataloader.train.dataset.data_root = data_root
 dataloader.train.dataset.processes = train_process
 dataloader.train.dataset.cut_height = cut_height
@@ -139,7 +165,7 @@ dataloader.test.total_batch_size = batch_size
 dataloader.test.num_workers = 4
 
 # Evaluation config
-dataloader.evaluator.output_dir = './output/openlane/1000d/llanet_resnet34/val'
+dataloader.evaluator.output_dir = "./output/openlane/1000d/llanet_resnet34/val"
 dataloader.evaluator.cfg = param_config
 
 train.amp.enabled = True
