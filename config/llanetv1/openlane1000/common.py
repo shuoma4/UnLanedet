@@ -123,6 +123,7 @@ def build_config(
     param_config.fc_hidden_dim = fc_hidden_dim
     param_config.num_classes = 2
     param_config.data_root = DATA_ROOT
+    param_config.use_offline_resized = True
     param_config.w_cls = 2.0
     param_config.w_geom = 4.0
     param_config.w_iou = 2.0

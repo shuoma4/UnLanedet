@@ -45,7 +45,7 @@ def distance_cost(predictions: torch.Tensor, targets: torch.Tensor, img_w: float
     distances = (pred_xs.unsqueeze(-2) - target_xs.unsqueeze(-3)).abs()  # (..., Np, Nt, Nr)
 
     # Mask invalid positions via multiplication
-    distances = (distances * valid_mask).sum(dim=-1) / (lengths + 1e-9)  # (..., Np, Nt)
+    distances = (distances * valid_mask).sum(dim=-1) / (lengths + 1e-5)  # (..., Np, Nt)
     return distances
 
 
@@ -229,12 +229,12 @@ def assign(
     if is_batch:
         if valid_mask is not None:
             vexp = valid_mask.unsqueeze(1).expand_as(dist_scores)  # (B, Np, Nt)
-            max_dist = dist_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+            max_dist = dist_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-5)
         else:
-            max_dist = dist_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+            max_dist = dist_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-5)
         dist_scores = 1.0 - (dist_scores / max_dist) + 1e-2
     else:
-        dist_scores = 1.0 - (dist_scores / (dist_scores.max() + 1e-9)) + 1e-2
+        dist_scores = 1.0 - (dist_scores / (dist_scores.max() + 1e-5)) + 1e-2
 
     # ── Focal classification cost ────────────────────────────────────────────
     cls_scores = focal_cost(predictions[..., :2], targets[..., 1].long())
@@ -249,24 +249,24 @@ def assign(
     if is_batch:
         if valid_mask is not None:
             vexp = valid_mask.unsqueeze(1).expand_as(start_scores)
-            max_start = start_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+            max_start = start_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-5)
         else:
-            max_start = start_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+            max_start = start_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-5)
         start_scores = 1.0 - (start_scores / max_start) + 1e-2
     else:
-        start_scores = 1.0 - (start_scores / (start_scores.max() + 1e-9)) + 1e-2
+        start_scores = 1.0 - (start_scores / (start_scores.max() + 1e-5)) + 1e-2
 
     # ── Theta cost ───────────────────────────────────────────────────────────
     theta_scores = torch.cdist(predictions[..., 4:5], targets[..., 4:5], p=1) * 180.0
     if is_batch:
         if valid_mask is not None:
             vexp = valid_mask.unsqueeze(1).expand_as(theta_scores)
-            max_theta = theta_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+            max_theta = theta_scores.masked_fill(~vexp, 0.0).flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-5)
         else:
-            max_theta = theta_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-9)
+            max_theta = theta_scores.flatten(1).max(dim=1).values.view(-1, 1, 1).clamp(min=1e-5)
         theta_scores = 1.0 - (theta_scores / max_theta) + 1e-2
     else:
-        theta_scores = 1.0 - (theta_scores / (theta_scores.max() + 1e-9)) + 1e-2
+        theta_scores = 1.0 - (theta_scores / (theta_scores.max() + 1e-5)) + 1e-2
 
     # ── Combined cost ────────────────────────────────────────────────────────
     cost = -((dist_scores * start_scores * theta_scores) ** 2) * distance_cost_weight + cls_scores * cls_cost_weight
