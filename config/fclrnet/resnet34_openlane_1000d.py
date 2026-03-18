@@ -79,7 +79,7 @@ total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter
-train.output_dir = "output/openlane/1000d/llanet_resnet34"
+train.output_dir = "output/openlane/1000d/clrnet_resnet34"
 
 optimizer = get_config("config/common/optim.py").AdamW
 optimizer.lr = 2.6e-4

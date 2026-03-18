@@ -109,13 +109,13 @@ class FCLRHead(CLRHead):
                 matched_targets = targets[batch_idx, gt_idx]  # (N_match, D)
 
                 # 1. Reg XYTL
-                reg_yxtl = matched_preds[:, 2:6].clone()
+                reg_yxtl = matched_preds[:, 2:6].clone().float()
                 reg_yxtl[:, 0] *= self.n_strips
                 reg_yxtl[:, 1] *= self.img_w - 1
                 reg_yxtl[:, 2] *= 180
                 reg_yxtl[:, 3] *= self.n_strips
 
-                tgt_yxtl = matched_targets[:, 2:6].clone()
+                tgt_yxtl = matched_targets[:, 2:6].clone().float()
 
                 # Length correction
                 with torch.no_grad():
@@ -130,8 +130,8 @@ class FCLRHead(CLRHead):
                 loss_reg = F.smooth_l1_loss(reg_yxtl, tgt_yxtl, reduction='none').mean(dim=1)
 
                 # 2. IoU Loss
-                reg_pred_xs = matched_preds[:, 6:].clone() * (self.img_w - 1)
-                reg_target_xs = matched_targets[:, 6:].clone()
+                reg_pred_xs = matched_preds[:, 6:].clone().float() * (self.img_w - 1)
+                reg_target_xs = matched_targets[:, 6:].clone().float()
 
                 # line_iou returns (N_match,)
                 iou_score = line_iou(reg_pred_xs, reg_target_xs, self.img_w, length=15, aligned=True)

@@ -290,13 +290,13 @@ class LLANetV1Head(FCLRHead):
             matched_preds = predictions[batch_idx, prior_idx]
             matched_targets = targets[batch_idx, gt_idx]
 
-            reg_yxtl = matched_preds[:, 2:6].clone()
+            reg_yxtl = matched_preds[:, 2:6].clone().float()
             reg_yxtl[:, 0] *= self.n_strips
             reg_yxtl[:, 1] *= self.img_w - 1
             reg_yxtl[:, 2] *= 180
             reg_yxtl[:, 3] *= self.n_strips
 
-            target_yxtl = matched_targets[:, 2:6].clone()
+            target_yxtl = matched_targets[:, 2:6].clone().float()
             with torch.no_grad():
                 pred_starts = (matched_preds[:, 2] * self.n_strips).round().long().clamp(0, self.n_strips)
                 target_starts = (matched_targets[:, 2] * self.n_strips).round().long()
@@ -306,11 +306,11 @@ class LLANetV1Head(FCLRHead):
             target_yxtl[:, 2] *= 180
 
             reg_loss_each = F.smooth_l1_loss(reg_yxtl, target_yxtl, reduction='none').mean(dim=1)
-            reg_loss_sum = torch.zeros(batch_size, device=device)
+            reg_loss_sum = torch.zeros(batch_size, device=device, dtype=torch.float32)
             reg_loss_sum.index_add_(0, batch_idx, reg_loss_each)
 
-            pred_xs = matched_preds[:, 6:].clone() * (self.img_w - 1)
-            target_xs = matched_targets[:, 6:].clone()
+            pred_xs = matched_preds[:, 6:].clone().float() * (self.img_w - 1)
+            target_xs = matched_targets[:, 6:].clone().float()
             iou_each = 1.0 - line_iou(pred_xs, target_xs, self.img_w, length=15, aligned=True)
             iou_loss_sum = torch.zeros(batch_size, device=device)
             iou_loss_sum.index_add_(0, batch_idx, iou_each)

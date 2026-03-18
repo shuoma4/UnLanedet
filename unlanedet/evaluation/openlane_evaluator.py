@@ -34,17 +34,40 @@ culane_metric.interp = _linear_interp
 
 
 def _openlane_metric_per_sample(
-    pred_pts, gt_pts, width=30, iou_threshold=0.5, img_shape=(1280, 1920)
+    pred_data, gt_data, width=30, iou_threshold=0.5, img_shape=(1280, 1920)
 ):
-    tp, fp, fn, _, _ = culane_metric.culane_metric(
-        pred_pts,
-        gt_pts,
-        width=width,
-        iou_threshold=iou_threshold,
-        official=True,  # Back to discrete math but optimized with BBox Crops
-        img_shape=(img_shape[0], img_shape[1]), 
-    )
-    return tp, fp, fn
+    pred_pts, pred_cats = pred_data
+    gt_pts, gt_cats = gt_data
+
+    if len(pred_pts) == 0:
+        return 0, 0, len(gt_pts), [], []
+    if len(gt_pts) == 0:
+        return 0, len(pred_pts), 0, [], []
+
+    interp_pred = np.array([culane_metric.interp(pred_lane, n=5) for pred_lane in pred_pts], dtype=object)
+    interp_anno = np.array([culane_metric.interp(anno_lane, n=5) for anno_lane in gt_pts], dtype=object)
+
+    ious = culane_metric.discrete_cross_iou(interp_pred, interp_anno, width=width, img_shape=(img_shape[0], img_shape[1]))
+    
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(1 - ious)
+
+    tp_mask = ious[row_ind, col_ind] > iou_threshold
+    tp = int(tp_mask.sum())
+    fp = len(pred_pts) - tp
+    fn = len(gt_pts) - tp
+
+    matched_pred_cats = []
+    matched_gt_cats = []
+    if pred_cats is not None and gt_cats is not None:
+        for i, is_tp in enumerate(tp_mask):
+            if is_tp:
+                r = row_ind[i]
+                c = col_ind[i]
+                matched_pred_cats.append(pred_cats[r])
+                matched_gt_cats.append(gt_cats[c])
+
+    return tp, fp, fn, matched_pred_cats, matched_gt_cats
 
 
 class OpenLaneEvaluator(DatasetEvaluator):
@@ -110,14 +133,27 @@ class OpenLaneEvaluator(DatasetEvaluator):
             if i >= len(self.data_infos):
                 break
 
-            pred_pts = [self._pred_lane_to_pts(l) for l in pred_lanes]
-            pred_pts = [p for p in pred_pts if len(p) >= 2]
+            pred_pts = []
+            pred_cats = []
+            for l in pred_lanes:
+                p = self._pred_lane_to_pts(l)
+                if len(p) >= 2:
+                    pred_pts.append(p)
+                    pred_cats.append(l.metadata.get('category_id', -1))
 
-            gt_pts = [self._gt_lane_to_pts(l) for l in self.data_infos[i]["lanes"]]
-            gt_pts = [g for g in gt_pts if len(g) >= 2]
+            gt_pts = []
+            gt_cats = []
+            raw_gts = self.data_infos[i]["lanes"]
+            raw_gt_cats = self.data_infos[i].get("lane_categories", [-1] * len(raw_gts))
 
-            pred_collection.append(pred_pts)
-            gt_collection.append(gt_pts)
+            for g, c in zip(raw_gts, raw_gt_cats):
+                p = self._gt_lane_to_pts(g)
+                if len(p) >= 2:
+                    gt_pts.append(p)
+                    gt_cats.append(c)
+
+            pred_collection.append((pred_pts, pred_cats))
+            gt_collection.append((gt_pts, gt_cats))
 
         import multiprocessing
         num_workers = min(32, multiprocessing.cpu_count() or 8)
@@ -145,9 +181,9 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 chunksize=100
             )
 
-        total_tp = sum(tp for tp, _, _ in results)
-        total_fp = sum(fp for _, fp, _ in results)
-        total_fn = sum(fn for _, _, fn in results)
+        total_tp = sum(res[0] for res in results)
+        total_fp = sum(res[1] for res in results)
+        total_fn = sum(res[2] for res in results)
 
         precision = (
             total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
@@ -168,11 +204,38 @@ class OpenLaneEvaluator(DatasetEvaluator):
             "F1": f1,
         }
 
+        all_pred_cats = []
+        all_gt_cats = []
+        for res in results:
+            if len(res) == 5:
+                all_pred_cats.extend(res[3])
+                all_gt_cats.extend(res[4])
+
+        if len(all_pred_cats) > 0 and len(all_gt_cats) > 0 and any(c != -1 for c in all_pred_cats):
+            from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+            cat_p = precision_score(all_gt_cats, all_pred_cats, average="macro", zero_division=0)
+            cat_r = recall_score(all_gt_cats, all_pred_cats, average="macro", zero_division=0)
+            cat_f1 = f1_score(all_gt_cats, all_pred_cats, average="macro", zero_division=0)
+            cm = confusion_matrix(all_gt_cats, all_pred_cats)
+            
+            result["Cat_Precision_Macro"] = cat_p
+            result["Cat_Recall_Macro"] = cat_r
+            result["Cat_F1_Macro"] = cat_f1
+            result["Confusion_Matrix"] = cm.tolist()
+
         self.logger.info("=== OpenLane Evaluation Results ===")
         for k, v in result.items():
-            self.logger.info(
-                f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}"
-            )
+            if k == "Confusion_Matrix":
+                self.logger.info("  Confusion Matrix:")
+                for row in v:
+                    self.logger.info(f"    {row}")
+            else:
+                self.logger.info(
+                    f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}"
+                )
+
+        if "Confusion_Matrix" in result:
+            del result["Confusion_Matrix"]
 
         if self.output_dir:
             save_path = osp.join(self.output_dir, "openlane_eval_results.json")

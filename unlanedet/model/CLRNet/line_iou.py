@@ -32,7 +32,7 @@ def line_iou(pred, target, img_w, length=15, aligned=True):
     invalid_masks = (invalid_mask < 0) | (invalid_mask >= img_w)
     ovr[invalid_masks] = 0.0
     union[invalid_masks] = 0.0
-    iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
+    iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-5)
     return iou
 
 
@@ -79,7 +79,7 @@ class CLRNetIoULoss(torch.nn.Module):
         invalid_masks = (invalid_mask < 0) | (invalid_mask >= 1.0)
         ovr[invalid_masks] = 0.0
         union[invalid_masks] = 0.0
-        iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-9)
+        iou = ovr.sum(dim=-1) / (union.sum(dim=-1) + 1e-5)
         return iou
 
     def forward(self, pred, target):

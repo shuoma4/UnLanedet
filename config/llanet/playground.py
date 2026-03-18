@@ -333,7 +333,7 @@ if __name__ == "__main__":
     try:
         print("Loading MobileNetV4-LLANet...")
         mobile_module = __import__(
-            "config.llanet.mobilenetv4_openlane", fromlist=["model"]
+            "config.llanetv1.openlane300.mbv4_gsafpn_category", fromlist=["model"]
         )
         mobilenetv4_model = mobile_module.model
         print("MobileNetV4-LLANet loaded!\n")

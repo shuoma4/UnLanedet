@@ -6,12 +6,22 @@ from unlanedet.model.fCLRNet.f_dynamic_assign import assign as clrnet_assign
 
 
 def _to_absolute(lanes, img_w, img_h):
-    lanes_abs = lanes.detach().clone()
+    lanes_abs = lanes.detach().clone().float()
     lanes_abs[..., 2] *= lanes.shape[-1] - 7
     lanes_abs[..., 3] *= img_w - 1
     lanes_abs[..., 4] *= 180.0
     lanes_abs[..., 5] *= lanes.shape[-1] - 7
     lanes_abs[..., 6:] *= img_w - 1
+    return lanes_abs
+
+
+def _target_to_absolute(lanes, img_w, img_h):
+    lanes_abs = lanes.detach().clone().float()
+    lanes_abs[..., 2] *= lanes.shape[-1] - 7
+    # lanes_abs[..., 3] is already absolute in dataloader
+    lanes_abs[..., 4] *= 180.0
+    # lanes_abs[..., 5] is already absolute in dataloader
+    # lanes_abs[..., 6:] is already absolute in dataloader
     return lanes_abs
 
 
@@ -42,7 +52,7 @@ def geometry_aware_assign(predictions, targets, img_w, img_h, valid_mask=None, c
         return matching_matrix[0] if squeeze else matching_matrix
 
     predictions_abs = _to_absolute(predictions, img_w, img_h)
-    targets_abs = _to_absolute(targets, img_w, img_h)
+    targets_abs = _target_to_absolute(targets, img_w, img_h)
     n_offsets = predictions_abs.shape[-1] - 6
     n_strips = n_offsets - 1
     sample_ys = _prepare_sample_ys(sample_ys, n_offsets, img_h, device)

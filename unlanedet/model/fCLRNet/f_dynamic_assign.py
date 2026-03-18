@@ -190,10 +190,10 @@ def assign(
     """
     is_batch = predictions.ndim == 3
 
-    predictions = predictions.detach().clone()
+    predictions = predictions.detach().clone().float()
     predictions[..., 3] *= img_w - 1
     predictions[..., 6:] *= img_w - 1
-    targets = targets.detach().clone()
+    targets = targets.detach().clone().float()
 
     # ── Reconcile valid_mask with actual targets shape ───────────────────────
     # valid_mask passed from fclr_head is computed from batch['lane_line'],

@@ -73,13 +73,13 @@ model = L(FCLRNet)(
 
 train = get_config("config/common/train.py").train
 epochs = 15
-batch_size = 100
+batch_size = 24
 epoch_per_iter = 45903 // batch_size + 1
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period = epoch_per_iter
 train.eval_period = epoch_per_iter * 2
-train.output_dir = "output/openlane/300d/llanet_resnet34"
+train.output_dir = "output/openlane/300d/clrnet_resnet34"
 
 optimizer = get_config("config/common/optim.py").AdamW
 optimizer.lr = 0.6e-3

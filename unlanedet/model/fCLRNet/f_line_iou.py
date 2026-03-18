@@ -15,7 +15,7 @@ Bug fix (clamp ovr/union at 0):
     Clamping at 0 is physically correct: negative overlap means no overlap.
 
 Bug fix (AMP / FP16 NaN in DivBackward0):
-    With AMP enabled (FP16), the epsilon ``1e-9`` underflows to exactly 0.0
+    With AMP enabled (FP16), the epsilon ``1e-5`` underflows to exactly 0.0
     in half-precision arithmetic.  When union_sum is also near-zero in FP16,
     the backward gradient  d(a/b)/db = -a/b^2  becomes NaN (DivBackward0
     crash observed at ~8000 iters).
@@ -87,7 +87,7 @@ def line_iou(
     union_sum = union.sum(dim=-1)
 
     # ── NaN-safe division (AMP/FP16 compatible) ─────────────────────────────
-    # 1e-9 underflows to 0 in FP16, causing DivBackward0 NaN when union_sum
+    # 1e-5 underflows to 0 in FP16, causing DivBackward0 NaN when union_sum
     # is also near-zero.  clamp(min=1.0) is safe because a single valid
     # point contributes union >= 2*length = 30 pixels; it only activates for
     # the degenerate all-invalid case.
