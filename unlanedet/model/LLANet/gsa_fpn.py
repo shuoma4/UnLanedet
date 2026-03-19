@@ -143,24 +143,37 @@ class SCModule(nn.Module):
         elif norm_cfg is not None:
             self.shortcut = get_norm(norm_cfg, out_channels)
 
-        # 注意力权重生成 (att_weight 通道数需与 context_feat 一致)
-        # 修改：移除内部 Sigmoid，并在 forward 中手动添加
-        self.att_conv = Conv2d(out_channels, out_channels, kernel_size=1, activation=None)
+        # 增强的通道空间注意力 (CBAM style)
+        self.ca_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.ca_max_pool = nn.AdaptiveMaxPool2d(1)
+        self.ca_fc1 = nn.Conv2d(out_channels, max(1, out_channels // 4), 1, bias=False)
+        self.ca_relu = nn.ReLU(inplace=True)
+        self.ca_fc2 = nn.Conv2d(max(1, out_channels // 4), out_channels, 1, bias=False)
+        
+        self.sa_conv = Conv2d(2, 1, kernel_size=7, padding=3, activation=None)
         # 改进注意力初始化：使用 Xavier 初始化（具体初始化策略在 GSAFPN.init_weights 中统一处理）
 
     def forward(self, x):
         # 非对称卷积提取条带上下文特征并投影维度
-        # x: (B, in_channels, H, W) -> context_feat: (B, out_channels, H, W)
         context_feat = self.asym_conv(x)
 
-        # 生成空间注意力权重
-        att_weight = torch.sigmoid(self.att_conv(context_feat))
+        # Channel Attention
+        avg_out = self.ca_fc2(self.ca_relu(self.ca_fc1(self.ca_avg_pool(context_feat))))
+        max_out = self.ca_fc2(self.ca_relu(self.ca_fc1(self.ca_max_pool(context_feat))))
+        ca_weight = torch.sigmoid(avg_out + max_out)
+        ca_feat = context_feat * ca_weight
+        
+        # Spatial Attention
+        sa_avg_out = torch.mean(ca_feat, dim=1, keepdim=True)
+        sa_max_out, _ = torch.max(ca_feat, dim=1, keepdim=True)
+        sa_weight = torch.sigmoid(self.sa_conv(torch.cat([sa_avg_out, sa_max_out], dim=1)))
+        
+        att_out = ca_feat * sa_weight
 
-        # 修复：使用输入 x 的残差连接（带维度匹配 shortcut）
+        # 残差连接
         residual = x if self.shortcut is None else self.shortcut(x)
-        att_out = context_feat * att_weight
         assert residual.shape == att_out.shape, (
-            f'SCModule 维度不匹配: residual={tuple(residual.shape)} vs att_out={tuple(att_out.shape)}'
+            f'SCModule 维度不匹配: {residual.shape} vs {att_out.shape}'
         )
         return residual + att_out
 
@@ -308,7 +321,7 @@ class GSAFPN(nn.Module):
             if isinstance(m, nn.Conv2d):
                 n_conv += 1
                 if getattr(m, 'weight', None) is not None:
-                    if name.endswith('att_conv'):
+                    if name.endswith('sa_conv') or name.endswith('ca_fc2'):
                         # 优化注意力层初始化：更小 std，避免 sigmoid 饱和
                         nn.init.normal_(m.weight, mean=0.0, std=0.01)
                         n_att += 1

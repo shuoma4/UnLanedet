@@ -10,3 +10,5 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
         assign_method="CLRNet",
         enable_global_semantic=True,
     )
+
+param_config.scm_kernel_size = 9

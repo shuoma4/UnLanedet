@@ -40,6 +40,9 @@ class LLANetV1Head(FCLRHead):
         self.num_lane_categories = int(getattr(cfg, 'num_lane_categories', len(CATEGORY_WEIGHT)))
         self.category_loss_weight = float(getattr(cfg, 'category_loss_weight', 1.0))
         self.category_scale_factor = float(getattr(cfg, 'category_scale_factor', 20.0))
+        self.enable_supcon = bool(getattr(cfg, 'enable_supcon', False))
+        self.lambda_con = float(getattr(cfg, 'lambda_con', 0.5)) if self.enable_supcon else 0.0
+        self.tau_con = float(getattr(cfg, 'tau_con', 0.07))
         self.prior_statistics = None
 
         super().__init__(
@@ -54,13 +57,12 @@ class LLANetV1Head(FCLRHead):
         )
 
         if self.enable_lane_category:
-            self.category_modules = nn.ModuleList(
-                [
-                    nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
-                    nn.ReLU(inplace=True),
-                ]
+            self.category_modules = nn.Sequential(
+                nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
             )
             if self.category_head_type == 'prototype':
                 self.category_prototypes = nn.Parameter(torch.randn(self.num_lane_categories, self.fc_hidden_dim))
@@ -80,7 +82,7 @@ class LLANetV1Head(FCLRHead):
                 )
             elif len(category_weights) > self.num_lane_categories:
                 category_weights = category_weights[: self.num_lane_categories]
-            self.category_criterion = nn.NLLLoss(weight=category_weights, reduction='sum')
+            self.category_criterion = nn.CrossEntropyLoss(weight=category_weights, reduction='sum')
 
     def _init_prior_embeddings(self):
         self.prior_embeddings = nn.Embedding(self.num_priors, 3)
@@ -108,18 +110,20 @@ class LLANetV1Head(FCLRHead):
         return priors, priors_on_featmap
 
     def _category_forward(self, flat_features, batch_size, num_priors):
-        category_features = flat_features.clone()
+        category_features = flat_features.clone().detach()
         for layer in self.category_modules:
             category_features = layer(category_features)
 
+        z = F.normalize(category_features, p=2, dim=-1)
+
         if self.category_head_type == 'prototype':
             logits = self.category_scale_factor * torch.matmul(
-                F.normalize(category_features, p=2, dim=-1),
+                z,
                 F.normalize(self.category_prototypes, p=2, dim=-1).transpose(0, 1),
             )
         else:
-            logits = self.category_layers(category_features)
-        return logits.reshape(batch_size, num_priors, -1)
+            logits = self.category_layers(z)
+        return logits.reshape(batch_size, num_priors, -1), z.reshape(batch_size, num_priors, -1)
 
     def forward(self, x, **kwargs):
         batch_features = list(x[len(x) - self.refine_layers :])
@@ -204,7 +208,7 @@ class LLANetV1Head(FCLRHead):
             output.update(**seg)
 
         if self.enable_lane_category and final_flat_features is not None:
-            output['category'] = self._category_forward(final_flat_features, batch_size, num_priors)
+            output['category'], output['category_z'] = self._category_forward(final_flat_features, batch_size, num_priors)
 
         output['distill_features'] = (
             final_flat_features.reshape(batch_size, num_priors, -1) if final_flat_features is not None else None
@@ -323,10 +327,33 @@ class LLANetV1Head(FCLRHead):
             if self.enable_lane_category and stage == self.refine_layers - 1 and lane_categories is not None and 'category' in output:
                 category_logits = output['category'][batch_idx, prior_idx]
                 category_targets = lane_categories[batch_idx, gt_idx].long()
-                category_loss += self.category_criterion(
-                    F.log_softmax(category_logits.float(), dim=-1),
+                
+                L_type = self.category_criterion(
+                    category_logits.float(),
                     category_targets,
                 ) / max(int(len(batch_idx)), 1)
+                
+                L_con = torch.tensor(0.0, device=device)
+                if self.enable_supcon and len(batch_idx) > 1:
+                    z_norm = output['category_z'][batch_idx, prior_idx] # (M, D)
+                    M = z_norm.size(0)
+                    sim_matrix = torch.matmul(z_norm, z_norm.T) / self.tau_con
+                    
+                    mask_self = torch.eye(M, device=device).bool()
+                    labels = category_targets
+                    mask_pos = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~mask_self
+                    
+                    valid = mask_pos.sum(dim=1) > 0
+                    
+                    sim_matrix.masked_fill_(mask_self, float('-inf'))
+                    log_prob = sim_matrix - torch.logsumexp(sim_matrix, dim=1, keepdim=True)
+                    
+                    loss_con = -(log_prob * mask_pos.float()).sum(dim=1)
+                    loss_con = loss_con[valid] / mask_pos[valid].sum(dim=1).float()
+                    if valid.sum() > 0:
+                        L_con = loss_con.mean()
+
+                category_loss += L_type + self.lambda_con * L_con
 
         seg_loss = self.criterion(F.log_softmax(output['seg'], dim=1), batch['seg'].long().to(device))
         norm = float(batch_size * self.refine_layers)

@@ -6,3 +6,4 @@ from .RESA import *
 from .CondlaneNet import *
 from .LLANet import *
 from .llanetv1 import *
+from .fCLRerNet import fCLRerNet
