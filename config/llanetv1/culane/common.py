@@ -20,6 +20,7 @@ def build_config(
     featuremap_out_channel=64,
     batch_size=24,
     fc_hidden_dim=64,
+    epochs=15,
 ):
     iou_loss_weight = 2.0
     cls_loss_weight = 2.0
@@ -86,7 +87,6 @@ def build_config(
     model = create_llanetv1_model(param_config)
 
     train = get_config('config/common/train.py').train
-    epochs = 15
      
     epoch_per_iter = 88880 // batch_size + 1
     total_iter = epoch_per_iter * epochs
@@ -151,7 +151,7 @@ def build_config(
     dataloader.train.dataset.cut_height = cut_height
     dataloader.train.dataset.cfg = param_config
     dataloader.train.total_batch_size = batch_size
-    dataloader.train.num_workers = 8
+    dataloader.train.num_workers = 4
     dataloader.train.persistent_workers = True
     dataloader.train.pin_memory = True
     dataloader.train.prefetch_factor = 4

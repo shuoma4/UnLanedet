@@ -8,6 +8,5 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
     enable_category_head=False,
     use_data_driven_priors=False,
     assign_method="GeometryAware",
-    batch_size=40
+    epochs=30,
 )
-dataloader.test.total_batch_size = 16

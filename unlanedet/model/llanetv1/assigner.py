@@ -7,21 +7,29 @@ from unlanedet.model.fCLRNet.f_dynamic_assign import assign as clrnet_assign
 
 def _to_absolute(lanes, img_w, img_h):
     lanes_abs = lanes.detach().clone().float()
-    lanes_abs[..., 2] *= lanes.shape[-1] - 7
+    lanes_abs[..., 2] *= lanes.shape[-1] - 7  # mapping start_y to strip index
     lanes_abs[..., 3] *= img_w - 1
     lanes_abs[..., 4] *= 180.0
-    lanes_abs[..., 5] *= lanes.shape[-1] - 7
+    lanes_abs[..., 5] *= lanes.shape[-1] - 7  # mapping length to strip count
     lanes_abs[..., 6:] *= img_w - 1
     return lanes_abs
 
 def _target_to_absolute(lanes, img_w, img_h):
     lanes_abs = lanes.detach().clone().float()
-    lanes_abs[..., 2] *= lanes.shape[-1] - 7
+    lanes_abs[..., 2] *= lanes.shape[-1] - 7  # mapping start_y to strip index
     lanes_abs[..., 4] *= 180.0
     return lanes_abs
 
+
+def curve_distance(pred_xs, target_xs, img_w):
+    target_broad = target_xs.unsqueeze(-3)
+    valid_mask = ((target_broad >= 0) & (target_broad < img_w)).float()
+    lengths = valid_mask.sum(dim=-1)
+    distances = (pred_xs.unsqueeze(-2) - target_xs.unsqueeze(-3)).abs()
+    distances = (distances * valid_mask).sum(dim=-1) / (lengths + 1e-5)
+    return distances / img_w  # Normalize by img_w to keep scale 0~1 like others
+
 def gaussian_penalty(err, sigma):
-    """运用高斯核将相对误差映射为平滑边界的代价。"""
     return 1.0 - torch.exp(-(err ** 2) / (2 * sigma ** 2))
 
 def geometry_aware_assign(predictions, targets, img_w, img_h, valid_mask=None, cfg=None, sample_ys=None):
@@ -72,36 +80,33 @@ def geometry_aware_assign(predictions, targets, img_w, img_h, valid_mask=None, c
     theta_c = torch.abs(pred_theta.unsqueeze(2) - gt_theta.unsqueeze(1)) / 180.0
     length_c = torch.abs(pred_length.unsqueeze(2) - gt_length.unsqueeze(1)) / max(1.0, float(n_strips))
 
-    iou_matrix = line_iou(predictions_abs[..., 6:].clamp(min=-img_w, max=2*img_w), 
+    iou_matrix = line_iou(predictions_abs[..., 6:],
                           targets_abs[..., 6:], img_w, aligned=False)
-    iou_cost = 1.0 - iou_matrix
+    iou_score = iou_matrix.clone()
+    iou_score[iou_score < 0] = 0.0
 
-    cost_x = gaussian_penalty(delta_x, sigma=0.05)
-    cost_y = gaussian_penalty(delta_y, sigma=0.1)     
-    cost_theta = gaussian_penalty(theta_c, sigma=0.1) 
-    cost_length = gaussian_penalty(length_c, sigma=0.2) 
-
-    geom_cost = (
-        iou_cost * 2.0 + 
-        cost_x * 1.0 + 
-        cost_y * 0.5 + 
-        cost_theta * 0.5 + 
-        cost_length * 0.5
-    ) / 4.5  
+    # 乘以多维高斯惩罚（Multi-dimensional Gaussian），以严格控制匹配条件（起到“逻辑与”的作用）
+    score_x = torch.exp(-(delta_x**2) / (2 * 0.15**2))
+    score_y = torch.exp(-(delta_y**2) / (2 * 0.20**2))
+    score_theta = torch.exp(-(theta_c**2) / (2 * 0.20**2))
+    score_length = torch.exp(-(length_c**2) / (2 * 0.30**2))
+    
+    geom_score = score_x * score_y * score_theta * score_length
 
     cls_score = focal_cost(predictions[..., :2], targets[..., 1].long())
-    
-    cost = geom_cost * w_geom + cls_score * w_cls
+
+    # cls_score is focal cost (loss value, positive), so larger is worse, adding it is correct
+    cost = - (geom_score ** 2) * w_geom + cls_score * w_cls 
     cost = cost.masked_fill(~valid_mask.unsqueeze(1), float('inf'))
 
-    sim_proxy = torch.clamp(1.0 - geom_cost, min=0.0)
+    # 修正Dynamic K机制，使用严格的IoU，确保与CLRNet保持同级别的选点数量
+    sim_proxy = iou_matrix.clone()
+    sim_proxy[sim_proxy < 0] = 0.0
     sim_proxy = sim_proxy.masked_fill(~valid_mask.unsqueeze(1), 0.0)
     
-    n_candidate_k = min(4, N)
-    if N < n_candidate_k:
-        topk_ious = sim_proxy
-    else:
-        topk_ious, _ = torch.topk(sim_proxy, n_candidate_k, dim=1)
+    n_candidate_k = getattr(cfg, 'n_candidate_k', 4) # CLRNet default is 4
+    n_candidate_k = min(n_candidate_k, N)
+    topk_ious, _ = torch.topk(sim_proxy, n_candidate_k, dim=1)
 
     dynamic_ks = torch.clamp(topk_ious.sum(dim=1).int(), min=1)
 

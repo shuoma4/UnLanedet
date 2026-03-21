@@ -36,13 +36,15 @@ class LLANetV1Head(FCLRHead):
         self.enable_lane_category = bool(
             getattr(cfg, 'enable_lane_category', getattr(cfg, 'enable_category_head', False))
         )
-        self.category_head_type = getattr(cfg, 'category_head_type', 'linear')
+        self.category_head_type = getattr(cfg, 'category_head_type', 'prototype')
         self.num_lane_categories = int(getattr(cfg, 'num_lane_categories', len(CATEGORY_WEIGHT)))
         self.category_loss_weight = float(getattr(cfg, 'category_loss_weight', 1.0))
         self.category_scale_factor = float(getattr(cfg, 'category_scale_factor', 20.0))
         self.enable_supcon = bool(getattr(cfg, 'enable_supcon', False))
         self.lambda_con = float(getattr(cfg, 'lambda_con', 0.5)) if self.enable_supcon else 0.0
         self.tau_con = float(getattr(cfg, 'tau_con', 0.07))
+        self.combined_alpha = float(getattr(cfg, 'combined_alpha', 0.5))
+        self.con_loss_weight = float(getattr(cfg, 'con_loss_weight', 0.1))
         self.prior_statistics = None
 
         super().__init__(
@@ -64,10 +66,12 @@ class LLANetV1Head(FCLRHead):
                 nn.ReLU(inplace=True),
                 nn.Linear(self.fc_hidden_dim, self.fc_hidden_dim),
             )
-            if self.category_head_type == 'prototype':
+            if self.category_head_type in ['prototype', 'combined']:
                 self.category_prototypes = nn.Parameter(torch.randn(self.num_lane_categories, self.fc_hidden_dim))
-                nn.init.normal_(self.category_prototypes, mean=0.0, std=0.01)
-            else:
+                nn.init.orthogonal_(self.category_prototypes)
+                if self.category_head_type == 'combined':
+                    self.category_tau = nn.Parameter(torch.tensor(self.category_scale_factor, dtype=torch.float32))
+            if self.category_head_type in ['linear', 'combined']:
                 self.category_layers = nn.Linear(self.fc_hidden_dim, self.num_lane_categories)
                 nn.init.normal_(self.category_layers.weight, mean=0.0, std=1e-3)
                 if self.category_layers.bias is not None:
@@ -82,7 +86,8 @@ class LLANetV1Head(FCLRHead):
                 )
             elif len(category_weights) > self.num_lane_categories:
                 category_weights = category_weights[: self.num_lane_categories]
-            self.category_criterion = nn.CrossEntropyLoss(weight=category_weights, reduction='sum')
+            self.register_buffer('category_weights_buf', category_weights)
+            self.category_criterion = nn.CrossEntropyLoss(weight=self.category_weights_buf, reduction='sum')
 
     def _init_prior_embeddings(self):
         self.prior_embeddings = nn.Embedding(self.num_priors, 3)
@@ -110,19 +115,28 @@ class LLANetV1Head(FCLRHead):
         return priors, priors_on_featmap
 
     def _category_forward(self, flat_features, batch_size, num_priors):
-        category_features = flat_features.clone().detach()
+        category_features = flat_features.clone()
         for layer in self.category_modules:
             category_features = layer(category_features)
 
         z = F.normalize(category_features, p=2, dim=-1)
 
-        if self.category_head_type == 'prototype':
+        if self.category_head_type == 'combined':
+            # 由于 z 是经过 L2 归一化的特征(数值极小)，直接送入无温度缩放的 Linear 层
+            # 会在 CE 损失回传时导致梯度爆炸并摧毁主干网络的定位特征，因此这里必须 detach
+            logits_linear = self.category_layers(z.detach())
+            logits_proto = self.category_tau * torch.matmul(
+                z,
+                F.normalize(self.category_prototypes, p=2, dim=-1).transpose(0, 1)
+            )
+            logits = self.combined_alpha * logits_linear + (1 - self.combined_alpha) * logits_proto
+        elif self.category_head_type == 'prototype':
             logits = self.category_scale_factor * torch.matmul(
                 z,
                 F.normalize(self.category_prototypes, p=2, dim=-1).transpose(0, 1),
             )
         else:
-            logits = self.category_layers(z)
+            logits = self.category_layers(category_features)
         return logits.reshape(batch_size, num_priors, -1), z.reshape(batch_size, num_priors, -1)
 
     def forward(self, x, **kwargs):
@@ -334,7 +348,7 @@ class LLANetV1Head(FCLRHead):
                 ) / max(int(len(batch_idx)), 1)
                 
                 L_con = torch.tensor(0.0, device=device)
-                if self.enable_supcon and len(batch_idx) > 1:
+                if (self.category_head_type == 'combined' or (self.category_head_type == 'prototype' and self.enable_supcon)) and len(batch_idx) > 1:
                     z_norm = output['category_z'][batch_idx, prior_idx] # (M, D)
                     M = z_norm.size(0)
                     sim_matrix = torch.matmul(z_norm, z_norm.T) / self.tau_con
@@ -348,12 +362,19 @@ class LLANetV1Head(FCLRHead):
                     sim_matrix.masked_fill_(mask_self, float('-inf'))
                     log_prob = sim_matrix - torch.logsumexp(sim_matrix, dim=1, keepdim=True)
                     
-                    loss_con = -(log_prob * mask_pos.float()).sum(dim=1)
+                    log_prob_pos = torch.where(mask_pos, log_prob, torch.zeros_like(log_prob))
+                    loss_con = -log_prob_pos.sum(dim=1)
+                    
                     loss_con = loss_con[valid] / mask_pos[valid].sum(dim=1).float()
                     if valid.sum() > 0:
                         L_con = loss_con.mean()
 
-                category_loss += L_type + self.lambda_con * L_con
+                    if self.category_head_type == 'combined':
+                        category_loss += L_type + self.con_loss_weight * L_con
+                    else:
+                        category_loss += L_type + self.lambda_con * L_con
+                else:
+                    category_loss += L_type
 
         seg_loss = self.criterion(F.log_softmax(output['seg'], dim=1), batch['seg'].long().to(device))
         norm = float(batch_size * self.refine_layers)

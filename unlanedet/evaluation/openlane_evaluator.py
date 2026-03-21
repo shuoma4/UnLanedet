@@ -156,7 +156,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
             gt_collection.append((gt_pts, gt_cats))
 
         import multiprocessing
-        num_workers = min(32, multiprocessing.cpu_count() or 8)
+        num_workers = min(8, multiprocessing.cpu_count() or 4)
         self.logger.info(f"Computing OpenLane IoU with {num_workers} workers...")
         
         # Prevent Thread Contentions in OpenCV and Numpy
@@ -213,15 +213,79 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         if len(all_pred_cats) > 0 and len(all_gt_cats) > 0 and any(c != -1 for c in all_pred_cats):
             from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-            cat_p = precision_score(all_gt_cats, all_pred_cats, average="macro", zero_division=0)
-            cat_r = recall_score(all_gt_cats, all_pred_cats, average="macro", zero_division=0)
-            cat_f1 = f1_score(all_gt_cats, all_pred_cats, average="macro", zero_division=0)
+            def get_cls_metrics(gt_cats, pred_cats):
+                if len(gt_cats) > 0 and len(pred_cats) > 0 and any(c != -1 for c in pred_cats):
+                    p_mac = float(precision_score(gt_cats, pred_cats, average="macro", zero_division=0))
+                    r_mac = float(recall_score(gt_cats, pred_cats, average="macro", zero_division=0))
+                    f1_mac = float(f1_score(gt_cats, pred_cats, average="macro", zero_division=0))
+                    p_wei = float(precision_score(gt_cats, pred_cats, average="weighted", zero_division=0))
+                    r_wei = float(recall_score(gt_cats, pred_cats, average="weighted", zero_division=0))
+                    f1_wei = float(f1_score(gt_cats, pred_cats, average="weighted", zero_division=0))
+                    return p_mac, r_mac, f1_mac, p_wei, r_wei, f1_wei
+                return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
+            cat_p, cat_r, cat_f1, p_wei, r_wei, f1_wei = get_cls_metrics(all_gt_cats, all_pred_cats)
             cm = confusion_matrix(all_gt_cats, all_pred_cats)
             
             result["Cat_Precision_Macro"] = cat_p
             result["Cat_Recall_Macro"] = cat_r
             result["Cat_F1_Macro"] = cat_f1
+            result["Cat_Precision_Weighted"] = p_wei
+            result["Cat_Recall_Weighted"] = r_wei
+            result["Cat_F1_Weighted"] = f1_wei
             result["Confusion_Matrix"] = cm.tolist()
+            
+        import glob
+        # Note: here we assume the current cfg has data_root
+        data_root = getattr(self.cfg, "data_root", "")
+        if data_root and "lane3d" in data_root:
+            test_dir = osp.join(data_root, "test")
+            scenario_files = glob.glob(osp.join(test_dir, "*.txt"))
+            self.logger.info(f"Computing Sub-scenarios... Found {len(scenario_files)} lists")
+            for s_file in scenario_files:
+                scenario_name = osp.basename(s_file).replace('.txt', '').replace('1000_', '')
+                with open(s_file, 'r') as f:
+                    lines = set([ln.strip() for ln in f.readlines() if ln.strip()])
+                
+                s_tp = 0
+                s_fp = 0
+                s_fn = 0
+                s_pred_cats = []
+                s_gt_cats = []
+                
+                for i, res_item in enumerate(results):
+                    img_path = self.data_infos[i].get("img_path", "")
+                    parts = img_path.split('/')
+                    if len(parts) >= 3:
+                        rel_path = f"{parts[-3]}/{parts[-2]}/{parts[-1]}"
+                    else:
+                        rel_path = img_path
+                        
+                    matched = False
+                    if rel_path in lines:
+                        matched = True
+                    else:
+                        for idx_line in lines:
+                            if idx_line in img_path:
+                                matched = True
+                                break
+                    if matched:
+                        s_tp += res_item[0]
+                        s_fp += res_item[1]
+                        s_fn += res_item[2]
+                        if len(res_item) == 5:
+                            s_pred_cats.extend(res_item[3])
+                            s_gt_cats.extend(res_item[4])
+                
+                if s_tp + s_fp + s_fn > 0:
+                    s_precision = s_tp / (s_tp + s_fp) if (s_tp + s_fp) > 0 else 0.0
+                    s_recall = s_tp / (s_tp + s_fn) if (s_tp + s_fn) > 0 else 0.0
+                    s_f1 = 2 * s_precision * s_recall / (s_precision + s_recall) if (s_precision + s_recall) > 0 else 0.0
+                    result[f"{scenario_name}_F1"] = s_f1
+                    if len(s_gt_cats) > 0 and 'get_cls_metrics' in locals():
+                        _, _, f1_mac, _, _, f1_wei = get_cls_metrics(s_gt_cats, s_pred_cats)
+                        result[f"{scenario_name}_Cat_F1_Macro"] = f1_mac
+                        result[f"{scenario_name}_Cat_F1_Weighted"] = f1_wei
 
         self.logger.info("=== OpenLane Evaluation Results ===")
         for k, v in result.items():

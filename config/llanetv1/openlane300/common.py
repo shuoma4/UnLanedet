@@ -83,6 +83,7 @@ def build_config(
     fc_hidden_dim=64,
     distill_cfg=None,
     deploy_cfg=None,
+    epochs=15,
 ):
     param_config = OmegaConf.create()
     param_config.backbone_type = backbone_type
@@ -138,7 +139,7 @@ def build_config(
     model = create_llanetv1_model(param_config)
 
     train = get_config("config/common/train.py").train
-    total_iter = EPOCH_PER_ITER * EPOCHS
+    total_iter = EPOCH_PER_ITER * epochs
     train.max_iter = total_iter
     train.checkpointer.period = EPOCH_PER_ITER
     train.eval_period = EPOCH_PER_ITER * 2

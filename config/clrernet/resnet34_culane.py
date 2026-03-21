@@ -36,7 +36,7 @@ ignore_label = 255
 bg_weight = 0.4
 featuremap_out_channel = 192
 num_classes = 4 + 1
-data_root = "/home/data/CULane"
+data_root = "/data0/lxy_data/mslanedet/CULane/"
 
 param_config = OmegaConf.create()
 param_config.iou_loss_weight = iou_loss_weight
@@ -88,6 +88,7 @@ total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
 train.checkpointer.period=epoch_per_iter
 train.eval_period = epoch_per_iter
+train.output_dir = "./output/culane/resnet34_clrernet"
 
 optimizer = get_config("config/common/optim.py").AdamW
 optimizer.lr = 0.6e-3
