@@ -159,7 +159,7 @@ def build_config(
         L(BGR2RGB)(),
         L(OpenLaneGenerator)(transforms=TRAIN_TRANSFORMS, cfg=param_config),
         L(ToTensor)(
-            keys=["img", "lane_line", "seg"],
+            keys=["img", "lane_line", "seg", "lane_vis", "intrinsic", "extrinsic"],
             collect_keys=["lane_categories", "lane_attributes", "lane_track_ids"],
         ),
     ]
@@ -169,7 +169,7 @@ def build_config(
             transforms=VAL_TRANSFORMS, training=False, cfg=param_config
         ),
         L(ToTensor)(
-            keys=["img"],
+            keys=["img", "lane_vis", "intrinsic", "extrinsic"],
             collect_keys=[
                 "img_path",
                 "lane_categories",

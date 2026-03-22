@@ -105,6 +105,7 @@ class LLANetV1(nn.Module):
                 features, temporal_aux = self.temporal_model(sequence_features)
             else:
                 features, temporal_aux = sequence_features[-1], {'temporal_consistency_loss': None}
+            temporal_aux['sequence_features'] = sequence_features
             return features, temporal_aux
         return self._forward_single_image(img), {'temporal_consistency_loss': None}
 
@@ -120,7 +121,35 @@ class LLANetV1(nn.Module):
             losses = self.head.loss(outputs, batch)
             temporal_loss = temporal_aux.get('temporal_consistency_loss')
             if temporal_loss is not None:
-                losses['temporal_consistency_loss'] = temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.0))
+                losses['temporal_consistency_loss'] = temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
+            
+            # 时序模式A：当 dataloader 提供 5D video 时，计算预测层可见区域的几何稳定性约束
+            sequence_features = temporal_aux.get('sequence_features')
+            if batch['img'].dim() == 5 and sequence_features is not None and len(sequence_features) >= 2:
+                if self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
+                    with torch.no_grad():
+                        prev_outputs = self.head(sequence_features[-2], batch=batch)
+                    preds = outputs.get('predictions_lists', [])
+                    prev_preds = prev_outputs.get('predictions_lists', [])
+                    if len(preds) > 0 and len(prev_preds) > 0:
+                        current_preds = preds[-1]
+                        previous_preds = prev_preds[-1]
+                        real_temporal_loss = self.temporal_model.temporal_loss(current_preds, previous_preds, batch)
+                        if real_temporal_loss is not None:
+                            losses['temporal_consistency_loss'] = real_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
+
+            # 兼容模式B：当 dataloader 仅提供 4D batch 时（非 5D video），使用批次内平移前一个样本假装作为"上一帧"对齐。
+            if batch['img'].dim() == 4 and self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
+                preds = outputs.get('predictions_lists', [])
+                if len(preds) > 0:
+                    current_preds = preds[-1]
+                    # We cannot just roll the tensor over the batch and call small difference
+                    # because the coordinates would be slightly different
+                    previous_preds = current_preds.roll(shifts=1, dims=0)
+                    pseudo_temporal_loss = self.temporal_model.temporal_loss(current_preds, previous_preds, batch)
+                    if pseudo_temporal_loss is not None:
+                        # use a proper scale since we are comparing totally different frames in the batch in Mode B
+                        losses['temporal_consistency_loss'] = pseudo_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
 
             if self.teacher is not None and self.distiller is not None:
                 with torch.no_grad():

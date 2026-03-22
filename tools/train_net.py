@@ -30,6 +30,9 @@ logger = logging.getLogger("unlanedet")
 
 
 def do_test(cfg, model):
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if "evaluator" in cfg.dataloader:
         # Convert to SyncBatchNorm if in distributed mode and not already converted
         if comm.get_world_size() > 1:

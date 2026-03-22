@@ -115,16 +115,20 @@ class LLANetV1Head(FCLRHead):
         return priors, priors_on_featmap
 
     def _category_forward(self, flat_features, batch_size, num_priors):
+        # 采用勾子缩放反传给 Backbone 的梯度 (x0.1)：
+        # 既允许 Backbone 学习部分语义特征(恢复分类F1)，又防止 loss_weight(5.0) 导致梯度过大破坏定位(保护检测F1)
         category_features = flat_features.clone()
+        if self.training and category_features.requires_grad:
+            category_features.register_hook(lambda grad: grad * 0.1)
+
         for layer in self.category_modules:
             category_features = layer(category_features)
 
         z = F.normalize(category_features, p=2, dim=-1)
 
         if self.category_head_type == 'combined':
-            # 由于 z 是经过 L2 归一化的特征(数值极小)，直接送入无温度缩放的 Linear 层
-            # 会在 CE 损失回传时导致梯度爆炸并摧毁主干网络的定位特征，因此这里必须 detach
-            logits_linear = self.category_layers(z.detach())
+            # 直接使用归一化前的特征喂给 linear，保证 logits 尺度能与 prototype 平起平坐
+            logits_linear = self.category_layers(category_features)
             logits_proto = self.category_tau * torch.matmul(
                 z,
                 F.normalize(self.category_prototypes, p=2, dim=-1).transpose(0, 1)

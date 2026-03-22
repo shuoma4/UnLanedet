@@ -66,6 +66,7 @@ class OpenLaneGenerator(GenerateLaneLine):
         padded_categories = np.zeros((self.max_lanes,), dtype=np.int64)
         padded_attributes = np.zeros((self.max_lanes,), dtype=np.int64)
         padded_track_ids = np.full((self.max_lanes,), -1, dtype=np.int64)
+        padded_vis = np.zeros((self.max_lanes, self.n_offsets), dtype=np.float32)
 
         lanes[:, 0] = 1
         lanes[:, 1] = 0
@@ -111,6 +112,7 @@ class OpenLaneGenerator(GenerateLaneLine):
             padded_categories[lane_idx] = category
             padded_attributes[lane_idx] = attribute
             padded_track_ids[lane_idx] = lane_info['track_id']
+            padded_vis[lane_idx, :len(all_xs)] = 1.0
             kept_lanes.append(lane)
 
         return {
@@ -120,6 +122,7 @@ class OpenLaneGenerator(GenerateLaneLine):
             'lane_categories': padded_categories,
             'lane_attributes': padded_attributes,
             'lane_track_ids': padded_track_ids,
+            'lane_vis': padded_vis,
             'gt_points': kept_lanes,
         }
 
@@ -172,6 +175,7 @@ class OpenLaneGenerator(GenerateLaneLine):
         sample['lane_categories'] = annos['lane_categories']
         sample['lane_attributes'] = annos['lane_attributes']
         sample['lane_track_ids'] = annos['lane_track_ids']
+        sample['lane_vis'] = annos['lane_vis']
         sample['seg'] = seg.get_arr() if self.training else np.zeros(img_org.shape[:2], dtype=np.uint8)
 
         return sample
