@@ -13,8 +13,3 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
     enable_global_semantic=False,
 )
 param_config.category_loss_weight = 5.0
-train.amp.enabled = False
-
-param_config.cut_height = 600
-dataloader.train.dataset.cut_height = 600
-dataloader.test.dataset.cut_height = 600
