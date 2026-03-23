@@ -13,3 +13,5 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
     enable_global_semantic=False,
 )
 param_config.category_loss_weight = 5.0
+
+

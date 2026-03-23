@@ -15,3 +15,4 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
 param_config.combined_alpha = 0.5
 param_config.con_loss_weight = 1.0
 param_config.category_loss_weight = 5.0
+

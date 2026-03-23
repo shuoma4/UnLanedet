@@ -13,17 +13,18 @@ from unlanedet.model.llanetv1.temporal_modules import TemporalFusionWrapper
 from ..common import TRAIN_TRANSFORMS, VAL_TRANSFORMS
 
 model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
-    run_name='tsm/baseline',
-    backbone_type='resnet',
-    backbone_name='resnet34',
-    neck_type='GSAFPN',
+    run_name="tsm/baseline",
+    backbone_type="resnet",
+    backbone_name="resnet34",
+    neck_type="GSAFPN",
     enable_category_head=True,
-    category_head_type='combined',
+    category_head_type="combined",
     use_data_driven_priors=False,
-    assign_method='CLRNet',
-    enable_temporal_model=False, # We override it manually below
+    assign_method="CLRNet",
+    enable_temporal_model=False,  # We override it manually below
     temporal_loss_weight=0.5,
     enable_global_semantic=True,
+    batch_size=2,
 )
 
 param_config.scm_kernel_size = 9
@@ -53,24 +54,39 @@ dataloader.test.dataset = L(OpenLaneTemporal)(
 # 2. Override the Data Process pipelines
 dataloader.train.dataset.processes = [
     L(BGR2RGB)(),
-    L(OpenLaneTemporalGenerator)(transforms=TRAIN_TRANSFORMS, cfg=param_config, training=True),
+    L(OpenLaneTemporalGenerator)(
+        transforms=TRAIN_TRANSFORMS, cfg=param_config, training=True
+    ),
     L(TemporalToTensor)(
-        keys=["img", "lane_line", "seg", "lane_vis", "intrinsic", "extrinsic", "xyz", "visibility"],
-        collect_keys=["lane_categories", "lane_attributes", "lane_track_ids", "track_id"],
+        keys=["img", "lane_line", "seg", "lane_vis", "intrinsic", "extrinsic"],
+        collect_keys=[
+            "lane_categories",
+            "lane_attributes",
+            "lane_track_ids",
+            "track_id",
+            "seq_visibility",
+            "seq_xyz",
+            "seq_track_id",
+        ],
     ),
 ]
 
 dataloader.test.dataset.processes = [
     L(BGR2RGB)(),
-    L(OpenLaneTemporalGenerator)(transforms=VAL_TRANSFORMS, cfg=param_config, training=False),
+    L(OpenLaneTemporalGenerator)(
+        transforms=VAL_TRANSFORMS, cfg=param_config, training=False
+    ),
     L(TemporalToTensor)(
-        keys=["img", "lane_vis", "intrinsic", "extrinsic", "xyz", "visibility"],
+        keys=["img", "lane_vis", "intrinsic", "extrinsic"],
         collect_keys=[
             "img_path",
             "lane_categories",
             "lane_attributes",
             "lane_track_ids",
-            "track_id"
+            "track_id",
+            "seq_visibility",
+            "seq_xyz",
+            "seq_track_id",
         ],
     ),
 ]
@@ -78,7 +94,8 @@ dataloader.test.dataset.processes = [
 
 # 3. Override the Temporal Model
 model.temporal_model = L(TemporalFusionWrapper)(
-    in_channels=64, # Default FPN out_channels
-    num_levels=getattr(param_config, 'refine_layers', 3)
+    in_channels=64,  # Default FPN out_channels
+    num_levels=getattr(param_config, "refine_layers", 3),
 )
-
+dataloader.train.total_batch_size = 2
+dataloader.test.total_batch_size = 2

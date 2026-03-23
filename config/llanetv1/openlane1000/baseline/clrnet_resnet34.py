@@ -22,7 +22,7 @@ ori_img_w = 1920
 ori_img_h = 1280
 img_w = 800
 img_h = 320
-cut_height = 270
+cut_height = 600
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1.0, 1.0, 1.0])
 ignore_label = 255
 bg_weight = 0.4
@@ -73,7 +73,7 @@ model = L(FCLRNet)(
 
 train = get_config("config/common/train.py").train
 epochs = 15
-batch_size = 24 # Reduce from 120
+batch_size = 48  # Reduce from 120
 epoch_per_iter = 142226 // batch_size + 1
 total_iter = epoch_per_iter * epochs
 train.max_iter = total_iter
@@ -163,9 +163,11 @@ dataloader.test.dataset.data_root = data_root
 dataloader.test.dataset.processes = val_process
 dataloader.test.dataset.cut_height = cut_height
 dataloader.test.dataset.cfg = param_config
-dataloader.test.total_batch_size = batch_size
+dataloader.test.total_batch_size = 8
 dataloader.test.num_workers = 4
 
 # Evaluation config
-dataloader.evaluator.output_dir = "./output/llanetv1/openlane1000/baseline/clrnet_resnet34/val"
+dataloader.evaluator.output_dir = (
+    "./output/llanetv1/openlane1000/baseline/clrnet_resnet34/val"
+)
 dataloader.evaluator.cfg = param_config

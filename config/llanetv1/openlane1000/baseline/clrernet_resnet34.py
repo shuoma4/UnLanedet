@@ -17,12 +17,12 @@ seg_loss_weight = 1.0
 num_points = 72
 max_lanes = 12  # openlane max lanes
 sample_y = range(1279, 270, -10)
-test_parameters = dict(conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
+test_parameters = dict[str, float](conf_threshold=0.4, nms_thres=50, nms_topk=max_lanes)
 ori_img_w = 1920
 ori_img_h = 1280
 img_w = 800
 img_h = 320
-cut_height = 270
+cut_height = 600
 img_norm = dict(mean=[103.939, 116.779, 123.68], std=[1.0, 1.0, 1.0])
 ignore_label = 255
 bg_weight = 0.4
@@ -163,9 +163,11 @@ dataloader.test.dataset.data_root = data_root
 dataloader.test.dataset.processes = val_process
 dataloader.test.dataset.cut_height = cut_height
 dataloader.test.dataset.cfg = param_config
-dataloader.test.total_batch_size = batch_size
+dataloader.test.total_batch_size = 8
 dataloader.test.num_workers = 4
 
 # Evaluation config
-dataloader.evaluator.output_dir = "./output/llanetv1/openlane1000/baseline/clrernet_resnet34/val"
+dataloader.evaluator.output_dir = (
+    "./output/llanetv1/openlane1000/baseline/clrernet_resnet34/val"
+)
 dataloader.evaluator.cfg = param_config

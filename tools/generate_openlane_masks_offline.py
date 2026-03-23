@@ -60,14 +60,14 @@ def process_sample(args):
 
 def main():
     pkl_files = [
-        "output/.cache/openlane_lane3d_300_train_cuth-270.pkl",
-        "output/.cache/openlane_lane3d_300_val_cuth-270.pkl",
-        "output/.cache/openlane_lane3d_1000_train_cuth-270.pkl",
-        "output/.cache/openlane_lane3d_1000_val_cuth-270.pkl",
+        "output/.cache/openlane_lane3d_300_train_cuth-600.pkl",
+        "output/.cache/openlane_lane3d_300_val_cuth-600.pkl",
+        "output/.cache/openlane_lane3d_1000_train_cuth-600.pkl",
+        "output/.cache/openlane_lane3d_1000_val_cuth-600.pkl",
     ]
 
-    mask_dir = os.path.join(DATA_ROOT, "mask")
-    cut_height = 270
+    mask_dir = os.path.join(DATA_ROOT, "mask_cut_600")
+    cut_height = 600
     img_shape = (1280 - cut_height, 1920)
 
     print("Masks will be saved to:", mask_dir)

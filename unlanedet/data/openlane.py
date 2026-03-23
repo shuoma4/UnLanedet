@@ -320,14 +320,23 @@ class OpenLane(BaseDataset):
         if use_offline:
             # 模式2：读取离线裁剪并等比缩放的 800x320 图和 mask
             base_dir = os.path.dirname(self.data_root)
-            if "training" in img_path:
-                resized_img_path = os.path.join(base_dir, "training_resized_800_320", rel_path)
+            if self.cut_height == 600:
+                train_dir = "training_cut_600_resized_800_320"
+                val_dir = "validation_cut_600_resized_800_320"
+                mask_dir = "mask_cut_600_resized_800_320"
             else:
-                resized_img_path = os.path.join(base_dir, "validation_resized_800_320", rel_path)
+                train_dir = "training_resized_800_320"
+                val_dir = "validation_resized_800_320"
+                mask_dir = "mask_resized_800_320"
+
+            if "training" in img_path:
+                resized_img_path = os.path.join(base_dir, train_dir, rel_path)
+            else:
+                resized_img_path = os.path.join(base_dir, val_dir, rel_path)
             
             img = cv2.imread(resized_img_path)
 
-            mask_path = os.path.join(base_dir, "mask_resized_800_320", rel_path).replace(".jpg", ".png")
+            mask_path = os.path.join(base_dir, mask_dir, rel_path).replace(".jpg", ".png")
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
             # 由于原 pkl 中的 lane 属于 1920x1280 坐标系，这里离线图片已经缩放到 800x320
@@ -350,8 +359,9 @@ class OpenLane(BaseDataset):
             img = cv2.imread(data_info["img_path"])
             img = img[self.cut_height :, :, :]
 
-            # 读取离线生成的1010x1920的mask
-            mask_path = os.path.join(os.path.dirname(self.data_root), "mask", rel_path).replace(".jpg", ".png")
+            # 读取离线生成的 mask
+            mask_dir_name = "mask_cut_600" if self.cut_height == 600 else "mask"
+            mask_path = os.path.join(os.path.dirname(self.data_root), mask_dir_name, rel_path).replace(".jpg", ".png")
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
             # Fallback 防止文件没生成完

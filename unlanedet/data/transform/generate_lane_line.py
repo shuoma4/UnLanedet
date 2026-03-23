@@ -241,14 +241,13 @@ class GenerateLaneLine(object):
     def __call__(self, sample):
         img_org = sample['img']
         # print(img_org is None)
-        if 'cut_height' in sample.keys():
-            self.cfg.cut_height = sample['cut_height']
-        if self.cfg.cut_height != 0:
+        cut_height = sample.get('cut_height', getattr(self.cfg, 'cut_height', 0))
+        if cut_height != 0:
             new_lanes = []
             for i in sample['lanes']:
                 lanes = []
                 for p in i:
-                    lanes.append((p[0], p[1] - self.cfg.cut_height))
+                    lanes.append((p[0], p[1] - cut_height))
                 new_lanes.append(lanes)
             sample.update({'lanes': new_lanes})
         line_strings_org = self.lane_to_linestrings(sample['lanes'])
@@ -610,14 +609,13 @@ class GenerateLanePts(object):
 
     def __call__(self, sample):
         img_org = sample['img']
-        if 'cut_height' in sample.keys():
-            self.cfg.cut_height = sample['cut_height']
-        if self.cfg.cut_height != 0:
+        cut_height = sample.get('cut_height', getattr(self.cfg, 'cut_height', 0))
+        if cut_height != 0:
             new_lanes = []
             for i in sample['lanes']:
                 lanes = []
                 for p in i:
-                    lanes.append((p[0], p[1] - self.cfg.cut_height))
+                    lanes.append((p[0], p[1] - cut_height))
                 new_lanes.append(lanes)
             sample.update({'lanes': new_lanes})
         line_strings_org = self.lane_to_linestrings(sample['lanes'])

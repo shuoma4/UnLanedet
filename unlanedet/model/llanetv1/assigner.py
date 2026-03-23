@@ -74,27 +74,31 @@ def geometry_aware_assign(predictions, targets, img_w, img_h, valid_mask=None, c
     gt_theta = targets_abs[..., 4]
     gt_length = targets_abs[..., 5]
 
-    w_geom_curve = 3.0
-    w_geom_start = 1.0
-    w_geom_theta = 1.0
+    # 1. 计算相对误差 (限定在 0 到 1 的主响应区间) Tensor Shape: [B, N, M]
+    delta_x = torch.abs(pred_start_x.unsqueeze(2) - gt_start_x.unsqueeze(1)) / img_w
+    delta_y = torch.abs(pred_start_y.unsqueeze(2) - gt_start_y.unsqueeze(1)) / max(1.0, float(n_strips))
+    theta_c = torch.abs(pred_theta.unsqueeze(2) - gt_theta.unsqueeze(1)) / 180.0
+    length_c = torch.abs(pred_length.unsqueeze(2) - gt_length.unsqueeze(1)) / max(1.0, float(n_strips))
 
-    cost_x = torch.abs(pred_start_x.unsqueeze(2) - gt_start_x.unsqueeze(1)) / img_w
-    cost_y = torch.abs(pred_start_y.unsqueeze(2) - gt_start_y.unsqueeze(1)) / max(1.0, float(n_strips))
-    cost_theta = torch.abs(pred_theta.unsqueeze(2) - gt_theta.unsqueeze(1)) / 180.0
-    cost_curve = curve_distance(predictions_abs[..., 6:], targets_abs[..., 6:], img_w)
+    iou_matrix = line_iou(predictions_abs[..., 6:],
+                          targets_abs[..., 6:], img_w, aligned=False)
+    iou_score = iou_matrix.clone()
+    iou_score[iou_score < 0] = 0.0
 
-    cls_cost = focal_cost(predictions[..., :2], targets[..., 1].long())
+    # 乘以多维高斯惩罚（Multi-dimensional Gaussian），以严格控制匹配条件（起到“逻辑与”的作用）
+    score_x = torch.exp(-(delta_x**2) / (2 * 0.15**2))
+    score_y = torch.exp(-(delta_y**2) / (2 * 0.20**2))
+    score_theta = torch.exp(-(theta_c**2) / (2 * 0.20**2))
+    score_length = torch.exp(-(length_c**2) / (2 * 0.30**2))
+    
+    geom_score = score_x * score_y * score_theta * score_length
 
-    geom_cost = (cost_curve * w_geom_curve) + \
-                (cost_x * w_geom_start) + \
-                (cost_y * w_geom_start) + \
-                (cost_theta * w_geom_theta)
+    cls_score = focal_cost(predictions[..., :2], targets[..., 1].long())
 
-    cost = geom_cost + cls_cost * w_cls
+    # cls_score is focal cost (loss value, positive), so larger is worse, adding it is correct
+    cost = - (geom_score ** 2) * w_geom + cls_score * w_cls 
     cost = cost.masked_fill(~valid_mask.unsqueeze(1), float('inf'))
 
-    iou_matrix = line_iou(predictions_abs[..., 6:], targets_abs[..., 6:], img_w, aligned=False)
-    
     # 修正Dynamic K机制，使用严格的IoU，确保与CLRNet保持同级别的选点数量
     sim_proxy = iou_matrix.clone()
     sim_proxy[sim_proxy < 0] = 0.0

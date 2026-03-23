@@ -11,42 +11,158 @@ def compute_homography_from_poses(extrinsic_k, extrinsic_t, intrinsic, z=0):
 
 
 class TemporalConsistencyLoss(nn.Module):
-    def __init__(self, loss_weight=1.0):
+    def __init__(self, loss_weight=1.0, cfg=None):
         super().__init__()
         self.loss_weight = loss_weight
+        self.cfg = cfg
 
-    def forward(self, current_preds, previous_preds, batch=None):
-        if current_preds is None or previous_preds is None:
-            return current_preds.new_tensor(0.0) if current_preds is not None else torch.tensor(0.0)
-            
-        # 兼容不同输入序列的情况 (支持降级模式)
+    def forward(self, current_preds, previous_preds, batch=None, outputs=None, assigner=None):
+        if current_preds is None:
+            return torch.tensor(0.0)
+
+        # Baseline constraint (if no batch info available)
         min_priors = min(current_preds.shape[1], previous_preds.shape[1])
         curr_p = current_preds[:, :min_priors]
         prev_p = previous_preds[:, :min_priors].detach()
+        cls_loss = F.mse_loss(F.softmax(curr_p[..., :2], dim=-1), F.softmax(prev_p[..., :2], dim=-1)) * 5.0
         
-        # 1. 约束分类概率分布的连续性 (包含背景和前景)
-        curr_prob = F.softmax(curr_p[..., :2], dim=-1)
-        prev_prob = F.softmax(prev_p[..., :2], dim=-1)
+        geo_loss = curr_p.new_tensor(0.0)
+        reg_loss = curr_p.new_tensor(0.0)
         
-        # 使用 MSE 使得分类概率保持平滑的过渡，稍微放大平衡量级
-        cls_loss = F.mse_loss(curr_prob, prev_prob) * 5.0
-        
-        # 2. 约束具有高置信度前排目标的几何位置连续性 (排除大量冗余且无意义的背景anchor造成的0梯度中和)
-        # 取上一帧被网络认为是实体车道线的 prior 作为追踪 anchor (阈值0.1)
-        fg_mask = (prev_prob[..., 1] > 0.1).float()
-        
+        # pure anchor smooth loss as fallback
+        fg_mask = (F.softmax(prev_p[..., :2], dim=-1)[..., 1] > 0.1).float()
         if fg_mask.sum() > 0:
-            # 仅对存在可能车道线的前景计算 L1 平滑偏移 (包括起点、角度、长度等维度的回归)
             reg_diff = F.smooth_l1_loss(curr_p[..., 2:6], prev_p[..., 2:6], reduction='none')
-            # 沿最后一维求均值后，使用前景掩膜提取
-            reg_loss = (reg_diff.mean(dim=-1) * fg_mask).sum() / (fg_mask.sum() + 1e-5)
-            # 乘以一个合理的系数
-            reg_loss = reg_loss * 10.0
-        else:
-            reg_loss = curr_p.new_tensor(0.0)
+            reg_loss = (reg_diff.mean(dim=-1) * fg_mask).sum() / (fg_mask.sum() + 1e-5) * 5.0
+
+        if batch is not None and outputs is not None and 'final_matching_matrix' in outputs and 'extrinsic' in batch:
+            B = current_preds.shape[0]
+            matching_matrix = outputs['final_matching_matrix'] # [B, num_priors, max_lanes]
+            matched_indices = matching_matrix.nonzero(as_tuple=False)
             
-        loss = cls_loss + reg_loss
-        return loss * self.loss_weight
+            seq_xyz = batch.get('seq_xyz')
+            if hasattr(seq_xyz, 'data'):
+                seq_xyz = seq_xyz.data
+                if isinstance(seq_xyz, list) and len(seq_xyz) == 1 and isinstance(seq_xyz[0], list): seq_xyz = seq_xyz[0]
+            seq_track = batch.get('seq_track_id')
+            if hasattr(seq_track, 'data'):
+                seq_track = seq_track.data
+                if isinstance(seq_track, list) and len(seq_track) == 1 and isinstance(seq_track[0], list): seq_track = seq_track[0]
+            seq_vis = batch.get('seq_visibility')
+            if hasattr(seq_vis, 'data'):
+                seq_vis = seq_vis.data
+                if isinstance(seq_vis, list) and len(seq_vis) == 1 and isinstance(seq_vis[0], list): seq_vis = seq_vis[0]
+            seq_ext = batch.get('extrinsic')
+            seq_int = batch.get('intrinsic', batch.get('intrinsic')) # in TemporalToTensor, it's just 'intrinsic'
+            
+            cut_height = float(getattr(self.cfg, 'cut_height', 600))
+            img_w = float(getattr(self.cfg, 'img_w', 800))
+            img_h = float(getattr(self.cfg, 'img_h', 320))
+            ori_img_w = float(getattr(self.cfg, 'ori_img_w', 1920))
+            ori_img_h = float(getattr(self.cfg, 'ori_img_h', 1280))
+            
+            n_offsets = int(getattr(self.cfg, 'num_points', 72))
+            n_strips = n_offsets - 1
+            strip_size = img_h / n_strips
+            
+            total_l1 = 0.0
+            num_valid = 0
+            
+            for b in range(B):
+                try:
+                    if seq_ext.dim() == 4:
+                        E_t_1 = seq_ext[b, -2].double()
+                        E_t = seq_ext[b, -1].double()
+                        K_t = seq_int[b, -1].double() if seq_int.dim() == 4 else seq_int[b].double()
+                    else:
+                        continue
+                        
+                    T_rel = torch.inverse(E_t) @ E_t_1
+                    
+                    track_ids_t_1 = seq_track[b][-2]
+                    track_ids_t = seq_track[b][-1]
+                    xyz_t_1 = seq_xyz[b][-2]
+                    vis_t_1 = seq_vis[b][-2]
+                    
+                    b_mask = (matched_indices[:, 0] == b)
+                    if not b_mask.any(): continue
+                    
+                    for prior_idx, gt_idx in zip(matched_indices[b_mask, 1], matched_indices[b_mask, 2]):
+                        g_idx = gt_idx.item()
+                        if g_idx >= len(track_ids_t): continue
+                        tid = track_ids_t[g_idx]
+                        if tid == -1: continue
+                        
+                        try:
+                            prev_idx = track_ids_t_1.index(tid)
+                        except ValueError:
+                            continue
+                            
+                        xyz = xyz_t_1[prev_idx]
+                        if len(xyz) == 0: continue
+                        
+                        pts = current_preds.new_tensor(xyz, dtype=torch.float64).transpose(0, 1) # 3, N
+                        ones = torch.ones((1, pts.shape[1]), device=pts.device, dtype=torch.float64)
+                        pts_homo = torch.cat([pts, ones], dim=0)
+                        
+                        pts_t_c = T_rel @ pts_homo
+                        X = pts_t_c[0, :]
+                        Y = pts_t_c[1, :]
+                        Z = pts_t_c[2, :]
+                        
+                        z_mask = Z > 0
+                        if not z_mask.any(): continue
+                        
+                        uv_proj_org = K_t @ torch.stack([X/Z, Y/Z, torch.ones_like(Z)], dim=0)
+                        u_org = uv_proj_org[0, :]
+                        v_org = uv_proj_org[1, :]
+                        
+                        u = u_org * (img_w / ori_img_w)
+                        v = (v_org - cut_height) * (img_h / (ori_img_h - cut_height))
+                        
+                        valid = z_mask & (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+                        if not valid.any(): continue
+                        
+                        u_valid = u[valid].float()
+                        v_valid = v[valid].float()
+                        
+                        y_idx = (img_h - v_valid) / strip_size
+                        floor_idx = torch.floor(y_idx).long()
+                        ceil_idx = torch.ceil(y_idx).long()
+                        
+                        floor_idx = torch.clamp(floor_idx, 0, n_offsets - 1)
+                        ceil_idx = torch.clamp(ceil_idx, 0, n_offsets - 1)
+                        
+                        alpha = y_idx - floor_idx
+                        
+                        pred = current_preds[b, prior_idx]
+                        lane_xs = pred[6:6+n_offsets] * img_w
+                        
+                        floor_x = lane_xs[floor_idx]
+                        ceil_x = lane_xs[ceil_idx]
+                        pred_u = floor_x * (1 - alpha) + ceil_x * alpha
+                        
+                        vis = current_preds.new_tensor(vis_t_1[prev_idx])
+                        vis_sub = vis[valid]
+                        
+                        l1 = F.l1_loss(pred_u, u_valid, reduction='none')
+                        vis_mask = vis_sub > 0.5
+                        if vis_mask.any():
+                            total_l1 += l1[vis_mask].mean()
+                            num_valid += 1
+                            
+                except Exception as e:
+                    # failsafe silent fallback for this batch 
+                    import logging
+                    logging.getLogger(__name__).warning("Temporal projection error: " + str(e))
+                    pass
+
+            if num_valid > 0:
+                geo_loss = total_l1 / num_valid * 5.0 # Give it a reasonable scale
+                # Reduce weight of anchor fallback if we have real geometry loss
+                reg_loss = geo_loss
+            
+        return (cls_loss + reg_loss) * self.loss_weight
 
 
 class ContMixTemporalBlock(nn.Module):

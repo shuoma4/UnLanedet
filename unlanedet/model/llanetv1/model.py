@@ -134,7 +134,13 @@ class LLANetV1(nn.Module):
                     if len(preds) > 0 and len(prev_preds) > 0:
                         current_preds = preds[-1]
                         previous_preds = prev_preds[-1]
-                        real_temporal_loss = self.temporal_model.temporal_loss(current_preds, previous_preds, batch)
+                        real_temporal_loss = self.temporal_model.temporal_loss(
+                            current_preds, 
+                            previous_preds, 
+                            batch, 
+                            outputs=outputs,
+                            assigner=getattr(self.head, 'assigner', None)
+                        )
                         if real_temporal_loss is not None:
                             losses['temporal_consistency_loss'] = real_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
 

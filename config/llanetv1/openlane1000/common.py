@@ -22,10 +22,9 @@ ORI_IMG_W = 1920
 ORI_IMG_H = 1280
 IMG_W = 800
 IMG_H = 320
-CUT_HEIGHT = 270
+CUT_HEIGHT = 600
 BATCH_SIZE = 24
 EPOCHS = 15
-EPOCH_PER_ITER = 142226 // BATCH_SIZE + 1
 DATA_ROOT = "/data1/lxy_log/workspace/ms/OpenLane/dataset/raw/lane3d_1000"
 DATASET_STATISTICS = "/data1/lxy_log/workspace/ms/UnLanedet/source/openlane_statistics/openlane_priors_with_clusters.npz"
 
@@ -84,6 +83,7 @@ def build_config(
     distill_cfg=None,
     deploy_cfg=None,
     epochs=15,
+    batch_size=BATCH_SIZE,
 ):
     param_config = OmegaConf.create()
     param_config.backbone_type = backbone_type
@@ -139,15 +139,16 @@ def build_config(
     model = create_llanetv1_model(param_config)
 
     train = get_config("config/common/train.py").train
-    total_iter = EPOCH_PER_ITER * epochs
+    epoch_per_iter = 142226 // batch_size + 1
+    total_iter = epoch_per_iter * epochs
     train.max_iter = total_iter
-    train.checkpointer.period = EPOCH_PER_ITER
-    train.eval_period = EPOCH_PER_ITER
+    train.checkpointer.period = epoch_per_iter
+    train.eval_period = epoch_per_iter
     train.output_dir = f"output/llanetv1/openlane1000/{run_name}"
-    train.amp.enabled = True
+    train.amp.enabled = False
 
     param_config.output_dir = train.output_dir
-    param_config.epoch_per_iter = EPOCH_PER_ITER
+    param_config.epoch_per_iter = epoch_per_iter
 
     optimizer = get_config("config/common/optim.py").AdamW
     optimizer.lr = 2.6e-4

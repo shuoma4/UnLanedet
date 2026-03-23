@@ -128,12 +128,11 @@ class OpenLaneGenerator(GenerateLaneLine):
 
     def __call__(self, sample):
         img_org = sample['img']
-        if 'cut_height' in sample:
-            self.cfg.cut_height = sample['cut_height']
-        if self.cfg.cut_height != 0:
+        cut_height = sample.get('cut_height', getattr(self.cfg, 'cut_height', 0))
+        if cut_height != 0:
             new_lanes = []
             for lane in sample['lanes']:
-                new_lanes.append([(p[0], p[1] - self.cfg.cut_height) for p in lane])
+                new_lanes.append([(p[0], p[1] - cut_height) for p in lane])
             sample.update({'lanes': new_lanes})
 
         line_strings_org = self.lane_to_linestrings(sample['lanes'])

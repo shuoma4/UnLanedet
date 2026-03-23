@@ -288,6 +288,8 @@ class LLANetV1Head(FCLRHead):
                 cfg=self.cfg,
                 sample_ys=self.prior_ys,
             )
+            if stage == self.refine_layers - 1:
+                output['final_matching_matrix'] = matching_matrix
             matched_indices = matching_matrix.nonzero(as_tuple=False)
             if matched_indices.numel() == 0:
                 batch_idx = predictions.new_zeros((0,), dtype=torch.long)
