@@ -173,7 +173,9 @@ class OpenLaneEvaluator(DatasetEvaluator):
             img_shape=img_shape,
         )
 
-        with multiprocessing.Pool(num_workers) as p:
+        # Use spawn context to prevent PyTorch deadlocks during fork when CUDA is initialized
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(num_workers) as p:
             # starmap will automatically unpack the zipped tuple into the two arguments
             results = p.starmap(
                 partial_func, 

@@ -11,7 +11,6 @@ import pickle
 import gc
 import functools
 
-@functools.lru_cache(maxsize=128)
 def load_segment_pkl(cache_dir, seg):
     with open(os.path.join(cache_dir, f"{seg}.pkl"), "rb") as f:
         return pickle.load(f)
@@ -22,6 +21,12 @@ class OpenLaneTemporal(BaseDataset):
         self.split = split
         self.max_lanes = getattr(cfg, 'max_lanes', 24)
         self.cache_dir = os.path.join(data_root, f"openlane_temporal_cache_dir_{split}_{self.seq_len}_cuth-{cut_height}")
+        
+        # Instance-local cache to avoid threading deadlocks in DataLoader forks
+        self._segment_cache = {}
+        self._cache_queue = []
+        self._max_cache_size = 8
+        
         super().__init__(data_root, split, cut_height, processes=processes, cfg=cfg)
         self.load_annotations()
 
@@ -244,9 +249,25 @@ class OpenLaneTemporal(BaseDataset):
             
         return frame_c
 
+    def _get_segment_data(self, seg):
+        if seg in self._segment_cache:
+            return self._segment_cache[seg]
+            
+        seg_data = load_segment_pkl(self.cache_dir, seg)
+        self._segment_cache[seg] = seg_data
+        self._cache_queue.append(seg)
+        
+        # Evict oldest segment to save memory
+        if len(self._cache_queue) > self._max_cache_size:
+            oldest_seg = self._cache_queue.pop(0)
+            if oldest_seg in self._segment_cache:
+                del self._segment_cache[oldest_seg]
+                
+        return seg_data
+
     def __getitem__(self, idx):
         seg, indices = self.clip_cache[idx]
-        seg_data = load_segment_pkl(self.cache_dir, seg)
+        seg_data = self._get_segment_data(seg)
         
         processed_clip = []
         for i in indices:
