@@ -24,15 +24,18 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
     enable_temporal_model=False,  # We override it manually below
     temporal_loss_weight=0.5,
     enable_global_semantic=True,
-    batch_size=2,
+    # AMP + 2-GPU DDP：total_batch=40（每卡 20），预计每卡约 8–9 GB
+    batch_size=40,
 )
 
 param_config.scm_kernel_size = 9
 param_config.category_loss_weight = 5.0
-train.amp.enabled = False
+train.amp.enabled = True           # fp16 混合精度，约减 30–40% per-iter 时间
+train.float32_precision = "high"   # TF32（Ada Lovelace 上有额外加速）
+train.cudnn_benchmark = True
 
-# 提升数据读取并行度，解决T=3时序数据加载瓶颈导致的速度过慢问题
-dataloader.train.num_workers = 8
+# 2-GPU 各 4 worker = 共 8 worker，预取 ×2 仍高效；避免 16 worker 并发撑爆 RAM
+dataloader.train.num_workers = 4
 dataloader.train.persistent_workers = True
 
 # 1. Override the Datasets
@@ -92,10 +95,23 @@ dataloader.test.dataset.processes = [
 ]
 
 
-# 3. Override the Temporal Model
+# 3. Override the Temporal Model，传入 cfg 使 TemporalConsistencyLoss 能读取图像尺寸等参数
 model.temporal_model = L(TemporalFusionWrapper)(
-    in_channels=64,  # Default FPN out_channels
+    in_channels=64,
     num_levels=getattr(param_config, "refine_layers", 3),
+    cfg=param_config,
 )
-dataloader.train.total_batch_size = 2
-dataloader.test.total_batch_size = 2
+dataloader.train.total_batch_size = 40
+# 评估时 batch 小，避免和 train persistent_workers 叠加撑爆 RAM
+dataloader.test.total_batch_size = 8   # 每卡 4，eval 无需大 batch
+
+# 4. 训练 I/O
+dataloader.train.pin_memory = True
+dataloader.train.prefetch_factor = 2   # 从 4 降到 2，减少 16 个 worker 的预取内存
+dataloader.test.num_workers = 2        # 2×2GPU=4 worker，eval 不需要多
+dataloader.test.persistent_workers = False  # eval 结束后立即释放 worker 内存
+dataloader.test.pin_memory = True
+dataloader.test.prefetch_factor = 2
+
+# 20.0 约束过强会压制检测收敛；回调到中等强度
+param_config.temporal_loss_weight = 8.0

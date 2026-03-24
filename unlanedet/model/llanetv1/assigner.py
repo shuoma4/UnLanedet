@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from unlanedet.model.fCLRNet.f_line_iou import line_iou
 from unlanedet.model.fCLRNet.f_dynamic_assign import focal_cost
 from unlanedet.model.fCLRNet.f_dynamic_assign import assign as clrnet_assign
+from unlanedet.model.fCLRerNet.f_dynamic_assign import assign as clrernet_assign
 
 
 def _to_absolute(lanes, img_w, img_h):
@@ -172,4 +173,6 @@ def assign(
             cfg=cfg,
             sample_ys=sample_ys,
         )
+    if method_name == "CLRerAssign":
+        return clrernet_assign(predictions, targets, img_w, img_h, valid_mask=masks)
     return clrnet_assign(predictions, targets, img_w, img_h, valid_mask=masks)

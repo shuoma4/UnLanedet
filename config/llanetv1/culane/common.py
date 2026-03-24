@@ -8,6 +8,7 @@ from unlanedet.data.transform import GenerateLaneLine
 from ...modelzoo import get_config
 from ..model_factory import create_llanetv1_model
 
+
 def build_config(
     run_name,
     backbone_type="resnet",
@@ -18,6 +19,7 @@ def build_config(
     assign_method="CLRNet",
     enable_global_semantic=False,
     featuremap_out_channel=64,
+    sample_points=36,
     batch_size=24,
     fc_hidden_dim=64,
     epochs=15,
@@ -39,10 +41,10 @@ def build_config(
     ignore_label = 255
     bg_weight = 0.4
     num_classes = 4 + 1
-    data_root = '/data0/lxy_data/mslanedet/CULane/'
-    
+    data_root = "/data0/lxy_data/mslanedet/CULane/"
+
     param_config = OmegaConf.create()
-    
+
     # Standard LLANetV1 settings
     param_config.backbone_type = backbone_type
     param_config.backbone_name = backbone_name
@@ -55,7 +57,7 @@ def build_config(
     param_config.enable_temporal_model = False
     param_config.num_priors = 192
     param_config.refine_layers = 3
-    param_config.sample_points = 36
+    param_config.sample_points = sample_points
     param_config.neck_out_channels = featuremap_out_channel
     param_config.featuremap_out_channel = featuremap_out_channel * 3
     param_config.fc_hidden_dim = fc_hidden_dim
@@ -63,7 +65,7 @@ def build_config(
     param_config.w_geom = 4.0
     param_config.w_iou = 2.0
     param_config.simota_q = 10
-    
+
     # fCLRNet-like CULane settings
     param_config.iou_loss_weight = iou_loss_weight
     param_config.cls_loss_weight = cls_loss_weight
@@ -86,8 +88,8 @@ def build_config(
 
     model = create_llanetv1_model(param_config)
 
-    train = get_config('config/common/train.py').train
-     
+    train = get_config("config/common/train.py").train
+
     epoch_per_iter = 88880 // batch_size + 1
     total_iter = epoch_per_iter * epochs
     train.max_iter = total_iter
@@ -99,7 +101,7 @@ def build_config(
     param_config.output_dir = train.output_dir
     param_config.epoch_per_iter = epoch_per_iter
 
-    optimizer = get_config('config/common/optim.py').AdamW
+    optimizer = get_config("config/common/optim.py").AdamW
     optimizer.lr = 0.6e-3
     optimizer.weight_decay = 0.01
 
@@ -108,44 +110,62 @@ def build_config(
     train_process = [
         L(GenerateLaneLine)(
             transforms=[
-                dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
-                dict(name='HorizontalFlip', parameters=dict(p=1.0), p=0.5),
-                dict(name='ChannelShuffle', parameters=dict(p=1.0), p=0.1),
-                dict(name='MultiplyAndAddToBrightness', parameters=dict(mul=(0.85, 1.15), add=(-10, 10)), p=0.6),
-                dict(name='AddToHueAndSaturation', parameters=dict(value=(-10, 10)), p=0.7),
                 dict(
-                    name='OneOf',
+                    name="Resize",
+                    parameters=dict(size=dict(height=img_h, width=img_w)),
+                    p=1.0,
+                ),
+                dict(name="HorizontalFlip", parameters=dict(p=1.0), p=0.5),
+                dict(name="ChannelShuffle", parameters=dict(p=1.0), p=0.1),
+                dict(
+                    name="MultiplyAndAddToBrightness",
+                    parameters=dict(mul=(0.85, 1.15), add=(-10, 10)),
+                    p=0.6,
+                ),
+                dict(
+                    name="AddToHueAndSaturation",
+                    parameters=dict(value=(-10, 10)),
+                    p=0.7,
+                ),
+                dict(
+                    name="OneOf",
                     transforms=[
-                        dict(name='MotionBlur', parameters=dict(k=(3, 5))),
-                        dict(name='MedianBlur', parameters=dict(k=(3, 5))),
+                        dict(name="MotionBlur", parameters=dict(k=(3, 5))),
+                        dict(name="MedianBlur", parameters=dict(k=(3, 5))),
                     ],
                     p=0.2,
                 ),
                 dict(
-                    name='Affine',
+                    name="Affine",
                     parameters=dict(
-                        translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)), rotate=(-10, 10), scale=(0.8, 1.2)
+                        translate_percent=dict(x=(-0.1, 0.1), y=(-0.1, 0.1)),
+                        rotate=(-10, 10),
+                        scale=(0.8, 1.2),
                     ),
                     p=0.7,
                 ),
             ],
             cfg=param_config,
         ),
-        L(ToTensor)(keys=['img', 'lane_line', 'seg']),
+        L(ToTensor)(keys=["img", "lane_line", "seg"]),
     ]
 
     val_process = [
         L(GenerateLaneLine)(
             transforms=[
-                dict(name='Resize', parameters=dict(size=dict(height=img_h, width=img_w)), p=1.0),
+                dict(
+                    name="Resize",
+                    parameters=dict(size=dict(height=img_h, width=img_w)),
+                    p=1.0,
+                ),
             ],
             training=False,
             cfg=param_config,
         ),
-        L(ToTensor)(keys=['img']),
+        L(ToTensor)(keys=["img"]),
     ]
 
-    dataloader = get_config('config/common/culane.py').dataloader
+    dataloader = get_config("config/common/culane.py").dataloader
     dataloader.train.dataset.processes = train_process
     dataloader.train.dataset.data_root = data_root
     dataloader.train.dataset.cut_height = cut_height

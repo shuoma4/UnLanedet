@@ -1,168 +1,220 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_LOG = logging.getLogger(__name__)
 
-def compute_homography_from_poses(extrinsic_k, extrinsic_t, intrinsic, z=0):
-    # 简化：使用内参和外参计算单应矩阵，假设路面 z=0
-    # 由于实现暂不包含完整的3D反投影逻辑，我们这里可以用一个基础版：
-    H = torch.eye(3, device=extrinsic_k.device)
-    return H
+
+def _unwrap(x):
+    """Unwrap DataLoader-wrapped list-of-lists."""
+    if hasattr(x, 'data'):
+        x = x.data
+    if isinstance(x, list) and len(x) == 1 and isinstance(x[0], list):
+        x = x[0]
+    return x
 
 
 class TemporalConsistencyLoss(nn.Module):
+    """时序一致性损失 (论文 Eq 4-7 ~ 4-12)
+
+    几何分支：matching_matrix.nonzero 一次取出全 batch 匹配，track 对齐与
+    T_rel/K 变换、投影、pred 插值均为张量批量运算；仅构建变长 xyz 填充时有
+    对匹配条数 M（≲ B×max_lanes）的短循环。
+    """
+
     def __init__(self, loss_weight=1.0, cfg=None):
         super().__init__()
         self.loss_weight = loss_weight
         self.cfg = cfg
 
+    # ------------------------------------------------------------------
+    # Public forward
+    # ------------------------------------------------------------------
     def forward(self, current_preds, previous_preds, batch=None, outputs=None, assigner=None):
         if current_preds is None:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device='cpu')
 
-        # Baseline constraint (if no batch info available)
-        min_priors = min(current_preds.shape[1], previous_preds.shape[1])
-        curr_p = current_preds[:, :min_priors]
-        prev_p = previous_preds[:, :min_priors].detach()
-        cls_loss = F.mse_loss(F.softmax(curr_p[..., :2], dim=-1), F.softmax(prev_p[..., :2], dim=-1)) * 5.0
-        
-        geo_loss = curr_p.new_tensor(0.0)
-        reg_loss = curr_p.new_tensor(0.0)
-        
-        # pure anchor smooth loss as fallback
-        fg_mask = (F.softmax(prev_p[..., :2], dim=-1)[..., 1] > 0.1).float()
-        if fg_mask.sum() > 0:
-            reg_diff = F.smooth_l1_loss(curr_p[..., 2:6], prev_p[..., 2:6], reduction='none')
-            reg_loss = (reg_diff.mean(dim=-1) * fg_mask).sum() / (fg_mask.sum() + 1e-5) * 5.0
+        device = current_preds.device
 
-        if batch is not None and outputs is not None and 'final_matching_matrix' in outputs and 'extrinsic' in batch:
-            B = current_preds.shape[0]
-            matching_matrix = outputs['final_matching_matrix'] # [B, num_priors, max_lanes]
-            matched_indices = matching_matrix.nonzero(as_tuple=False)
-            
-            seq_xyz = batch.get('seq_xyz')
-            if hasattr(seq_xyz, 'data'):
-                seq_xyz = seq_xyz.data
-                if isinstance(seq_xyz, list) and len(seq_xyz) == 1 and isinstance(seq_xyz[0], list): seq_xyz = seq_xyz[0]
-            seq_track = batch.get('seq_track_id')
-            if hasattr(seq_track, 'data'):
-                seq_track = seq_track.data
-                if isinstance(seq_track, list) and len(seq_track) == 1 and isinstance(seq_track[0], list): seq_track = seq_track[0]
-            seq_vis = batch.get('seq_visibility')
-            if hasattr(seq_vis, 'data'):
-                seq_vis = seq_vis.data
-                if isinstance(seq_vis, list) and len(seq_vis) == 1 and isinstance(seq_vis[0], list): seq_vis = seq_vis[0]
-            seq_ext = batch.get('extrinsic')
-            seq_int = batch.get('intrinsic', batch.get('intrinsic')) # in TemporalToTensor, it's just 'intrinsic'
-            
-            cut_height = float(getattr(self.cfg, 'cut_height', 600))
-            img_w = float(getattr(self.cfg, 'img_w', 800))
-            img_h = float(getattr(self.cfg, 'img_h', 320))
-            ori_img_w = float(getattr(self.cfg, 'ori_img_w', 1920))
-            ori_img_h = float(getattr(self.cfg, 'ori_img_h', 1280))
-            
-            n_offsets = int(getattr(self.cfg, 'num_points', 72))
-            n_strips = n_offsets - 1
-            strip_size = img_h / n_strips
-            
-            total_l1 = 0.0
-            num_valid = 0
-            
-            for b in range(B):
-                try:
-                    if seq_ext.dim() == 4:
-                        E_t_1 = seq_ext[b, -2].double()
-                        E_t = seq_ext[b, -1].double()
-                        K_t = seq_int[b, -1].double() if seq_int.dim() == 4 else seq_int[b].double()
-                    else:
-                        continue
-                        
-                    T_rel = torch.inverse(E_t) @ E_t_1
-                    
-                    track_ids_t_1 = seq_track[b][-2]
-                    track_ids_t = seq_track[b][-1]
-                    xyz_t_1 = seq_xyz[b][-2]
-                    vis_t_1 = seq_vis[b][-2]
-                    
-                    b_mask = (matched_indices[:, 0] == b)
-                    if not b_mask.any(): continue
-                    
-                    for prior_idx, gt_idx in zip(matched_indices[b_mask, 1], matched_indices[b_mask, 2]):
-                        g_idx = gt_idx.item()
-                        if g_idx >= len(track_ids_t): continue
-                        tid = track_ids_t[g_idx]
-                        if tid == -1: continue
-                        
-                        try:
-                            prev_idx = track_ids_t_1.index(tid)
-                        except ValueError:
-                            continue
-                            
-                        xyz = xyz_t_1[prev_idx]
-                        if len(xyz) == 0: continue
-                        
-                        pts = current_preds.new_tensor(xyz, dtype=torch.float64).transpose(0, 1) # 3, N
-                        ones = torch.ones((1, pts.shape[1]), device=pts.device, dtype=torch.float64)
-                        pts_homo = torch.cat([pts, ones], dim=0)
-                        
-                        pts_t_c = T_rel @ pts_homo
-                        X = pts_t_c[0, :]
-                        Y = pts_t_c[1, :]
-                        Z = pts_t_c[2, :]
-                        
-                        z_mask = Z > 0
-                        if not z_mask.any(): continue
-                        
-                        uv_proj_org = K_t @ torch.stack([X/Z, Y/Z, torch.ones_like(Z)], dim=0)
-                        u_org = uv_proj_org[0, :]
-                        v_org = uv_proj_org[1, :]
-                        
-                        u = u_org * (img_w / ori_img_w)
-                        v = (v_org - cut_height) * (img_h / (ori_img_h - cut_height))
-                        
-                        valid = z_mask & (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
-                        if not valid.any(): continue
-                        
-                        u_valid = u[valid].float()
-                        v_valid = v[valid].float()
-                        
-                        y_idx = (img_h - v_valid) / strip_size
-                        floor_idx = torch.floor(y_idx).long()
-                        ceil_idx = torch.ceil(y_idx).long()
-                        
-                        floor_idx = torch.clamp(floor_idx, 0, n_offsets - 1)
-                        ceil_idx = torch.clamp(ceil_idx, 0, n_offsets - 1)
-                        
-                        alpha = y_idx - floor_idx
-                        
-                        pred = current_preds[b, prior_idx]
-                        lane_xs = pred[6:6+n_offsets] * img_w
-                        
-                        floor_x = lane_xs[floor_idx]
-                        ceil_x = lane_xs[ceil_idx]
-                        pred_u = floor_x * (1 - alpha) + ceil_x * alpha
-                        
-                        vis = current_preds.new_tensor(vis_t_1[prev_idx])
-                        vis_sub = vis[valid]
-                        
-                        l1 = F.l1_loss(pred_u, u_valid, reduction='none')
-                        vis_mask = vis_sub > 0.5
-                        if vis_mask.any():
-                            total_l1 += l1[vis_mask].mean()
-                            num_valid += 1
-                            
-                except Exception as e:
-                    # failsafe silent fallback for this batch 
-                    import logging
-                    logging.getLogger(__name__).warning("Temporal projection error: " + str(e))
-                    pass
+        # --- 1. 向量化的 anchor-level 平滑约束（fallback） ---
+        min_p = min(current_preds.shape[1], previous_preds.shape[1])
+        cur = current_preds[:, :min_p]
+        prv = previous_preds[:, :min_p].detach()
 
-            if num_valid > 0:
-                geo_loss = total_l1 / num_valid * 5.0 # Give it a reasonable scale
-                # Reduce weight of anchor fallback if we have real geometry loss
-                reg_loss = geo_loss
-            
+        cls_loss = F.mse_loss(
+            F.softmax(cur[..., :2], dim=-1),
+            F.softmax(prv[..., :2], dim=-1),
+        ) * 5.0
+
+        fg = (F.softmax(prv[..., :2], dim=-1)[..., 1] > 0.1).float()
+        if fg.sum() > 0:
+            rd = F.smooth_l1_loss(cur[..., 2:6], prv[..., 2:6], reduction='none')
+            reg_loss = (rd.mean(-1) * fg).sum() / (fg.sum() + 1e-5) * 5.0
+        else:
+            reg_loss = cur.new_tensor(0.0)
+
+        # --- 2. 基于 3D 标注的几何一致性损失 ---
+        if (batch is not None and outputs is not None
+                and 'final_matching_matrix' in outputs
+                and 'extrinsic' in batch):
+            try:
+                geo = self._geo_loss(current_preds, batch, outputs, device)
+                if geo is not None:
+                    reg_loss = geo
+            except Exception as exc:
+                _LOG.warning("TemporalConsistencyLoss geo error: %s", exc)
+
         return (cls_loss + reg_loss) * self.loss_weight
+
+    # ------------------------------------------------------------------
+    # 几何一致性损失（向量化核心）
+    # ------------------------------------------------------------------
+    def _geo_loss(self, current_preds, batch, outputs, device):
+        cfg = self.cfg
+        cut_h   = float(getattr(cfg, 'cut_height', 600))
+        img_w   = float(getattr(cfg, 'img_w',     800))
+        img_h   = float(getattr(cfg, 'img_h',     320))
+        ori_w   = float(getattr(cfg, 'ori_img_w', 1920))
+        ori_h   = float(getattr(cfg, 'ori_img_h', 1280))
+        n_off   = int(getattr(cfg,   'num_points', 72))
+        strip   = img_h / (n_off - 1)
+        su      = img_w / ori_w
+        sv      = img_h / (ori_h - cut_h)
+
+        seq_ext = batch['extrinsic']    # [B, T, 4, 4]
+        seq_int = batch['intrinsic']    # [B, T, 3, 3] or [B, 3, 3]
+        if seq_ext.dim() != 4:
+            return None
+
+        # 全 batch 一次性计算 T_rel = E_t^{-1} @ E_{t-1}  (Eq 4-7)
+        E_t1  = seq_ext[:, -2].double()          # [B, 4, 4]
+        E_t   = seq_ext[:, -1].double()          # [B, 4, 4]
+        T_rel = torch.linalg.inv(E_t) @ E_t1    # [B, 4, 4]
+        K_all = (seq_int[:, -1] if seq_int.dim() == 4 else seq_int).double()  # [B, 3, 3]
+
+        matching_matrix = outputs['final_matching_matrix']  # [B, num_priors, max_lanes]
+        seq_xyz   = _unwrap(batch.get('seq_xyz'))
+        seq_track = _unwrap(batch.get('seq_track_id'))
+        seq_vis   = _unwrap(batch.get('seq_visibility'))
+
+        B = current_preds.shape[0]
+        max_lanes = int(getattr(cfg, 'max_lanes', 12))
+
+        track_t_all = torch.full((B, max_lanes), -1, dtype=torch.long, device=device)
+        track_t1_all = torch.full((B, max_lanes), -1, dtype=torch.long, device=device)
+        for bb in range(B):
+            try:
+                tt = seq_track[bb][-1]
+                t1 = seq_track[bb][-2]
+            except (IndexError, TypeError, KeyError):
+                continue
+            if not tt or not t1:
+                continue
+            n = min(len(tt), max_lanes)
+            if n:
+                track_t_all[bb, :n] = torch.as_tensor(tt[:n], device=device, dtype=torch.long)
+            n = min(len(t1), max_lanes)
+            if n:
+                track_t1_all[bb, :n] = torch.as_tensor(t1[:n], device=device, dtype=torch.long)
+
+        idx = matching_matrix.nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return None
+        b, prior_idx, gt_idx = idx[:, 0], idx[:, 1], idx[:, 2]
+
+        ok = gt_idx < max_lanes
+        b, prior_idx, gt_idx = b[ok], prior_idx[ok], gt_idx[ok]
+        if b.numel() == 0:
+            return None
+
+        cur_tid = track_t_all[b, gt_idx]
+        ok = cur_tid >= 0
+        b, prior_idx, gt_idx, cur_tid = b[ok], prior_idx[ok], gt_idx[ok], cur_tid[ok]
+        if b.numel() == 0:
+            return None
+
+        rows = track_t1_all[b]
+        eq = rows == cur_tid.unsqueeze(1)
+        has = eq.any(dim=1)
+        if not has.any():
+            return None
+        b = b[has]
+        prior_idx = prior_idx[has]
+        prev_lane_idx = eq[has].long().argmax(dim=1)
+        M = prior_idx.shape[0]
+        if M == 0:
+            return None
+
+        n_pts_list = []
+        for i in range(M):
+            bi = int(b[i].item())
+            pi = int(prev_lane_idx[i].item())
+            try:
+                xyz_row = seq_xyz[bi][-2][pi]
+                n_pts_list.append(len(xyz_row))
+            except (IndexError, TypeError, KeyError):
+                n_pts_list.append(0)
+        max_N = max(n_pts_list) if n_pts_list else 0
+        if max_N == 0:
+            return None
+
+        pts_pad = torch.zeros(M, 4, max_N, dtype=torch.float64, device=device)
+        vis_pad = torch.zeros(M, max_N, dtype=torch.float32, device=device)
+        pt_mask = torch.zeros(M, max_N, dtype=torch.bool, device=device)
+
+        for i in range(M):
+            n = n_pts_list[i]
+            if n == 0:
+                continue
+            bi = int(b[i].item())
+            pi = int(prev_lane_idx[i].item())
+            try:
+                xyz_t1 = seq_xyz[bi][-2][pi]
+                vis_t1 = seq_vis[bi][-2][pi]
+            except (IndexError, TypeError, KeyError):
+                continue
+            pts_pad[i, :3, :n] = torch.as_tensor(xyz_t1, dtype=torch.float64, device=device).t()
+            pts_pad[i, 3, :n] = 1.0
+            vis_pad[i, :n] = torch.as_tensor(vis_t1, dtype=torch.float32, device=device)
+            pt_mask[i, :n] = True
+
+        T_bn = T_rel[b].double()
+        K_bn = K_all[b].double()
+
+        pts_t = torch.einsum('nij,njk->nik', T_bn, pts_pad)
+        X, Y, Z = pts_t[:, 0], pts_t[:, 1], pts_t[:, 2]
+
+        Z_safe = Z.clamp(min=1e-6)
+        fx, fy = K_bn[:, 0, 0], K_bn[:, 1, 1]
+        cx, cy = K_bn[:, 0, 2], K_bn[:, 1, 2]
+        u = ((X / Z_safe) * fx.unsqueeze(1) + cx.unsqueeze(1)).float() * su
+        v = (((Y / Z_safe) * fy.unsqueeze(1) + cy.unsqueeze(1)) - cut_h).float() * sv
+
+        valid = (
+            pt_mask
+            & (Z > 0)
+            & (u >= 0) & (u < img_w)
+            & (v >= 0) & (v < img_h)
+            & (vis_pad > 0.5)
+        )
+        if not valid.any():
+            return None
+
+        y_idx = ((img_h - v) / strip).clamp(0, n_off - 1)
+        fi = y_idx.long().clamp(0, n_off - 1)
+        ci = (y_idx + 1).long().clamp(0, n_off - 1)
+        frac = (y_idx - fi.float()).clamp(0, 1)
+
+        pred_lanes = current_preds[b, prior_idx]
+        lane_xs = pred_lanes[:, 6 : 6 + n_off] * img_w
+
+        pred_u_floor = lane_xs.gather(1, fi)
+        pred_u_ceil = lane_xs.gather(1, ci)
+        pred_u = pred_u_floor * (1 - frac) + pred_u_ceil * frac
+
+        return F.l1_loss(pred_u[valid], u[valid].detach()) * 10.0
 
 
 class ContMixTemporalBlock(nn.Module):

@@ -70,6 +70,69 @@ def _openlane_metric_per_sample(
     return tp, fp, fn, matched_pred_cats, matched_gt_cats
 
 
+def _compute_lane_category_eval(gt_cats, pred_cats, num_classes):
+    """
+    固定标签空间 [0, num_classes) 的混淆矩阵及每类 TP/FP/FN 与 P/R/F1。
+    仅保留 GT 与预测均在 [0, num_classes) 内的匹配对（与车道线 TP 上的类别统计一致）。
+    """
+    from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+
+    if not gt_cats or not pred_cats or len(gt_cats) != len(pred_cats):
+        return None
+    if not any(c != -1 for c in pred_cats):
+        return None
+
+    gt = np.asarray(gt_cats, dtype=np.int64)
+    pr = np.asarray(pred_cats, dtype=np.int64)
+    mask = (gt >= 0) & (gt < num_classes) & (pr >= 0) & (pr < num_classes)
+    if not np.any(mask):
+        return None
+    gt = gt[mask]
+    pr = pr[mask]
+
+    labels = list(range(num_classes))
+    cm = confusion_matrix(gt, pr, labels=labels)
+
+    per_class = []
+    for k in range(num_classes):
+        tp = int(cm[k, k])
+        fp = int(cm[:, k].sum() - tp)
+        fn = int(cm[k, :].sum() - tp)
+        prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        f1 = float(2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        per_class.append(
+            {
+                "class_id": k,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "precision": prec,
+                "recall": rec,
+                "f1": f1,
+            }
+        )
+
+    p_mac = float(precision_score(gt, pr, average="macro", labels=labels, zero_division=0))
+    r_mac = float(recall_score(gt, pr, average="macro", labels=labels, zero_division=0))
+    f1_mac = float(f1_score(gt, pr, average="macro", labels=labels, zero_division=0))
+    p_wei = float(precision_score(gt, pr, average="weighted", labels=labels, zero_division=0))
+    r_wei = float(recall_score(gt, pr, average="weighted", labels=labels, zero_division=0))
+    f1_wei = float(f1_score(gt, pr, average="weighted", labels=labels, zero_division=0))
+
+    return {
+        "num_classes": num_classes,
+        "confusion_matrix": cm.tolist(),
+        "per_class": per_class,
+        "Cat_Precision_Macro": p_mac,
+        "Cat_Recall_Macro": r_mac,
+        "Cat_F1_Macro": f1_mac,
+        "Cat_Precision_Weighted": p_wei,
+        "Cat_Recall_Weighted": r_wei,
+        "Cat_F1_Weighted": f1_wei,
+    }
+
+
 class OpenLaneEvaluator(DatasetEvaluator):
     """
     OpenLane 数据集的 IoU-based 评估器（与 CULane 同一套 IoU 逻辑）。
@@ -102,6 +165,7 @@ class OpenLaneEvaluator(DatasetEvaluator):
 
         self.ori_img_w = getattr(cfg, "ori_img_w", 1920) if cfg else 1920
         self.ori_img_h = getattr(cfg, "ori_img_h", 1280) if cfg else 1280
+        self.num_lane_categories = int(getattr(cfg, "num_lane_categories", 15)) if cfg else 15
 
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
@@ -213,30 +277,22 @@ class OpenLaneEvaluator(DatasetEvaluator):
                 all_pred_cats.extend(res[3])
                 all_gt_cats.extend(res[4])
 
-        if len(all_pred_cats) > 0 and len(all_gt_cats) > 0 and any(c != -1 for c in all_pred_cats):
-            from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-            def get_cls_metrics(gt_cats, pred_cats):
-                if len(gt_cats) > 0 and len(pred_cats) > 0 and any(c != -1 for c in pred_cats):
-                    p_mac = float(precision_score(gt_cats, pred_cats, average="macro", zero_division=0))
-                    r_mac = float(recall_score(gt_cats, pred_cats, average="macro", zero_division=0))
-                    f1_mac = float(f1_score(gt_cats, pred_cats, average="macro", zero_division=0))
-                    p_wei = float(precision_score(gt_cats, pred_cats, average="weighted", zero_division=0))
-                    r_wei = float(recall_score(gt_cats, pred_cats, average="weighted", zero_division=0))
-                    f1_wei = float(f1_score(gt_cats, pred_cats, average="weighted", zero_division=0))
-                    return p_mac, r_mac, f1_mac, p_wei, r_wei, f1_wei
-                return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-            
-            cat_p, cat_r, cat_f1, p_wei, r_wei, f1_wei = get_cls_metrics(all_gt_cats, all_pred_cats)
-            cm = confusion_matrix(all_gt_cats, all_pred_cats)
-            
-            result["Cat_Precision_Macro"] = cat_p
-            result["Cat_Recall_Macro"] = cat_r
-            result["Cat_F1_Macro"] = cat_f1
-            result["Cat_Precision_Weighted"] = p_wei
-            result["Cat_Recall_Weighted"] = r_wei
-            result["Cat_F1_Weighted"] = f1_wei
-            result["Confusion_Matrix"] = cm.tolist()
-            
+        category_eval = _compute_lane_category_eval(
+            all_gt_cats, all_pred_cats, self.num_lane_categories
+        )
+        if category_eval is not None:
+            result["Cat_Precision_Macro"] = category_eval["Cat_Precision_Macro"]
+            result["Cat_Recall_Macro"] = category_eval["Cat_Recall_Macro"]
+            result["Cat_F1_Macro"] = category_eval["Cat_F1_Macro"]
+            result["Cat_Precision_Weighted"] = category_eval["Cat_Precision_Weighted"]
+            result["Cat_Recall_Weighted"] = category_eval["Cat_Recall_Weighted"]
+            result["Cat_F1_Weighted"] = category_eval["Cat_F1_Weighted"]
+            result["Category_Eval"] = {
+                "num_classes": category_eval["num_classes"],
+                "confusion_matrix": category_eval["confusion_matrix"],
+                "per_class": category_eval["per_class"],
+            }
+
         import glob
         # Note: here we assume the current cfg has data_root
         data_root = getattr(self.cfg, "data_root", "")
@@ -284,24 +340,28 @@ class OpenLaneEvaluator(DatasetEvaluator):
                     s_recall = s_tp / (s_tp + s_fn) if (s_tp + s_fn) > 0 else 0.0
                     s_f1 = 2 * s_precision * s_recall / (s_precision + s_recall) if (s_precision + s_recall) > 0 else 0.0
                     result[f"{scenario_name}_F1"] = s_f1
-                    if len(s_gt_cats) > 0 and 'get_cls_metrics' in locals():
-                        _, _, f1_mac, _, _, f1_wei = get_cls_metrics(s_gt_cats, s_pred_cats)
-                        result[f"{scenario_name}_Cat_F1_Macro"] = f1_mac
-                        result[f"{scenario_name}_Cat_F1_Weighted"] = f1_wei
+                    s_cat = _compute_lane_category_eval(
+                        s_gt_cats, s_pred_cats, self.num_lane_categories
+                    )
+                    if s_cat is not None:
+                        result[f"{scenario_name}_Cat_F1_Macro"] = s_cat["Cat_F1_Macro"]
+                        result[f"{scenario_name}_Cat_F1_Weighted"] = s_cat["Cat_F1_Weighted"]
+                        result[f"{scenario_name}_Category_Eval"] = {
+                            "num_classes": s_cat["num_classes"],
+                            "confusion_matrix": s_cat["confusion_matrix"],
+                            "per_class": s_cat["per_class"],
+                        }
 
         self.logger.info("=== OpenLane Evaluation Results ===")
         for k, v in result.items():
-            if k == "Confusion_Matrix":
-                self.logger.info("  Confusion Matrix:")
-                for row in v:
-                    self.logger.info(f"    {row}")
+            if k == "Category_Eval" or k.endswith("_Category_Eval"):
+                self.logger.info(f"  {k}: num_classes={v.get('num_classes')}, per_class entries={len(v.get('per_class', []))}")
+            elif isinstance(v, float):
+                self.logger.info(f"  {k}: {v:.4f}")
+            elif isinstance(v, (list, dict)) and len(str(v)) > 200:
+                self.logger.info(f"  {k}: <omitted, size {len(v)}>")
             else:
-                self.logger.info(
-                    f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}"
-                )
-
-        if "Confusion_Matrix" in result:
-            del result["Confusion_Matrix"]
+                self.logger.info(f"  {k}: {v}")
 
         if self.output_dir:
             save_path = osp.join(self.output_dir, "openlane_eval_results.json")

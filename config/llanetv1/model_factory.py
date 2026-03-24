@@ -20,6 +20,19 @@ def _get_mobilenet_channels(backbone_name):
     return channel_map.get(backbone_name, [80, 160, 960])
 
 
+def _get_efficientnet_channels(backbone_name):
+    # timm features_only=True, out_indices=[2, 3, 4] 对应 stride 8/16/32 的输出通道
+    channel_map = {
+        'efficientnet_b0': [40, 112, 320],
+        'efficientnet_b1': [40, 112, 320],
+        'efficientnet_b2': [48, 120, 352],
+        'efficientnet_b3': [48, 136, 384],
+        'tf_efficientnet_lite0': [32, 96, 320],
+        'tf_efficientnet_lite1': [32, 96, 320],
+    }
+    return channel_map.get(backbone_name, [40, 112, 320])
+
+
 def create_llanetv1_model(cfg):
     feature_dim = getattr(cfg, 'neck_out_channels', cfg.featuremap_out_channel)
     hidden_dim = getattr(cfg, 'fc_hidden_dim', feature_dim)
@@ -34,6 +47,14 @@ def create_llanetv1_model(cfg):
             out_indices=[2, 3, 4],
         )
         in_channels = _get_mobilenet_channels(backbone_name)
+    elif backbone_type == 'efficientnet':
+        backbone = L(TimmMobileNetV4Wrapper)(
+            model_name=backbone_name,
+            pretrained=getattr(cfg, 'use_pretrained_backbone', True),
+            features_only=True,
+            out_indices=[2, 3, 4],
+        )
+        in_channels = _get_efficientnet_channels(backbone_name)
     else:
         backbone = L(ResNetWrapper)(
             resnet=backbone_name,

@@ -3,6 +3,7 @@ import numpy as np
 import pprint
 import sys
 from collections.abc import Mapping
+from numbers import Number
 
 
 def print_csv_format(results):
@@ -16,13 +17,18 @@ def print_csv_format(results):
     """
     assert isinstance(results, Mapping) or not len(results), results
     logger = logging.getLogger(__name__)
+    def _fmt_value(v):
+        if isinstance(v, Number):
+            return "{0:.4f}".format(float(v))
+        # e.g. list/dict for category details: keep printable string, avoid crash
+        return str(v)
     for task, res in results.items():
         if isinstance(res, Mapping):
             # Don't print "AP-category" metrics since they are usually not tracked.
             important_res = [(k, v) for k, v in res.items() if "-" not in k]
             logger.info("copypaste: Task: {}".format(task))
             logger.info("copypaste: " + ",".join([k[0] for k in important_res]))
-            logger.info("copypaste: " + ",".join(["{0:.4f}".format(k[1]) for k in important_res]))
+            logger.info("copypaste: " + ",".join([_fmt_value(k[1]) for k in important_res]))
         else:
             logger.info(f"copypaste: {task}={res}")
 

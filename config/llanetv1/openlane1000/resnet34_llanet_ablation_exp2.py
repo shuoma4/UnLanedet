@@ -1,0 +1,21 @@
+# Exp2: 逆频率权重✓, 原型头×, SupCon×
+# 在 Exp1 基础上加入逆频率权重 CE Loss
+from .common import build_config
+
+model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
+    run_name="resnet34_llanet_ablation_exp2",
+    backbone_type="resnet34",
+    backbone_name="resnet34",
+    neck_type="GSAFPN",
+    enable_category_head=True,
+    category_head_type="linear",
+    use_data_driven_priors=False,
+    assign_method="CLRNet",
+    enable_global_semantic=True,
+    batch_size=24,
+    epochs=20,
+    use_category_weights=True,
+    enable_supcon=False,
+)
+
+param_config.scm_kernel_size = 9

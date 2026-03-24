@@ -184,9 +184,14 @@ def main():
         iou = round(float(s["iou_threshold"]), 2)
         w = int(s["width"])
         if (iou, w) in completed_settings:
-            print(f"Skipping already processed IoU={iou}, Width={w}")
+            msg = f"[PR-EVAL] Skipping already processed IoU={iou}, Width={w}"
+            print(msg)
+            logger.info(msg)
             continue
-            
+
+        msg = f"[PR-EVAL] Evaluating IoU={iou}, Width={w}..."
+        print(msg)
+        logger.info(msg)
         res_row = {"IoU_Threshold": iou, "Width": w}
         
         if is_culane:
@@ -234,13 +239,21 @@ def main():
             res_row["Total_Recall"] = res.get("Recall", 0)
             res_row["Cat_F1_Macro"] = res.get("Cat_F1_Macro", 0)
             res_row["Cat_F1_Weighted"] = res.get("Cat_F1_Weighted", 0)
-            
+            if "Category_Eval" in res:
+                res_row["Category_Eval"] = res["Category_Eval"]
+
             # Sub scenarios. Ensure OpenLaneEvaluator has evaluated sub-scenarios!
             for scenario in ["updown", "curve", "extreme_weather", "night", "intersection", "merge_split"]:
                 if f"{scenario}_F1" in res:
                     res_row[f"{scenario}_F1"] = res.get(f"{scenario}_F1", 0)
                     res_row[f"{scenario}_Cat_F1_Macro"] = res.get(f"{scenario}_Cat_F1_Macro", 0)
                     res_row[f"{scenario}_Cat_F1_Weighted"] = res.get(f"{scenario}_Cat_F1_Weighted", 0)
+                if f"{scenario}_Category_Eval" in res:
+                    res_row[f"{scenario}_Category_Eval"] = res[f"{scenario}_Category_Eval"]
+            # 覆盖 evaluator 中任意其它分场景（文件名与上述列表不一致时）
+            for k, v in res.items():
+                if k.endswith("_Category_Eval") and k not in res_row:
+                    res_row[k] = v
                 
         all_results.append(res_row)
 

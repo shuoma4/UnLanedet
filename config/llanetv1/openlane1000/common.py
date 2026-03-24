@@ -84,6 +84,8 @@ def build_config(
     deploy_cfg=None,
     epochs=15,
     batch_size=BATCH_SIZE,
+    use_category_weights=True,
+    enable_supcon=False,
 ):
     param_config = OmegaConf.create()
     param_config.backbone_type = backbone_type
@@ -97,6 +99,8 @@ def build_config(
     param_config.category_scale_factor = 20.0
     param_config.use_data_driven_priors = use_data_driven_priors
     param_config.assign_method = assign_method
+    param_config.use_category_weights = use_category_weights
+    param_config.enable_supcon = enable_supcon
     param_config.enable_temporal_model = enable_temporal_model
     param_config.temporal_loss_weight = temporal_loss_weight
     param_config.distill_cfg = distill_cfg or dict(enable=False)

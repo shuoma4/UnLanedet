@@ -41,6 +41,7 @@ class LLANetV1Head(FCLRHead):
         self.category_loss_weight = float(getattr(cfg, 'category_loss_weight', 1.0))
         self.category_scale_factor = float(getattr(cfg, 'category_scale_factor', 20.0))
         self.enable_supcon = bool(getattr(cfg, 'enable_supcon', False))
+        self.use_category_weights = bool(getattr(cfg, 'use_category_weights', True))
         self.lambda_con = float(getattr(cfg, 'lambda_con', 0.5)) if self.enable_supcon else 0.0
         self.tau_con = float(getattr(cfg, 'tau_con', 0.07))
         self.combined_alpha = float(getattr(cfg, 'combined_alpha', 0.5))
@@ -87,7 +88,10 @@ class LLANetV1Head(FCLRHead):
             elif len(category_weights) > self.num_lane_categories:
                 category_weights = category_weights[: self.num_lane_categories]
             self.register_buffer('category_weights_buf', category_weights)
-            self.category_criterion = nn.CrossEntropyLoss(weight=self.category_weights_buf, reduction='sum')
+            if self.use_category_weights:
+                self.category_criterion = nn.CrossEntropyLoss(weight=self.category_weights_buf, reduction='sum')
+            else:
+                self.category_criterion = nn.CrossEntropyLoss(reduction='sum')
 
     def _init_prior_embeddings(self):
         self.prior_embeddings = nn.Embedding(self.num_priors, 3)
@@ -144,6 +148,9 @@ class LLANetV1Head(FCLRHead):
         return logits.reshape(batch_size, num_priors, -1), z.reshape(batch_size, num_priors, -1)
 
     def forward(self, x, **kwargs):
+        # 仅 LLANetV1 在「时序一致性」辅助前向中传入 predictions_only=True（见 model.py）；
+        # 其它训练/推理请勿传该参数，行为与历史版本一致（默认算 seg + category）。
+        predictions_only = bool(kwargs.pop("predictions_only", False))
         batch_features = list(x[len(x) - self.refine_layers :])
         batch_features.reverse()
         batch_size = batch_features[-1].shape[0]
@@ -209,7 +216,8 @@ class LLANetV1Head(FCLRHead):
             'distill_cls_logits': predictions_lists[-1][..., :2],
         }
 
-        if self.training:
+        # 仅算车道线预测（供时序辅助前向等）：跳过分割头与类别头，省一次大量卷积/全连接
+        if self.training and not predictions_only:
             seg_features = torch.cat(
                 [
                     F.interpolate(
@@ -225,7 +233,7 @@ class LLANetV1Head(FCLRHead):
             seg = self.seg_decoder(seg_features)
             output.update(**seg)
 
-        if self.enable_lane_category and final_flat_features is not None:
+        if self.enable_lane_category and final_flat_features is not None and not predictions_only:
             output['category'], output['category_z'] = self._category_forward(final_flat_features, batch_size, num_priors)
 
         output['distill_features'] = (
@@ -354,7 +362,7 @@ class LLANetV1Head(FCLRHead):
                 ) / max(int(len(batch_idx)), 1)
                 
                 L_con = torch.tensor(0.0, device=device)
-                if (self.category_head_type == 'combined' or (self.category_head_type == 'prototype' and self.enable_supcon)) and len(batch_idx) > 1:
+                if self.enable_supcon and len(batch_idx) > 1:
                     z_norm = output['category_z'][batch_idx, prior_idx] # (M, D)
                     M = z_norm.size(0)
                     sim_matrix = torch.matmul(z_norm, z_norm.T) / self.tau_con
@@ -375,10 +383,8 @@ class LLANetV1Head(FCLRHead):
                     if valid.sum() > 0:
                         L_con = loss_con.mean()
 
-                    if self.category_head_type == 'combined':
-                        category_loss += L_type + self.con_loss_weight * L_con
-                    else:
-                        category_loss += L_type + self.lambda_con * L_con
+                    con_w = self.con_loss_weight if self.category_head_type == 'combined' else self.lambda_con
+                    category_loss += L_type + con_w * L_con
                 else:
                     category_loss += L_type
 

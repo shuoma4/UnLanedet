@@ -13,6 +13,9 @@ from .distill import LaneDistillationLoss
 
 LOGGER = logging.getLogger(__name__)
 
+# 将多帧拼成一次 backbone 前向可加速，但峰值显存 ∝ B*T；超过阈值则逐帧前向以防 OOM（B=6,T=3→18）
+_MAX_STACKED_SEQUENCE_BT = 18
+
 
 def _maybe_get(cfg, key, default=None):
     if cfg is None:
@@ -83,13 +86,38 @@ class LLANetV1(nn.Module):
             features = self.neck(features)
         return features
 
+    def _forward_sequence_stacked(self, img):
+        """将 T 帧拼成 B*T 一次过 backbone+neck，再拆回各帧（避免 T 次重复卷积）。"""
+        if img.dim() != 5:
+            raise ValueError("expected 5D img (B,T,C,H,W)")
+        B, T, C, H, W = img.shape
+        x = img.reshape(B * T, C, H, W)
+        feat_bt = self.backbone(x)
+        if self.neck is not None:
+            feat_bt = self.neck(feat_bt)
+        if not isinstance(feat_bt, (list, tuple)):
+            feat_bt = [feat_bt]
+        sequence_features = []
+        for t in range(T):
+            frame_feats = []
+            for f in feat_bt:
+                _, Cc, fh, fw = f.shape
+                f4 = f.view(B, T, Cc, fh, fw)
+                frame_feats.append(f4[:, t].contiguous())
+            sequence_features.append(frame_feats)
+        return sequence_features
+
     def extract_features(self, batch):
         if isinstance(batch, dict):
             img = batch['img']
         else:
             img = batch
         if img.dim() == 5:
-            sequence_features = [self._forward_single_image(img[:, t]) for t in range(img.shape[1])]
+            B, T = img.shape[0], img.shape[1]
+            if B * T <= _MAX_STACKED_SEQUENCE_BT:
+                sequence_features = self._forward_sequence_stacked(img)
+            else:
+                sequence_features = [self._forward_single_image(img[:, t]) for t in range(T)]
             if self.temporal_model is not None:
                 aggregated_features, _ = self.temporal_model(sequence_features)
             else:
@@ -100,7 +128,11 @@ class LLANetV1(nn.Module):
     def forward_features_and_aux(self, batch):
         img = batch['img']
         if img.dim() == 5:
-            sequence_features = [self._forward_single_image(img[:, t]) for t in range(img.shape[1])]
+            B, T = img.shape[0], img.shape[1]
+            if B * T <= _MAX_STACKED_SEQUENCE_BT:
+                sequence_features = self._forward_sequence_stacked(img)
+            else:
+                sequence_features = [self._forward_single_image(img[:, t]) for t in range(T)]
             if self.temporal_model is not None:
                 features, temporal_aux = self.temporal_model(sequence_features)
             else:
@@ -127,8 +159,13 @@ class LLANetV1(nn.Module):
             sequence_features = temporal_aux.get('sequence_features')
             if batch['img'].dim() == 5 and sequence_features is not None and len(sequence_features) >= 2:
                 if self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
+                    # 仅此时序分支：head 只产出 predictions_lists 供 L_t，不传 predictions_only 则与其它 LLANetV1 训练完全一致
                     with torch.no_grad():
-                        prev_outputs = self.head(sequence_features[-2], batch=batch)
+                        prev_outputs = self.head(
+                            sequence_features[-2],
+                            batch=batch,
+                            predictions_only=True,
+                        )
                     preds = outputs.get('predictions_lists', [])
                     prev_preds = prev_outputs.get('predictions_lists', [])
                     if len(preds) > 0 and len(prev_preds) > 0:
