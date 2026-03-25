@@ -527,6 +527,9 @@ class AMPTrainer(SimpleTrainer):
 
         self.after_backward()
 
+        self.grad_scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=35.0)
+
         if self.async_write_metrics:
             # write metrics asynchronically
             self.concurrent_executor.submit(

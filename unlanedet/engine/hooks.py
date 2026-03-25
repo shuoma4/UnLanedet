@@ -1,5 +1,6 @@
 import datetime
 import itertools
+import json
 import logging
 import math
 import operator
@@ -265,12 +266,104 @@ class BestCheckpointer(HookBase):
         self._file_prefix = file_prefix
         self.best_metric = None
         self.best_iter = None
+        self._state_file = None
+
+    def before_train(self):
+        # Persist best metric across resume runs.
+        save_dir = getattr(self._checkpointer, "save_dir", "")
+        if save_dir:
+            self._state_file = os.path.join(save_dir, f"{self._file_prefix}_state.json")
+            self._load_best_state()
+
+    def _load_best_state(self):
+        if not self._state_file:
+            return
+
+        # 1) Prefer explicit best-state file.
+        if os.path.exists(self._state_file):
+            try:
+                with open(self._state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                metric_name = data.get("metric_name")
+                metric = data.get("best_metric")
+                iteration = data.get("best_iter")
+                if metric_name == self._val_metric and metric is not None and iteration is not None:
+                    self.best_metric = float(metric)
+                    self.best_iter = int(iteration)
+                    self._logger.info(
+                        "Loaded best metric state: %s=%.5f @ iteration %d",
+                        self._val_metric,
+                        self.best_metric,
+                        self.best_iter,
+                    )
+                    return
+            except Exception as exc:
+                self._logger.warning("Failed to load best metric state file: %s", exc)
+
+        # 2) Backward-compatible bootstrap: recover best from metrics.json.
+        metrics_file = os.path.join(os.path.dirname(self._state_file), "metrics.json")
+        if not os.path.exists(metrics_file):
+            return
+
+        best_val = None
+        best_iter = None
+        try:
+            with open(metrics_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if self._val_metric not in rec:
+                        continue
+                    val = rec.get(self._val_metric)
+                    it = rec.get("iteration", -1)
+                    if val is None:
+                        continue
+                    val = float(val)
+                    if math.isnan(val) or math.isinf(val):
+                        continue
+                    if best_val is None or self._compare(val, best_val):
+                        best_val = val
+                        best_iter = int(it)
+        except Exception as exc:
+            self._logger.warning("Failed to parse metrics.json for best metric: %s", exc)
+            return
+
+        if best_val is not None:
+            self.best_metric = best_val
+            self.best_iter = best_iter
+            self._persist_best_state()
+            self._logger.info(
+                "Recovered best metric from metrics.json: %s=%.5f @ iteration %d",
+                self._val_metric,
+                self.best_metric,
+                self.best_iter,
+            )
+
+    def _persist_best_state(self):
+        if not self._state_file:
+            return
+        try:
+            payload = {
+                "metric_name": self._val_metric,
+                "best_metric": float(self.best_metric),
+                "best_iter": int(self.best_iter),
+            }
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception as exc:
+            self._logger.warning("Failed to persist best metric state: %s", exc)
 
     def _update_best(self, val, iteration):
         if math.isnan(val) or math.isinf(val):
             return False
         self.best_metric = val
         self.best_iter = iteration
+        self._persist_best_state()
         return True
 
     def _best_checking(self):
@@ -552,15 +645,22 @@ class EvalHook(HookBase):
             ), "Eval function must return a dict. Got {} instead.".format(results)
 
             flattened_results = flatten_results_dict(results)
+            scalar_results = {}
+            skipped_keys = []
             for k, v in flattened_results.items():
                 try:
-                    v = float(v)
-                except Exception as e:
-                    raise ValueError(
-                        "[EvalHook] eval_function should return a nested dict of float. "
-                        "Got '{}: {}' instead.".format(k, v)
-                    ) from e
-            self.trainer.storage.put_scalars(**flattened_results, smoothing_hint=False)
+                    scalar_results[k] = float(v)
+                except Exception:
+                    skipped_keys.append(k)
+
+            if skipped_keys:
+                logging.getLogger(__name__).warning(
+                    "[EvalHook] Skip non-scalar eval metrics: %s",
+                    ", ".join(skipped_keys),
+                )
+
+            if scalar_results:
+                self.trainer.storage.put_scalars(**scalar_results, smoothing_hint=False)
 
         # Evaluation may take different time among workers.
         # A barrier make them start the next iteration together.
