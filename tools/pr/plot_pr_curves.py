@@ -1,7 +1,7 @@
 import os
 import json
 import re
-
+from config.matplotlib_font import *
 import matplotlib.pyplot as plt
 
 from unlanedet.data.openlane import LANE_CATEGORIES
@@ -19,16 +19,15 @@ def _infer_per_class_plot_ids(data, category_key="Category_Eval"):
         return ids if ids else DEFAULT_PER_CLASS_PLOT_IDS
     return DEFAULT_PER_CLASS_PLOT_IDS
 
+
 # ====== 配置区 ======
 # 结果目录
-PR_RESULT_DIR = "output/llanetv1/openlane1000/category/clrnet_linear_resnet34/pr_curves"
+PR_RESULT_DIR = (
+    "output/llanetv1/openlane1000/category/clrnet_combined_resnet34/pr_curves"
+)
 IMG_DIR = os.path.join(PR_RESULT_DIR, "image")
 os.makedirs(IMG_DIR, exist_ok=True)
 
-# 字体设置
-plt.rcParams["font.family"] = "AR PL UMing CN"
-plt.rcParams["font.sans-serif"] = ["AR PL UMing CN", "SimHei"]
-plt.rcParams["font.serif"] = ["Times New Roman"]
 
 # 读取数据
 with open(os.path.join(PR_RESULT_DIR, "pr_metrics.json"), "r") as f:
@@ -186,6 +185,7 @@ def plot_overall_cat_pr_curves():
     plt.savefig(os.path.join(IMG_DIR, "overall_cat_pr_curve_by_width.png"), dpi=600)
     plt.close()
 
+
 # 6. 分场景类别PR曲线（宏/加权平均）
 def plot_scene_cat_pr_curves():
     # 自动检测所有分场景名
@@ -213,7 +213,9 @@ def plot_scene_cat_pr_curves():
             plt.plot(ious, weighted, label="Cat_F1_Weighted", marker="s")
         plt.xlabel("IoU 阈值", fontname="AR PL UMing CN")
         plt.ylabel("F1", fontname="AR PL UMing CN")
-        plt.title(f"{scene}分场景类别PR曲线（随IoU变化, Width=30）", fontname="AR PL UMing CN")
+        plt.title(
+            f"{scene}分场景类别PR曲线（随IoU变化, Width=30）", fontname="AR PL UMing CN"
+        )
         plt.legend()
         plt.grid(True)
         plt.savefig(os.path.join(IMG_DIR, f"{scene}_cat_pr_curve_by_iou.png"), dpi=600)
@@ -233,14 +235,22 @@ def plot_scene_cat_pr_curves():
         if has_macro:
             plt.plot(sorted_widths, sorted_macro, label="Cat_F1_Macro", marker="o")
         if has_weighted:
-            plt.plot(sorted_widths, sorted_weighted, label="Cat_F1_Weighted", marker="s")
+            plt.plot(
+                sorted_widths, sorted_weighted, label="Cat_F1_Weighted", marker="s"
+            )
         plt.xlabel("扩展宽度", fontname="AR PL UMing CN")
         plt.ylabel("F1", fontname="AR PL UMing CN")
-        plt.title(f"{scene}分场景类别PR曲线（随Width变化, IoU=0.5）", fontname="AR PL UMing CN")
+        plt.title(
+            f"{scene}分场景类别PR曲线（随Width变化, IoU=0.5）",
+            fontname="AR PL UMing CN",
+        )
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(IMG_DIR, f"{scene}_cat_pr_curve_by_width.png"), dpi=600)
+        plt.savefig(
+            os.path.join(IMG_DIR, f"{scene}_cat_pr_curve_by_width.png"), dpi=600
+        )
         plt.close()
+
 
 # 7. 分场景十四类车道线类别PR曲线（宏/加权平均，保存到 image/category/{scene}/）
 def plot_scene_category14_cat_pr_curves():
@@ -272,10 +282,15 @@ def plot_scene_category14_cat_pr_curves():
             plt.plot(ious, weighted, label="wF1 (Cat_F1_Weighted)", marker="s")
         plt.xlabel("IoU 阈值", fontname="AR PL UMing CN")
         plt.ylabel("F1", fontname="AR PL UMing CN")
-        plt.title(f"{scene} 14类车道线类别PR曲线（随IoU变化, Width=30）", fontname="AR PL UMing CN")
+        plt.title(
+            f"{scene} 14类车道线类别PR曲线（随IoU变化, Width=30）",
+            fontname="AR PL UMing CN",
+        )
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(scene_img_dir, f"{scene}_cat14_pr_curve_by_iou.png"), dpi=600)
+        plt.savefig(
+            os.path.join(scene_img_dir, f"{scene}_cat14_pr_curve_by_iou.png"), dpi=600
+        )
         plt.close()
         # Width sweep
         widths, macro, weighted = [], [], []
@@ -290,15 +305,27 @@ def plot_scene_category14_cat_pr_curves():
         sorted_widths, sorted_macro, sorted_weighted = zip(*pairs)
         plt.figure()
         if has_macro:
-            plt.plot(sorted_widths, sorted_macro, label="mF1 (Cat_F1_Macro)", marker="o")
+            plt.plot(
+                sorted_widths, sorted_macro, label="mF1 (Cat_F1_Macro)", marker="o"
+            )
         if has_weighted:
-            plt.plot(sorted_widths, sorted_weighted, label="wF1 (Cat_F1_Weighted)", marker="s")
+            plt.plot(
+                sorted_widths,
+                sorted_weighted,
+                label="wF1 (Cat_F1_Weighted)",
+                marker="s",
+            )
         plt.xlabel("扩展宽度", fontname="AR PL UMing CN")
         plt.ylabel("F1", fontname="AR PL UMing CN")
-        plt.title(f"{scene} 14类车道线类别PR曲线（随Width变化, IoU=0.5）", fontname="AR PL UMing CN")
+        plt.title(
+            f"{scene} 14类车道线类别PR曲线（随Width变化, IoU=0.5）",
+            fontname="AR PL UMing CN",
+        )
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(scene_img_dir, f"{scene}_cat14_pr_curve_by_width.png"), dpi=600)
+        plt.savefig(
+            os.path.join(scene_img_dir, f"{scene}_cat14_pr_curve_by_width.png"), dpi=600
+        )
         plt.close()
 
 
@@ -363,12 +390,21 @@ def _plot_per_class_bundle(
     by_f = reorder(by_f)
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    for ax, series, ylab in zip(axes, (by_r, by_p, by_f), ("Recall", "Precision", "F1")):
+    for ax, series, ylab in zip(
+        axes, (by_r, by_p, by_f), ("Recall", "Precision", "F1")
+    ):
         for c in class_ids:
             ys = series[c]
             if not ys:
                 continue
-            ax.plot(xs_sorted, ys, label=_class_label(c), marker="o", markersize=2, linewidth=1)
+            ax.plot(
+                xs_sorted,
+                ys,
+                label=_class_label(c),
+                marker="o",
+                markersize=2,
+                linewidth=1,
+            )
         ax.set_xlabel(xlabel, fontname="AR PL UMing CN")
         ax.set_ylabel(ylab, fontname="AR PL UMing CN")
         ax.set_title(f"{title_prefix} — {ylab}", fontname="AR PL UMing CN")

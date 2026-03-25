@@ -1,5 +1,6 @@
 import importlib
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -171,15 +172,24 @@ class LLANetV1(nn.Module):
                     if len(preds) > 0 and len(prev_preds) > 0:
                         current_preds = preds[-1]
                         previous_preds = prev_preds[-1]
-                        real_temporal_loss = self.temporal_model.temporal_loss(
-                            current_preds, 
-                            previous_preds, 
-                            batch, 
-                            outputs=outputs,
-                            assigner=getattr(self.head, 'assigner', None)
+                        _dev = "cuda" if current_preds.is_cuda else "cpu"
+                        _amp_off = (
+                            torch.amp.autocast(device_type=_dev, enabled=False)
+                            if current_preds.is_cuda
+                            else nullcontext()
                         )
+                        with _amp_off:
+                            real_temporal_loss = self.temporal_model.temporal_loss(
+                                current_preds,
+                                previous_preds,
+                                batch,
+                                outputs=outputs,
+                                assigner=getattr(self.head, 'assigner', None),
+                            )
                         if real_temporal_loss is not None:
-                            losses['temporal_consistency_loss'] = real_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
+                            losses['temporal_consistency_loss'] = real_temporal_loss * float(
+                                _maybe_get(self.cfg, 'temporal_loss_weight', 0.5)
+                            )
 
             # 兼容模式B：当 dataloader 仅提供 4D batch 时（非 5D video），使用批次内平移前一个样本假装作为"上一帧"对齐。
             if batch['img'].dim() == 4 and self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
@@ -189,7 +199,16 @@ class LLANetV1(nn.Module):
                     # We cannot just roll the tensor over the batch and call small difference
                     # because the coordinates would be slightly different
                     previous_preds = current_preds.roll(shifts=1, dims=0)
-                    pseudo_temporal_loss = self.temporal_model.temporal_loss(current_preds, previous_preds, batch)
+                    _dev = "cuda" if current_preds.is_cuda else "cpu"
+                    _amp_off = (
+                        torch.amp.autocast(device_type=_dev, enabled=False)
+                        if current_preds.is_cuda
+                        else nullcontext()
+                    )
+                    with _amp_off:
+                        pseudo_temporal_loss = self.temporal_model.temporal_loss(
+                            current_preds, previous_preds, batch
+                        )
                     if pseudo_temporal_loss is not None:
                         # use a proper scale since we are comparing totally different frames in the batch in Mode B
                         losses['temporal_consistency_loss'] = pseudo_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))

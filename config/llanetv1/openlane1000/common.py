@@ -189,7 +189,7 @@ def build_config(
     dataloader.train.dataset.processes = train_process
     dataloader.train.dataset.cut_height = CUT_HEIGHT
     dataloader.train.dataset.cfg = param_config
-    dataloader.train.total_batch_size = BATCH_SIZE
+    dataloader.train.total_batch_size = batch_size
     dataloader.train.num_workers = 4
     dataloader.train.persistent_workers = True
     dataloader.train.pin_memory = True
@@ -199,7 +199,7 @@ def build_config(
     dataloader.test.dataset.processes = val_process
     dataloader.test.dataset.cut_height = CUT_HEIGHT
     dataloader.test.dataset.cfg = param_config
-    dataloader.test.total_batch_size = BATCH_SIZE
+    dataloader.test.total_batch_size = batch_size
     dataloader.test.num_workers = 4
 
     dataloader.evaluator.cfg = param_config

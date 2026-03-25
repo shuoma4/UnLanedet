@@ -37,36 +37,65 @@ class TemporalConsistencyLoss(nn.Module):
             return torch.tensor(0.0, device='cpu')
 
         device = current_preds.device
-
-        # --- 1. 向量化的 anchor-level 平滑约束（fallback） ---
+        # AMP(fp16) 下对整段纵向坐标做 smooth_l1 易在反传中炸 Linear(Addmm) 梯度；全程用 fp32 计算
         min_p = min(current_preds.shape[1], previous_preds.shape[1])
-        cur = current_preds[:, :min_p]
-        prv = previous_preds[:, :min_p].detach()
+        cur = current_preds[:, :min_p].float()
+        prv = previous_preds[:, :min_p].detach().float()
 
-        cls_loss = F.mse_loss(
-            F.softmax(cur[..., :2], dim=-1),
-            F.softmax(prv[..., :2], dim=-1),
-        ) * 5.0
+        cls_loss = cur.new_tensor(0.0)
+        reg_loss = cur.new_tensor(0.0)
+        used_matched = False
 
-        fg = (F.softmax(prv[..., :2], dim=-1)[..., 1] > 0.1).float()
-        if fg.sum() > 0:
-            rd = F.smooth_l1_loss(cur[..., 2:6], prv[..., 2:6], reduction='none')
-            reg_loss = (rd.mean(-1) * fg).sum() / (fg.sum() + 1e-5) * 5.0
-        else:
-            reg_loss = cur.new_tensor(0.0)
+        # --- 1. 匹配上的 positive anchor：避免对全体 prior 做 softmax-MSE（背景占满巨量 anchor，差分被平均到≈0） ---
+        if outputs is not None and 'final_matching_matrix' in outputs:
+            mm = outputs['final_matching_matrix']
+            if mm.device != cur.device:
+                mm = mm.to(cur.device)
+            idx = mm.nonzero(as_tuple=False)
+            if idx.numel() > 0:
+                b_all, p_all = idx[:, 0], idx[:, 1]
+                bp = torch.stack([b_all, p_all], dim=1)
+                uniq = torch.unique(bp, dim=0)
+                bu, pu = uniq[:, 0], uniq[:, 1]
+                # logit 级 smooth_l1：对未饱和的正负样本都比 softmax-MSE 敏感
+                cls_loss = F.smooth_l1_loss(cur[bu, pu, :2], prv[bu, pu, :2])
+                reg_loss = F.smooth_l1_loss(cur[bu, pu, 2:6], prv[bu, pu, 2:6])
+                n_off = int(getattr(self.cfg, 'num_points', 72) if self.cfg else 72)
+                end = 6 + n_off
+                if cur.shape[-1] >= end:
+                    # 72 维采样横坐标对总梯度的贡献远大于 2:6；单独降权抑制偶发梯度爆炸
+                    reg_loss = reg_loss + 0.2 * F.smooth_l1_loss(
+                        cur[bu, pu, 6:end], prv[bu, pu, 6:end]
+                    )
+                used_matched = True
 
-        # --- 2. 基于 3D 标注的几何一致性损失 ---
+        # --- 2. 无匹配信息时的 fallback：在「当前或上一帧任一视为前景」的 prior 上约束 ---
+        if not used_matched:
+            p_cur = F.softmax(cur[..., :2], dim=-1)[..., 1]
+            p_prv = F.softmax(prv[..., :2], dim=-1)[..., 1]
+            fg = ((p_cur > 0.05) | (p_prv > 0.05)).float()
+            if fg.sum() > 0:
+                cls_l1 = F.smooth_l1_loss(cur[..., :2], prv[..., :2], reduction='none').mean(2)
+                cls_loss = (cls_l1 * fg).sum() / (fg.sum() + 1e-5)
+                rd = F.smooth_l1_loss(cur[..., 2:6], prv[..., 2:6], reduction='none').mean(2)
+                reg_loss = (rd * fg).sum() / (fg.sum() + 1e-5)
+
+        # --- 3. 几何分支：与 anchor 级 reg 相加，而不是替换（避免 geo==None 时只剩过小的 cls） ---
         if (batch is not None and outputs is not None
                 and 'final_matching_matrix' in outputs
                 and 'extrinsic' in batch):
             try:
                 geo = self._geo_loss(current_preds, batch, outputs, device)
                 if geo is not None:
-                    reg_loss = geo
+                    reg_loss = reg_loss + geo
             except Exception as exc:
                 _LOG.warning("TemporalConsistencyLoss geo error: %s", exc)
 
-        return (cls_loss + reg_loss) * self.loss_weight
+        total = (cls_loss + reg_loss) * self.loss_weight
+        if not torch.isfinite(total):
+            _LOG.warning("TemporalConsistencyLoss: non-finite total, using 0 for this step")
+            return current_preds.new_zeros((), device=device, dtype=torch.float32)
+        return total
 
     # ------------------------------------------------------------------
     # 几何一致性损失（向量化核心）
@@ -207,14 +236,14 @@ class TemporalConsistencyLoss(nn.Module):
         ci = (y_idx + 1).long().clamp(0, n_off - 1)
         frac = (y_idx - fi.float()).clamp(0, 1)
 
-        pred_lanes = current_preds[b, prior_idx]
+        pred_lanes = current_preds[b, prior_idx].float()
         lane_xs = pred_lanes[:, 6 : 6 + n_off] * img_w
 
         pred_u_floor = lane_xs.gather(1, fi)
         pred_u_ceil = lane_xs.gather(1, ci)
         pred_u = pred_u_floor * (1 - frac) + pred_u_ceil * frac
 
-        return F.l1_loss(pred_u[valid], u[valid].detach()) * 10.0
+        return F.l1_loss(pred_u[valid], u[valid].detach()) * 5.0
 
 
 class ContMixTemporalBlock(nn.Module):

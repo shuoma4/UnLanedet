@@ -111,3 +111,109 @@ class TemporalFusionWrapper(nn.Module):
             enhanced_levels.append(f_enhanced)
 
         return enhanced_levels, {'temporal_consistency_loss': None}
+
+
+class KalmanTemporalWrapper(nn.Module):
+    """Feature-space Kalman-style temporal filtering baseline.
+
+    This is a lightweight approximation of industrial temporal smoothing:
+    - state prediction: x_{t|t-1} = x_{t-1}
+    - state update:     x_t = x_{t|t-1} + K * (z_t - x_{t|t-1})
+    where K is a learnable per-level scalar in (0, 1).
+    """
+
+    def __init__(self, in_channels=64, num_levels=3, cfg=None):
+        super().__init__()
+        self.num_levels = num_levels
+        # Initialize around 0.6 to make current observation slightly dominant.
+        self.kalman_logit = nn.Parameter(torch.full((num_levels,), 0.4))
+        from .temporal import TemporalConsistencyLoss
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+
+    def forward(self, sequence_features):
+        T = len(sequence_features)
+        if T == 0:
+            return [], {'temporal_consistency_loss': None}
+
+        gains = torch.sigmoid(self.kalman_logit)
+        enhanced_levels = []
+        for level in range(self.num_levels):
+            x = sequence_features[0][level]
+            k = gains[level].view(1, 1, 1, 1)
+            for t in range(1, T):
+                z_t = sequence_features[t][level]
+                x = x + k * (z_t - x)
+            enhanced_levels.append(x)
+        return enhanced_levels, {'temporal_consistency_loss': None}
+
+
+class ConcatFusionWrapper(nn.Module):
+    """Late fusion baseline by direct channel concatenation of multi-frame features."""
+
+    def __init__(self, in_channels=64, num_levels=3, seq_len=3, cfg=None):
+        super().__init__()
+        self.num_levels = num_levels
+        self.seq_len = seq_len
+        self.fuse_convs = nn.ModuleList(
+            [nn.Conv2d(in_channels * seq_len, in_channels, kernel_size=1) for _ in range(num_levels)]
+        )
+        from .temporal import TemporalConsistencyLoss
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+
+    def forward(self, sequence_features):
+        T = len(sequence_features)
+        if T == 0:
+            return [], {'temporal_consistency_loss': None}
+
+        # Keep most recent seq_len frames.
+        use = sequence_features[-self.seq_len :]
+        while len(use) < self.seq_len:
+            use = [use[0]] + use
+
+        enhanced_levels = []
+        for level in range(self.num_levels):
+            feats = [frame[level] for frame in use]
+            fused = self.fuse_convs[level](torch.cat(feats, dim=1))
+            enhanced_levels.append(fused)
+        return enhanced_levels, {'temporal_consistency_loss': None}
+
+
+class _ConvGRUCell(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        pad = kernel_size // 2
+        self.conv_z = nn.Conv2d(channels * 2, channels, kernel_size, padding=pad)
+        self.conv_r = nn.Conv2d(channels * 2, channels, kernel_size, padding=pad)
+        self.conv_h = nn.Conv2d(channels * 2, channels, kernel_size, padding=pad)
+
+    def forward(self, x_t, h_prev):
+        inp = torch.cat([x_t, h_prev], dim=1)
+        z = torch.sigmoid(self.conv_z(inp))
+        r = torch.sigmoid(self.conv_r(inp))
+        cand = torch.tanh(self.conv_h(torch.cat([x_t, r * h_prev], dim=1)))
+        h_t = (1 - z) * h_prev + z * cand
+        return h_t
+
+
+class ConvGRUTemporalWrapper(nn.Module):
+    """ConvGRU temporal baseline with one cell per FPN level."""
+
+    def __init__(self, in_channels=64, num_levels=3, cfg=None):
+        super().__init__()
+        self.num_levels = num_levels
+        self.cells = nn.ModuleList([_ConvGRUCell(in_channels) for _ in range(num_levels)])
+        from .temporal import TemporalConsistencyLoss
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+
+    def forward(self, sequence_features):
+        T = len(sequence_features)
+        if T == 0:
+            return [], {'temporal_consistency_loss': None}
+
+        enhanced_levels = []
+        for level in range(self.num_levels):
+            h = sequence_features[0][level]
+            for t in range(1, T):
+                h = self.cells[level](sequence_features[t][level], h)
+            enhanced_levels.append(h)
+        return enhanced_levels, {'temporal_consistency_loss': None}
