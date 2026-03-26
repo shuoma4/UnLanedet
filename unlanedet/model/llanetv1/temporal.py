@@ -41,7 +41,36 @@ class TemporalConsistencyLoss(nn.Module):
         min_p = min(current_preds.shape[1], previous_preds.shape[1])
         cur = current_preds[:, :min_p].float()
         prv = previous_preds[:, :min_p].detach().float()
+        
+        # Apply a conservative clamp before anything to prevent infinite/nan propagation
+        cur = torch.clamp(cur, min=-10.0, max=10.0)
+        prv = torch.clamp(prv, min=-10.0, max=10.0)
+        
+        # NOTE: Computing Smooth L1 loss directly on UNNORMALIZED coordinates (like 800 pixels)
+        # provides meaningful loss values but creates absolutely massive gradients compared 
+        # to the main FCLRNet losses which compute Smooth L1 on normalized coordinates. 
+        # To balance this, we compute loss on physical scale, but scale down the final loss value
+        # by a factor (e.g. 1e-3) so the gradient magnitude matches the primary task.
+        
+        n_strips = float(getattr(self.cfg, 'num_points', 72)) - 1
+        img_w = float(getattr(self.cfg, 'img_w', 800))
+        img_h = float(getattr(self.cfg, 'img_h', 320))
 
+        cur_unnorm = cur.clone()
+        cur_unnorm[..., 2] *= n_strips
+        cur_unnorm[..., 3] *= img_w - 1
+        cur_unnorm[..., 4] *= 90  # LLANetHead 中 theta 范围归一化
+        cur_unnorm[..., 5] *= n_strips
+        cur_unnorm[..., 6:] *= img_w - 1
+
+        prv_unnorm = prv.clone()
+        prv_unnorm[..., 2] *= n_strips
+        prv_unnorm[..., 3] *= img_w - 1
+        prv_unnorm[..., 4] *= 90
+        prv_unnorm[..., 5] *= n_strips
+        prv_unnorm[..., 6:] *= img_w - 1
+        
+        # 移除内部 scale_factor 使得误差在原物理尺寸上真实反馈
         cls_loss = cur.new_tensor(0.0)
         reg_loss = cur.new_tensor(0.0)
         used_matched = False
@@ -59,14 +88,20 @@ class TemporalConsistencyLoss(nn.Module):
                 bu, pu = uniq[:, 0], uniq[:, 1]
                 # logit 级 smooth_l1：对未饱和的正负样本都比 softmax-MSE 敏感
                 cls_loss = F.smooth_l1_loss(cur[bu, pu, :2], prv[bu, pu, :2])
-                reg_loss = F.smooth_l1_loss(cur[bu, pu, 2:6], prv[bu, pu, 2:6])
+                
+                # Regression loss on physical coordinates
+                reg_loss = F.smooth_l1_loss(cur_unnorm[bu, pu, 2:6], prv_unnorm[bu, pu, 2:6])
+                # Scale loss manually by a moderate factor (e.g. 0.05) to prevent NaN from extreme physical scales
+                reg_loss = reg_loss * 0.05
+                
                 n_off = int(getattr(self.cfg, 'num_points', 72) if self.cfg else 72)
                 end = 6 + n_off
                 if cur.shape[-1] >= end:
-                    # 72 维采样横坐标对总梯度的贡献远大于 2:6；单独降权抑制偶发梯度爆炸
-                    reg_loss = reg_loss + 0.2 * F.smooth_l1_loss(
-                        cur[bu, pu, 6:end], prv[bu, pu, 6:end]
+                    # Offsets loss on physical coordinates
+                    off_loss = F.smooth_l1_loss(
+                        cur_unnorm[bu, pu, 6:end], prv_unnorm[bu, pu, 6:end]
                     )
+                    reg_loss = reg_loss + 0.2 * off_loss * 0.05
                 used_matched = True
 
         # --- 2. 无匹配信息时的 fallback：在「当前或上一帧任一视为前景」的 prior 上约束 ---
@@ -77,17 +112,27 @@ class TemporalConsistencyLoss(nn.Module):
             if fg.sum() > 0:
                 cls_l1 = F.smooth_l1_loss(cur[..., :2], prv[..., :2], reduction='none').mean(2)
                 cls_loss = (cls_l1 * fg).sum() / (fg.sum() + 1e-5)
-                rd = F.smooth_l1_loss(cur[..., 2:6], prv[..., 2:6], reduction='none').mean(2)
-                reg_loss = (rd * fg).sum() / (fg.sum() + 1e-5)
+                rd = F.smooth_l1_loss(cur_unnorm[..., 2:6], prv_unnorm[..., 2:6], reduction='none').mean(2)
+                reg_loss = ((rd * fg).sum() / (fg.sum() + 1e-5)) * 0.05
+        
+        # Clip the base temporal losses to prevent them from blowing up
+        cls_loss = torch.clamp(cls_loss, max=10.0)
+        reg_loss = torch.clamp(reg_loss, max=100.0)
 
         # --- 3. 几何分支：与 anchor 级 reg 相加，而不是替换（避免 geo==None 时只剩过小的 cls） ---
         if (batch is not None and outputs is not None
                 and 'final_matching_matrix' in outputs
                 and 'extrinsic' in batch):
             try:
+                # 传入归一化前的坐标给 geo_loss，因为 geo_loss 内部有自己的反归一化或像素尺度计算
+                # 同时也传入未反归一化的 cur 供其使用（内部实现如果期望归一化的输入，这里需要一致）
                 geo = self._geo_loss(current_preds, batch, outputs, device)
                 if geo is not None:
-                    reg_loss = reg_loss + geo
+                    # 几何分支通常也会因为无遮挡、越界等原因计算出极小值或极大值，加一个 clamp 和 isfinite 检查
+                    if torch.isfinite(geo):
+                        reg_loss = reg_loss + geo.clamp(-20.0, 20.0)
+                    else:
+                        _LOG.warning("TemporalConsistencyLoss: geo loss is non-finite.")
             except Exception as exc:
                 _LOG.warning("TemporalConsistencyLoss geo error: %s", exc)
 
@@ -237,13 +282,14 @@ class TemporalConsistencyLoss(nn.Module):
         frac = (y_idx - fi.float()).clamp(0, 1)
 
         pred_lanes = current_preds[b, prior_idx].float()
-        lane_xs = pred_lanes[:, 6 : 6 + n_off] * img_w
+        # clamp is necessary here to prevent exploding gradients when predictions are wild
+        lane_xs = torch.clamp(pred_lanes[:, 6 : 6 + n_off] * img_w, -100.0, img_w + 100.0)
 
         pred_u_floor = lane_xs.gather(1, fi)
         pred_u_ceil = lane_xs.gather(1, ci)
         pred_u = pred_u_floor * (1 - frac) + pred_u_ceil * frac
 
-        return F.l1_loss(pred_u[valid], u[valid].detach()) * 5.0
+        return F.smooth_l1_loss(pred_u[valid], u[valid].detach()) * 5.0
 
 
 class ContMixTemporalBlock(nn.Module):

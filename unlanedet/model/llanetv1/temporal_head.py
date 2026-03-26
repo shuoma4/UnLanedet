@@ -15,7 +15,7 @@ from .assigner import assign
 from .prior import init_priors
 
 
-class LLANetV1Head(FCLRHead):
+class LLANetV1TemporalHead(FCLRHead):
     """fCLRNet-based lane head with optional category branch and data-driven priors."""
 
     def __init__(
@@ -194,18 +194,35 @@ class LLANetV1Head(FCLRHead):
             def tran_tensor(t):
                 return t.unsqueeze(2).clone().repeat(1, 1, self.n_offsets)
 
+            # Prevent theta from exploding tan() to inf which causes AddmmBackward0 NaN
+            # Keep inplace assignment to maintain correct graph structure, but clamp rhs.
+            predictions[..., 4] = torch.clamp(predictions[..., 4], min=-0.48, max=0.48)
+            
+            # Prevent zero or negative length division by zero in downstream IoU
+            predictions[..., 5] = torch.clamp(predictions[..., 5], min=0.01, max=1.0)
+            
+            # Prevent start_y out of bounds
+            predictions[..., 2] = torch.clamp(predictions[..., 2], min=0.0, max=1.0)
+
             predictions[..., 6:] = (
                 tran_tensor(predictions[..., 3]) * (self.img_w - 1)
                 + (
-                    (1 - self.prior_ys.repeat(batch_size, num_priors, 1) - tran_tensor(predictions[..., 2]))
+                    (
+                        1
+                        - self.prior_ys.repeat(batch_size, num_priors, 1)
+                        - tran_tensor(predictions[..., 2])
+                    )
                     * self.img_h
-                    / torch.tan(tran_tensor(predictions[..., 4]) * math.pi + 1e-5)
+                    / (torch.tan(tran_tensor(predictions[..., 4]) * math.pi) + 1e-5)
                 )
             ) / (self.img_w - 1)
 
             prediction_lines = predictions.clone()
             predictions[..., 6:] += reg[..., 4:]
-            predictions_lists.append(predictions)
+            
+            # CRITICAL: Append a clone of predictions to the list so that external TemporalConsistencyLoss
+            # computes gradients on a separate leaf of the graph, avoiding "modified by inplace operation" error!
+            predictions_lists.append(predictions.clone())
 
             if stage != self.refine_layers - 1:
                 priors = prediction_lines.detach().clone()
@@ -371,19 +388,9 @@ class LLANetV1Head(FCLRHead):
                     labels = category_targets
                     mask_pos = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~mask_self
                     
-                    # valid: anchors that have at least one positive sample in-batch.
-                    # Singleton classes (only one anchor for a class in the batch) have no positives
-                    # and should not be allowed to affect other anchors via the denominator,
-                    # otherwise rare classes can be repeatedly pushed away under SupCon.
                     valid = mask_pos.sum(dim=1) > 0
-                    invalid = ~valid
                     
-                    # Exclude self from denominators
                     sim_matrix.masked_fill_(mask_self, float('-inf'))
-                    # Exclude singleton anchors from denominators
-                    if invalid.any():
-                        sim_matrix[:, invalid] = float('-inf')
-                    
                     log_prob = sim_matrix - torch.logsumexp(sim_matrix, dim=1, keepdim=True)
                     
                     log_prob_pos = torch.where(mask_pos, log_prob, torch.zeros_like(log_prob))

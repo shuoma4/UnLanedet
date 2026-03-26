@@ -93,7 +93,8 @@ class TemporalFusionWrapper(nn.Module):
         ])
 
         from .temporal import TemporalConsistencyLoss
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)
@@ -128,7 +129,8 @@ class KalmanTemporalWrapper(nn.Module):
         # Initialize around 0.6 to make current observation slightly dominant.
         self.kalman_logit = nn.Parameter(torch.full((num_levels,), 0.4))
         from .temporal import TemporalConsistencyLoss
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)
@@ -158,7 +160,8 @@ class ConcatFusionWrapper(nn.Module):
             [nn.Conv2d(in_channels * seq_len, in_channels, kernel_size=1) for _ in range(num_levels)]
         )
         from .temporal import TemporalConsistencyLoss
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)
@@ -203,7 +206,8 @@ class ConvGRUTemporalWrapper(nn.Module):
         self.num_levels = num_levels
         self.cells = nn.ModuleList([_ConvGRUCell(in_channels) for _ in range(num_levels)])
         from .temporal import TemporalConsistencyLoss
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
+        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)

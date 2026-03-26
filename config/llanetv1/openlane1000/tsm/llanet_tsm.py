@@ -112,5 +112,5 @@ dataloader.test.persistent_workers = False  # eval 结束后立即释放 worker 
 dataloader.test.pin_memory = True
 dataloader.test.prefetch_factor = 2
 
-# 20.0 约束过强会压制检测收敛；回调到中等强度
-param_config.temporal_loss_weight = 8.0
+# 权重调回 5.0（因为我们内部重新加回了 0.05 的安全缩放）
+param_config.temporal_loss_weight = 5.0

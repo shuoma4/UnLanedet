@@ -160,10 +160,14 @@ class LLANetV1(nn.Module):
             sequence_features = temporal_aux.get('sequence_features')
             if batch['img'].dim() == 5 and sequence_features is not None and len(sequence_features) >= 2:
                 if self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
-                    # 仅此时序分支：head 只产出 predictions_lists 供 L_t，不传 predictions_only 则与其它 LLANetV1 训练完全一致
+                    # 构造上一帧的输入序列，并经过时序模型融合，以解决 Domain Gap 问题
+                    prev_sequence_features = sequence_features[:-1]
                     with torch.no_grad():
+                        prev_features, _ = self.temporal_model(prev_sequence_features)
+                        
+                        # 仅此时序分支：head 只产出 predictions_lists 供 L_t，不传 predictions_only 则与其它 LLANetV1 训练完全一致
                         prev_outputs = self.head(
-                            sequence_features[-2],
+                            prev_features,
                             batch=batch,
                             predictions_only=True,
                         )
@@ -187,9 +191,8 @@ class LLANetV1(nn.Module):
                                 assigner=getattr(self.head, 'assigner', None),
                             )
                         if real_temporal_loss is not None:
-                            losses['temporal_consistency_loss'] = real_temporal_loss * float(
-                                _maybe_get(self.cfg, 'temporal_loss_weight', 0.5)
-                            )
+                            # 已经在 TemporalConsistencyLoss 内部乘过 loss_weight，这里不再重复乘
+                            losses['temporal_consistency_loss'] = real_temporal_loss
 
             # 兼容模式B：当 dataloader 仅提供 4D batch 时（非 5D video），使用批次内平移前一个样本假装作为"上一帧"对齐。
             if batch['img'].dim() == 4 and self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
@@ -210,8 +213,8 @@ class LLANetV1(nn.Module):
                             current_preds, previous_preds, batch
                         )
                     if pseudo_temporal_loss is not None:
-                        # use a proper scale since we are comparing totally different frames in the batch in Mode B
-                        losses['temporal_consistency_loss'] = pseudo_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
+                        # 已经在内部乘过，这里不重复乘
+                        losses['temporal_consistency_loss'] = pseudo_temporal_loss
 
             if self.teacher is not None and self.distiller is not None:
                 with torch.no_grad():
