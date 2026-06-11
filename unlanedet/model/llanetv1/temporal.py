@@ -28,6 +28,8 @@ class TemporalConsistencyLoss(nn.Module):
         super().__init__()
         self.loss_weight = loss_weight
         self.cfg = cfg
+        # Internal step counter for temporal warmup/ramp.
+        self.register_buffer("_step", torch.zeros((), dtype=torch.long), persistent=False)
 
     # ------------------------------------------------------------------
     # Public forward
@@ -46,36 +48,12 @@ class TemporalConsistencyLoss(nn.Module):
         cur = torch.clamp(cur, min=-10.0, max=10.0)
         prv = torch.clamp(prv, min=-10.0, max=10.0)
         
-        # NOTE: Computing Smooth L1 loss directly on UNNORMALIZED coordinates (like 800 pixels)
-        # provides meaningful loss values but creates absolutely massive gradients compared 
-        # to the main FCLRNet losses which compute Smooth L1 on normalized coordinates. 
-        # To balance this, we compute loss on physical scale, but scale down the final loss value
-        # by a factor (e.g. 1e-3) so the gradient magnitude matches the primary task.
-        
-        n_strips = float(getattr(self.cfg, 'num_points', 72)) - 1
-        img_w = float(getattr(self.cfg, 'img_w', 800))
-        img_h = float(getattr(self.cfg, 'img_h', 320))
-
-        cur_unnorm = cur.clone()
-        cur_unnorm[..., 2] *= n_strips
-        cur_unnorm[..., 3] *= img_w - 1
-        cur_unnorm[..., 4] *= 90  # LLANetHead 中 theta 范围归一化
-        cur_unnorm[..., 5] *= n_strips
-        cur_unnorm[..., 6:] *= img_w - 1
-
-        prv_unnorm = prv.clone()
-        prv_unnorm[..., 2] *= n_strips
-        prv_unnorm[..., 3] *= img_w - 1
-        prv_unnorm[..., 4] *= 90
-        prv_unnorm[..., 5] *= n_strips
-        prv_unnorm[..., 6:] *= img_w - 1
-        
-        # 移除内部 scale_factor 使得误差在原物理尺寸上真实反馈
         cls_loss = cur.new_tensor(0.0)
         reg_loss = cur.new_tensor(0.0)
         used_matched = False
+        self._step = self._step + 1
 
-        # --- 1. 匹配上的 positive anchor：避免对全体 prior 做 softmax-MSE（背景占满巨量 anchor，差分被平均到≈0） ---
+        # --- 1. 匹配上的 positive anchor：保留分类特征的一致性约束，移除静态 2D 坐标约束 ---
         if outputs is not None and 'final_matching_matrix' in outputs:
             mm = outputs['final_matching_matrix']
             if mm.device != cur.device:
@@ -86,38 +64,17 @@ class TemporalConsistencyLoss(nn.Module):
                 bp = torch.stack([b_all, p_all], dim=1)
                 uniq = torch.unique(bp, dim=0)
                 bu, pu = uniq[:, 0], uniq[:, 1]
-                # logit 级 smooth_l1：对未饱和的正负样本都比 softmax-MSE 敏感
+                # Keep a light classification consistency term only on strict matches.
                 cls_loss = F.smooth_l1_loss(cur[bu, pu, :2], prv[bu, pu, :2])
-                
-                # Regression loss on physical coordinates
-                reg_loss = F.smooth_l1_loss(cur_unnorm[bu, pu, 2:6], prv_unnorm[bu, pu, 2:6])
-                # Scale loss manually by a moderate factor (e.g. 0.05) to prevent NaN from extreme physical scales
-                reg_loss = reg_loss * 0.05
-                
-                n_off = int(getattr(self.cfg, 'num_points', 72) if self.cfg else 72)
-                end = 6 + n_off
-                if cur.shape[-1] >= end:
-                    # Offsets loss on physical coordinates
-                    off_loss = F.smooth_l1_loss(
-                        cur_unnorm[bu, pu, 6:end], prv_unnorm[bu, pu, 6:end]
-                    )
-                    reg_loss = reg_loss + 0.2 * off_loss * 0.05
+                cls_loss = torch.nan_to_num(cls_loss, nan=0.0, posinf=0.0, neginf=0.0)
                 used_matched = True
 
-        # --- 2. 无匹配信息时的 fallback：在「当前或上一帧任一视为前景」的 prior 上约束 ---
-        if not used_matched:
-            p_cur = F.softmax(cur[..., :2], dim=-1)[..., 1]
-            p_prv = F.softmax(prv[..., :2], dim=-1)[..., 1]
-            fg = ((p_cur > 0.05) | (p_prv > 0.05)).float()
-            if fg.sum() > 0:
-                cls_l1 = F.smooth_l1_loss(cur[..., :2], prv[..., :2], reduction='none').mean(2)
-                cls_loss = (cls_l1 * fg).sum() / (fg.sum() + 1e-5)
-                rd = F.smooth_l1_loss(cur_unnorm[..., 2:6], prv_unnorm[..., 2:6], reduction='none').mean(2)
-                reg_loss = ((rd * fg).sum() / (fg.sum() + 1e-5)) * 0.05
+        # --- 2. 无匹配信息时的 fallback：在「当前或上一帧任一视为前景」的 prior 上约束（仅分类） ---
+        # REMOVED: 之前这里的 fallback 逻辑会错误地将同一 prior 在帧间的正常车道线出现/消失作为损失进行惩罚，
+        # 以及未考虑车辆运动导致车道线在 prior 间转移的情况。现已删除该不合理约束。
         
-        # Clip the base temporal losses to prevent them from blowing up
-        cls_loss = torch.clamp(cls_loss, max=10.0)
-        reg_loss = torch.clamp(reg_loss, max=100.0)
+        # Keep cls branch always light; geometric branch carries the major constraint.
+        cls_loss = torch.clamp(cls_loss, max=2.0)
 
         # --- 3. 几何分支：与 anchor 级 reg 相加，而不是替换（避免 geo==None 时只剩过小的 cls） ---
         if (batch is not None and outputs is not None
@@ -128,18 +85,35 @@ class TemporalConsistencyLoss(nn.Module):
                 # 同时也传入未反归一化的 cur 供其使用（内部实现如果期望归一化的输入，这里需要一致）
                 geo = self._geo_loss(current_preds, batch, outputs, device)
                 if geo is not None:
-                    # 几何分支通常也会因为无遮挡、越界等原因计算出极小值或极大值，加一个 clamp 和 isfinite 检查
-                    if torch.isfinite(geo):
-                        reg_loss = reg_loss + geo.clamp(-20.0, 20.0)
+                    geo = torch.nan_to_num(geo, nan=0.0, posinf=0.0, neginf=0.0)
+                    if torch.isfinite(geo).all() and float(geo.item()) >= 0.0:
+                        # Robust add with mild cap; avoid hard saturation to fixed constants.
+                        geo_cap = float(getattr(self.cfg, "temporal_geo_cap", 8.0))
+                        reg_loss = reg_loss + geo.clamp(min=0.0, max=geo_cap)
                     else:
                         _LOG.warning("TemporalConsistencyLoss: geo loss is non-finite.")
             except Exception as exc:
                 _LOG.warning("TemporalConsistencyLoss geo error: %s", exc)
 
-        total = (cls_loss + reg_loss) * self.loss_weight
-        if not torch.isfinite(total):
+        # Weight schedule: warmup -> linear ramp -> full weight.
+        warmup_iters = int(getattr(self.cfg, "temporal_warmup_iters", 2000))
+        ramp_iters = int(getattr(self.cfg, "temporal_ramp_iters", 4000))
+        step = int(self._step.item())
+        if step <= warmup_iters:
+            sched = 0.0
+        elif step <= warmup_iters + max(ramp_iters, 1):
+            sched = float(step - warmup_iters) / float(max(ramp_iters, 1))
+        else:
+            sched = 1.0
+
+        total = (0.2 * cls_loss + reg_loss) * (self.loss_weight * sched)
+        total_cap = float(getattr(self.cfg, "temporal_total_cap", 20.0))
+        total = torch.clamp(total, min=0.0, max=total_cap)
+        total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.isfinite(total).all():
             _LOG.warning("TemporalConsistencyLoss: non-finite total, using 0 for this step")
-            return current_preds.new_zeros((), device=device, dtype=torch.float32)
+            # Detached scalar: must not retain graph links to preds (avoids poisoned backward).
+            return torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=False)
         return total
 
     # ------------------------------------------------------------------
@@ -159,13 +133,19 @@ class TemporalConsistencyLoss(nn.Module):
 
         seq_ext = batch['extrinsic']    # [B, T, 4, 4]
         seq_int = batch['intrinsic']    # [B, T, 3, 3] or [B, 3, 3]
-        if seq_ext.dim() != 4:
+        seq_pose = batch.get('pose')    # [B, T, 4, 4]
+        if seq_ext.dim() != 4 or seq_pose is None or seq_pose.dim() != 4:
             return None
 
-        # 全 batch 一次性计算 T_rel = E_t^{-1} @ E_{t-1}  (Eq 4-7)
+        # 全 batch 一次性计算 T_rel = E_t^{-1} @ pose_t^{-1} @ pose_{t-1} @ E_{t-1}
         E_t1  = seq_ext[:, -2].double()          # [B, 4, 4]
         E_t   = seq_ext[:, -1].double()          # [B, 4, 4]
-        T_rel = torch.linalg.inv(E_t) @ E_t1    # [B, 4, 4]
+        P_t1  = seq_pose[:, -2].double()         # [B, 4, 4]
+        P_t   = seq_pose[:, -1].double()         # [B, 4, 4]
+        
+        # ego_t1 to ego_t: inv(P_t) @ P_t1
+        # cam_t1 to cam_t: inv(E_t) @ inv(P_t) @ P_t1 @ E_t1
+        T_rel = torch.linalg.inv(E_t) @ torch.linalg.inv(P_t) @ P_t1 @ E_t1    # [B, 4, 4]
         K_all = (seq_int[:, -1] if seq_int.dim() == 4 else seq_int).double()  # [B, 3, 3]
 
         matching_matrix = outputs['final_matching_matrix']  # [B, num_priors, max_lanes]
@@ -260,15 +240,18 @@ class TemporalConsistencyLoss(nn.Module):
         pts_t = torch.einsum('nij,njk->nik', T_bn, pts_pad)
         X, Y, Z = pts_t[:, 0], pts_t[:, 1], pts_t[:, 2]
 
-        Z_safe = Z.clamp(min=1e-6)
+        # OpenLane/Waymo camera coords: X=forward, Y=left, Z=up.
+        # Depth is X. So points must be in front of the camera (X > 0)
+        X_safe = X.clamp(min=1e-6)
         fx, fy = K_bn[:, 0, 0], K_bn[:, 1, 1]
         cx, cy = K_bn[:, 0, 2], K_bn[:, 1, 2]
-        u = ((X / Z_safe) * fx.unsqueeze(1) + cx.unsqueeze(1)).float() * su
-        v = (((Y / Z_safe) * fy.unsqueeze(1) + cy.unsqueeze(1)) - cut_h).float() * sv
+        # projection mapping to image plane: u = -Y/X*fx + cx, v = -Z/X*fy + cy
+        u = ((-Y / X_safe) * fx.unsqueeze(1) + cx.unsqueeze(1)).float() * su
+        v = (((-Z / X_safe) * fy.unsqueeze(1) + cy.unsqueeze(1)) - cut_h).float() * sv
 
         valid = (
             pt_mask
-            & (Z > 0)
+            & (X > 0.1)  # Filter points behind camera
             & (u >= 0) & (u < img_w)
             & (v >= 0) & (v < img_h)
             & (vis_pad > 0.5)
@@ -289,7 +272,33 @@ class TemporalConsistencyLoss(nn.Module):
         pred_u_ceil = lane_xs.gather(1, ci)
         pred_u = pred_u_floor * (1 - frac) + pred_u_ceil * frac
 
-        return F.smooth_l1_loss(pred_u[valid], u[valid].detach()) * 5.0
+        # Reliability gate: require enough overlap points per lane.
+        min_pts = int(getattr(cfg, "temporal_min_valid_points", 8))
+        valid_cnt = valid.sum(dim=1)
+        lane_ok = valid_cnt >= min_pts
+        if not lane_ok.any():
+            return None
+
+        # Robust point residual: pseudo-Huber + per-point confidence gate.
+        delta = float(getattr(cfg, "temporal_huber_delta", 3.0))
+        tau = float(getattr(cfg, "temporal_reproj_tau", 8.0))
+        max_point_err = float(getattr(cfg, "temporal_max_point_error", 150.0))
+
+        err = (pred_u - u.detach()).abs()
+        huber = (delta * delta) * (torch.sqrt(1.0 + (err / delta) ** 2) - 1.0)
+        w_reproj = torch.exp(-(err.detach() / max(tau, 1e-6)))
+
+        point_mask = valid & lane_ok.unsqueeze(1) & (err.detach() <= max_point_err)
+        if not point_mask.any():
+            return None
+
+        weighted = huber * w_reproj
+        num = weighted[point_mask].sum()
+        den = w_reproj[point_mask].sum().clamp_min(1e-6)
+        geo = num / den
+        geo_scale = float(getattr(cfg, "temporal_geo_scale", 1.0))
+        out = geo * geo_scale
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class ContMixTemporalBlock(nn.Module):

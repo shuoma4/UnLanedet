@@ -14,8 +14,16 @@ from .distill import LaneDistillationLoss
 
 LOGGER = logging.getLogger(__name__)
 
-# 将多帧拼成一次 backbone 前向可加速，但峰值显存 ∝ B*T；超过阈值则逐帧前向以防 OOM（B=6,T=3→18）
-_MAX_STACKED_SEQUENCE_BT = 18
+# 将多帧拼成一次 backbone 前向可加速，但峰值显存 ∝ B*T；超过阈值则逐帧前向以防 OOM（B=56,T=3→168）
+_MAX_STACKED_SEQUENCE_BT = 168
+
+
+def _stacked_sequence_bt_limit(cfg):
+    """若 cfg.max_stacked_sequence_bt 存在则用之，否则用全局默认（便于 FP32/大模型降显存）。"""
+    lim = _maybe_get(cfg, "max_stacked_sequence_bt", None)
+    if lim is None:
+        return _MAX_STACKED_SEQUENCE_BT
+    return int(lim)
 
 
 def _maybe_get(cfg, key, default=None):
@@ -115,7 +123,7 @@ class LLANetV1(nn.Module):
             img = batch
         if img.dim() == 5:
             B, T = img.shape[0], img.shape[1]
-            if B * T <= _MAX_STACKED_SEQUENCE_BT:
+            if B * T <= _stacked_sequence_bt_limit(self.cfg):
                 sequence_features = self._forward_sequence_stacked(img)
             else:
                 sequence_features = [self._forward_single_image(img[:, t]) for t in range(T)]
@@ -130,7 +138,7 @@ class LLANetV1(nn.Module):
         img = batch['img']
         if img.dim() == 5:
             B, T = img.shape[0], img.shape[1]
-            if B * T <= _MAX_STACKED_SEQUENCE_BT:
+            if B * T <= _stacked_sequence_bt_limit(self.cfg):
                 sequence_features = self._forward_sequence_stacked(img)
             else:
                 sequence_features = [self._forward_single_image(img[:, t]) for t in range(T)]
@@ -191,8 +199,11 @@ class LLANetV1(nn.Module):
                                 assigner=getattr(self.head, 'assigner', None),
                             )
                         if real_temporal_loss is not None:
-                            # 已经在 TemporalConsistencyLoss 内部乘过 loss_weight，这里不再重复乘
-                            losses['temporal_consistency_loss'] = real_temporal_loss
+                            # TemporalConsistencyLoss returns normalized raw temporal loss;
+                            # apply config weight at the final integration point.
+                            losses['temporal_consistency_loss'] = (
+                                real_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
+                            )
 
             # 兼容模式B：当 dataloader 仅提供 4D batch 时（非 5D video），使用批次内平移前一个样本假装作为"上一帧"对齐。
             if batch['img'].dim() == 4 and self.temporal_model is not None and getattr(self.temporal_model, 'temporal_loss', None) is not None:
@@ -213,8 +224,9 @@ class LLANetV1(nn.Module):
                             current_preds, previous_preds, batch
                         )
                     if pseudo_temporal_loss is not None:
-                        # 已经在内部乘过，这里不重复乘
-                        losses['temporal_consistency_loss'] = pseudo_temporal_loss
+                        losses['temporal_consistency_loss'] = (
+                            pseudo_temporal_loss * float(_maybe_get(self.cfg, 'temporal_loss_weight', 0.5))
+                        )
 
             if self.teacher is not None and self.distiller is not None:
                 with torch.no_grad():

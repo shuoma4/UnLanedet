@@ -87,17 +87,26 @@ class TemporalFusionWrapper(nn.Module):
     def __init__(self, in_channels=64, num_levels=3, cfg=None):
         super(TemporalFusionWrapper, self).__init__()
         self.num_levels = num_levels
+        self.cfg = cfg
+        self.register_buffer("_forward_step", torch.zeros((), dtype=torch.long), persistent=False)
         self.mixers = nn.ModuleList([
             ContMixT(in_channels=in_channels, hidden_channels=in_channels)
             for _ in range(num_levels)
         ])
 
         from .temporal import TemporalConsistencyLoss
-        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)
+        self._forward_step = self._forward_step + 1
+
+        # During early warmup, bypass temporal feature fusion entirely and use current-frame features.
+        # This avoids corrupting the main detection branch before temporal supervision is enabled.
+        feature_warmup = int(getattr(self.cfg, "temporal_feature_warmup_iters", 2000)) if self.cfg else 0
+        if self.training and int(self._forward_step.item()) <= max(feature_warmup, 0):
+            return sequence_features[-1], {'temporal_consistency_loss': None}
+
         enhanced_levels = []
 
         for level in range(self.num_levels):
@@ -129,8 +138,7 @@ class KalmanTemporalWrapper(nn.Module):
         # Initialize around 0.6 to make current observation slightly dominant.
         self.kalman_logit = nn.Parameter(torch.full((num_levels,), 0.4))
         from .temporal import TemporalConsistencyLoss
-        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)
@@ -160,8 +168,7 @@ class ConcatFusionWrapper(nn.Module):
             [nn.Conv2d(in_channels * seq_len, in_channels, kernel_size=1) for _ in range(num_levels)]
         )
         from .temporal import TemporalConsistencyLoss
-        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)
@@ -195,7 +202,7 @@ class _ConvGRUCell(nn.Module):
         r = torch.sigmoid(self.conv_r(inp))
         cand = torch.tanh(self.conv_h(torch.cat([x_t, r * h_prev], dim=1)))
         h_t = (1 - z) * h_prev + z * cand
-        return h_t
+        return torch.nan_to_num(h_t, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
 class ConvGRUTemporalWrapper(nn.Module):
@@ -206,8 +213,7 @@ class ConvGRUTemporalWrapper(nn.Module):
         self.num_levels = num_levels
         self.cells = nn.ModuleList([_ConvGRUCell(in_channels) for _ in range(num_levels)])
         from .temporal import TemporalConsistencyLoss
-        loss_w = getattr(cfg, 'temporal_loss_weight', 1.0) if cfg else 1.0
-        self.temporal_loss = TemporalConsistencyLoss(loss_weight=loss_w, cfg=cfg)
+        self.temporal_loss = TemporalConsistencyLoss(loss_weight=1.0, cfg=cfg)
 
     def forward(self, sequence_features):
         T = len(sequence_features)

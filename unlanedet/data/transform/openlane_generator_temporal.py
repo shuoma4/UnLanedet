@@ -74,9 +74,11 @@ class OpenLaneTemporalGenerator(OpenLaneGenerator):
 
             gt_dict["extrinsic"] = sample["extrinsic"]
             gt_dict["intrinsic"] = sample["intrinsic"]
+            gt_dict["pose"] = sample.get("pose", None)
             gt_dict["visibility"] = sample.get("visibility", [])
             gt_dict["xyz"] = sample.get("xyz", [])
-            gt_dict["track_id"] = sample.get("track_id", [])
+            # OpenLaneTemporal stores ids as lane_track_ids; keep backward compatibility with track_id
+            gt_dict["track_id"] = sample.get("track_id", sample.get("lane_track_ids", []))
 
             transformed_frames.append(gt_dict)
 
@@ -88,7 +90,7 @@ class OpenLaneTemporalGenerator(OpenLaneGenerator):
         batched_dict = {}
         last_frame = minibatches[-1]
         
-        stackable_keys = ["img", "extrinsic", "intrinsic", "visibility", "xyz", "track_id"]
+        stackable_keys = ["img", "extrinsic", "intrinsic", "pose", "visibility", "xyz", "track_id"]
         
         for k in keys:
             if k in stackable_keys:

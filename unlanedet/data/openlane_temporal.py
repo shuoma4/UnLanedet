@@ -113,7 +113,8 @@ class OpenLaneTemporal(BaseDataset):
                 'xyz': xyz,
                 'cut_height': self.cut_height,
                 'extrinsic': np.array(anno.get('extrinsic', [])), 
-                'intrinsic': np.array(anno.get('intrinsic', []))
+                'intrinsic': np.array(anno.get('intrinsic', [])),
+                'pose': np.array(anno.get('pose', [])) if anno.get('pose') is not None else None
             }
             
             parts = img_rel_path.split('/')

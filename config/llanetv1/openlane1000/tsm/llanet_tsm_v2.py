@@ -13,7 +13,7 @@ from unlanedet.model.llanetv1.temporal_modules import TemporalFusionWrapper
 from ..common import TRAIN_TRANSFORMS, VAL_TRANSFORMS
 
 model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
-    run_name="tsm/baseline",
+    run_name="tsm/v2_optimized",
     backbone_type="resnet",
     backbone_name="resnet34",
     neck_type="GSAFPN",
@@ -24,8 +24,8 @@ model, dataloader, train, optimizer, lr_multiplier, param_config = build_config(
     enable_temporal_model=False,  # We override it manually below
     temporal_loss_weight=0.5,
     enable_global_semantic=True,
-    # AMP + 2-GPU DDP：total_batch=40（每卡 20），预计每卡约 8–9 GB
-    batch_size=40,
+    # 单卡：将 batch_size 提高到 36，进一步压榨 16GB 显存
+    batch_size=36,
 )
 
 param_config.scm_kernel_size = 9
@@ -34,8 +34,7 @@ train.amp.enabled = True           # fp16 混合精度，约减 30–40% per-ite
 train.float32_precision = "high"   # TF32（Ada Lovelace 上有额外加速）
 train.cudnn_benchmark = True
 
-# 提升数据读取并行度，解决 T=3 时序数据加载瓶颈
-dataloader.train.num_workers = 8
+dataloader.train.num_workers = 6
 dataloader.train.persistent_workers = True
 
 # 1. Override the Datasets
@@ -101,14 +100,17 @@ model.temporal_model = L(TemporalFusionWrapper)(
     num_levels=getattr(param_config, "refine_layers", 3),
     cfg=param_config,
 )
-dataloader.train.total_batch_size = 40
-dataloader.test.total_batch_size = 40
+dataloader.train.total_batch_size = 36
+# 评估时 batch 小；单卡 seq_len=3 不宜过大
+dataloader.test.total_batch_size = 4
 
 # 4. 训练 I/O
 dataloader.train.pin_memory = True
-dataloader.train.prefetch_factor = 4
-dataloader.test.num_workers = 4
-dataloader.test.persistent_workers = True
+dataloader.train.prefetch_factor = 2
+dataloader.test.num_workers = 2
+dataloader.test.persistent_workers = False  # eval 结束后立即释放 worker 内存
 dataloader.test.pin_memory = True
+dataloader.test.prefetch_factor = 2
 
-param_config.temporal_loss_weight = 0.5
+# 权重调回 5.0（因为我们内部重新加回了 0.05 的安全缩放）
+param_config.temporal_loss_weight = 5.0

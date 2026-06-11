@@ -45,6 +45,14 @@ class LLANetV1Head(FCLRHead):
         self.lambda_con = float(getattr(cfg, 'lambda_con', 0.5)) if self.enable_supcon else 0.0
         self.tau_con = float(getattr(cfg, 'tau_con', 0.07))
         self.combined_alpha = float(getattr(cfg, 'combined_alpha', 0.5))
+        # combined 头的“解耦策略”：
+        # 1) 推理/评估阶段可选择只输出 prototype logits（避免 linear 决策边界拖累 Macro）
+        # 2) 训练阶段可额外用 linear logits 做辅助 CE，以保留对共享特征的梯度信号
+        self.combined_proto_as_output = bool(getattr(cfg, 'combined_proto_as_output', False))
+        self.combined_enable_linear_aux_loss = bool(getattr(cfg, 'combined_enable_linear_aux_loss', False))
+        self.combined_linear_aux_loss_weight = float(
+            getattr(cfg, 'combined_linear_aux_loss_weight', self.combined_alpha)
+        )
         self.con_loss_weight = float(getattr(cfg, 'con_loss_weight', 0.1))
         self.prior_statistics = None
 
@@ -137,7 +145,15 @@ class LLANetV1Head(FCLRHead):
                 z,
                 F.normalize(self.category_prototypes, p=2, dim=-1).transpose(0, 1)
             )
-            logits = self.combined_alpha * logits_linear + (1 - self.combined_alpha) * logits_proto
+            logits_linear_out = logits_linear.reshape(batch_size, num_priors, -1)
+            logits_proto_out = logits_proto.reshape(batch_size, num_priors, -1)
+            logits_mixed_out = self.combined_alpha * logits_linear_out + (1 - self.combined_alpha) * logits_proto_out
+            logits_out = logits_proto_out if self.combined_proto_as_output else logits_mixed_out
+
+            z_out = z.reshape(batch_size, num_priors, -1)
+            if self.combined_enable_linear_aux_loss:
+                return logits_out, z_out, logits_linear_out, logits_proto_out
+            return logits_out, z_out
         elif self.category_head_type == 'prototype':
             logits = self.category_scale_factor * torch.matmul(
                 z,
@@ -234,7 +250,11 @@ class LLANetV1Head(FCLRHead):
             output.update(**seg)
 
         if self.enable_lane_category and final_flat_features is not None and not predictions_only:
-            output['category'], output['category_z'] = self._category_forward(final_flat_features, batch_size, num_priors)
+            cat_ret = self._category_forward(final_flat_features, batch_size, num_priors)
+            if isinstance(cat_ret, tuple) and len(cat_ret) == 4:
+                output['category'], output['category_z'], output['category_linear_logits'], output['category_proto_logits'] = cat_ret
+            else:
+                output['category'], output['category_z'] = cat_ret
 
         output['distill_features'] = (
             final_flat_features.reshape(batch_size, num_priors, -1) if final_flat_features is not None else None
@@ -353,13 +373,25 @@ class LLANetV1Head(FCLRHead):
             iou_loss += (iou_loss_sum[valid_img_mask] / count_per_img[valid_img_mask]).sum()
 
             if self.enable_lane_category and stage == self.refine_layers - 1 and lane_categories is not None and 'category' in output:
-                category_logits = output['category'][batch_idx, prior_idx]
                 category_targets = lane_categories[batch_idx, gt_idx].long()
                 
-                L_type = self.category_criterion(
-                    category_logits.float(),
-                    category_targets,
-                ) / max(int(len(batch_idx)), 1)
+                if (
+                    self.category_head_type == 'combined'
+                    and self.combined_enable_linear_aux_loss
+                    and 'category_linear_logits' in output
+                    and 'category_proto_logits' in output
+                ):
+                    category_logits_proto = output['category_proto_logits'][batch_idx, prior_idx]
+                    category_logits_linear = output['category_linear_logits'][batch_idx, prior_idx]
+
+                    denom = max(int(len(batch_idx)), 1)
+                    L_type_proto = self.category_criterion(category_logits_proto.float(), category_targets) / denom
+                    L_type_linear = self.category_criterion(category_logits_linear.float(), category_targets) / denom
+                    L_type = L_type_proto + self.combined_linear_aux_loss_weight * L_type_linear
+                else:
+                    category_logits = output['category'][batch_idx, prior_idx]
+                    denom = max(int(len(batch_idx)), 1)
+                    L_type = self.category_criterion(category_logits.float(), category_targets) / denom
                 
                 L_con = torch.tensor(0.0, device=device)
                 if self.enable_supcon and len(batch_idx) > 1:
@@ -398,7 +430,8 @@ class LLANetV1Head(FCLRHead):
                 else:
                     category_loss += L_type
 
-        seg_loss = self.criterion(F.log_softmax(output['seg'], dim=1), batch['seg'].long().to(device))
+        seg_logits = torch.nan_to_num(output['seg'], nan=0.0, posinf=50.0, neginf=-50.0)
+        seg_loss = self.criterion(F.log_softmax(seg_logits, dim=1), batch['seg'].long().to(device))
         norm = float(batch_size * self.refine_layers)
         cls_loss /= norm
         reg_xytl_loss /= norm
